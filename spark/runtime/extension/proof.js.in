@@ -1,0 +1,27 @@
+/* Authored GPL-3.0-or-later. Only fixed hypothetical policy checks; no requests or history. */
+"use strict";
+globalThis.r2d2ProtectionProof = Object.freeze({state: "pending"});
+(async () => {
+  try {
+    const allowed = await chrome.extension.isAllowedIncognitoAccess();
+    const enabled = await chrome.declarativeNetRequest.getEnabledRulesets();
+    const exact = enabled.slice().sort().join(",") === "easylist,easyprivacy,owner_lg,ublock_badware";
+    const seeds = ["snu.lge.com", "snu-dev.lge.com", "redirect.lgsmartplatform.com", "qt-us.ad.lgsmartad.com", "156.147.69.32"];
+    let ownerPolicy = true;
+    const owner = r => r.matchedRules.some(x => x.rulesetId === "owner_lg");
+    for (const host of seeds) {
+      for (const type of ["main_frame", "xmlhttprequest", "websocket"]) {
+        const result = await chrome.declarativeNetRequest.testMatchOutcome({url: (type === "websocket" ? "wss://" : "https://") + host + "/r2d2-hypothetical", type});
+        ownerPolicy = ownerPolicy && owner(result);
+      }
+    }
+    for (const host of ["snu.lge.com.example.invalid", "prefixsnu.lge.com", "www.youtube.com", "127.0.0.1"]) {
+      const result = await chrome.declarativeNetRequest.testMatchOutcome({url: "https://" + host + "/r2d2-hypothetical", type: "main_frame"});
+      ownerPolicy = ownerPolicy && !owner(result);
+    }
+    globalThis.r2d2ProtectionProof = Object.freeze({state: "complete", incognito: chrome.extension.inIncognitoContext === true,
+      incognitoAllowed: allowed === true, rulesetsExact: exact, ruleSetCount: enabled.length, ownerPolicyExact: ownerPolicy});
+  } catch (_) {
+    globalThis.r2d2ProtectionProof = Object.freeze({state: "unavailable"});
+  }
+})();

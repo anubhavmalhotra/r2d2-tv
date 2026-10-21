@@ -1,0 +1,203 @@
+"""Finite no-browser keyboard authority/queue controls. Never opens a listener."""
+import copy, io, json, re, subprocess, unittest, inspect, textwrap
+from pathlib import Path
+from unittest.mock import Mock, patch
+import protocol as q
+import session_page as p
+import trial as t
+import test_tabs
+from test_trial import headers
+
+FID='1'*16
+OID='2'*16
+TOKEN='a'*48
+
+def body(action='insert',text='synthetic é水'):
+    v={'action':action,'focusId':FID,'id':OID}
+    if action in ('insert','insert-enter'):v['text']=text
+    return v
+
+def focus(fid=FID):return {'state':'editable','kind':'text','multiline':False,'focusId':fid}
+
+class EditorModel:
+    def __init__(self):
+        self.calls=[];self.matches=[];self.kind='text';self.multi=False;self.focusid=None;self.fail=None;self.projection=None
+        self.page=p.TabSession.__new__(p.TabSession)
+        self.page.target='owned';self.page.session='attached';self.page.editor=None
+        self.page.editor_probes=self.page.editor_edits=0;self.page.assert_alive=Mock()
+        self.page._call=self.call
+    def call(self,method,params,session=False):
+        self.calls.append((method,copy.deepcopy(params),session))
+        if method==self.fail:raise p.ProofError('FIXED_NATIVE_ERROR')
+        if method=='Page.getFrameTree':return {'frameTree':{'frame':{'id':'root'}}}
+        if method=='Page.createIsolatedWorld':
+            assert params=={'frameId':'root','worldName':'r2d2-owned-editor','grantUniveralAccess':False}
+            return {'executionContextId':7}
+        if method=='Runtime.evaluate':
+            if 'return !!(b&&' in params['expression']:
+                return {'result':{'value':self.matches.pop(0) if self.matches else True}}
+            if self.projection is not None:return {'result':{'value':self.projection}}
+            candidate=re.search(r'id:"([a-f0-9]{16})"',params['expression']).group(1)
+            if not self.focusid or 'if(true||' in params['expression']:self.focusid=candidate
+            if self.kind=='password':return {'result':{'value':{'state':'unavailable','kind':'password','multiline':False,'focusId':None}}}
+            return {'result':{'value':{'state':'editable','kind':self.kind,'multiline':self.multi,'focusId':self.focusid}}}
+        if method.startswith('Input.'):return {}
+        raise AssertionError(method)
+    def ready(self):
+        value=self.page.editor_probe();return dict(body(),focusId=value['focusId'])
+
+class Keyboard(unittest.TestCase):
+    def test_password_is_detected_but_no_capability_or_native_write(self):
+        m=EditorModel();m.kind='password';value=m.page.editor_probe()
+        self.assertEqual(value,{'state':'unavailable','kind':'password','multiline':False,'focusId':None})
+        self.assertIsNone(m.page.editor);self.assertEqual(m.page.editor_apply(body()),'rejected')
+        self.assertFalse(any(x[0].startswith('Input.')for x in m.calls))
+        tr=test_tabs.Integration().trial();tr.editor_state=dict(focus(),kind='password');self.assertFalse(tr.queue_text(body()))
+    def test_protocol_exact_unicode_and_control_bounds(self):
+        for action in ('insert','insert-enter','enter','backspace'):self.assertTrue(q.valid_text(body(action)))
+        for v in [dict(body(),extra=1),dict(body(),id=True),dict(body(),focusId='old'),body(text=''),body(text='a'*1025),body(text='\ud800'),body(text='x\x00'),body(text='\x7f'),body(text='\r')]:self.assertFalse(q.valid_text(v))
+        self.assertTrue(q.valid_text(body(text='😀'*1024)))
+        self.assertTrue(q.valid_text(body(text='a\nb\t')))
+    def test_fixed_routes_tv_only(self):
+        for name,method in [('text','POST'),('text-focus','GET')]:
+            self.assertEqual(q.route_request(q.TV,method,'/'+TOKEN+'/'+name,headers(),TOKEN),name)
+            self.assertIsNone(q.route_request(q.SPARK,method,'/'+TOKEN+'/'+name,headers(),TOKEN))
+            self.assertIsNone(q.route_request(q.TV,'GET'if method=='POST'else'POST','/'+TOKEN+'/'+name,headers(),TOKEN))
+    def test_stable_focus_and_no_value_projection(self):
+        m=EditorModel();first=m.page.editor_probe();second=m.page.editor_probe()
+        self.assertEqual(first,second);self.assertNotIn('value',first)
+        calls=json.dumps(m.calls)
+        self.assertNotIn('.value',calls);self.assertNotIn('textContent',calls);self.assertNotIn('innerText',calls)
+        self.assertNotEqual(m.page.editor_probe(force=True)['focusId'],first['focusId'])
+    def test_malformed_native_projection_refused(self):
+        for bad in [dict(focus(),focusId=[]),dict(focus(),multiline=1),dict(focus(),value='SECRET'),dict(focus(),kind='email')]:
+            m=EditorModel();m.projection=bad
+            with self.assertRaisesRegex(p.ProofError,'EDITOR_PROJECTION'):m.page.editor_probe()
+    def test_insert_exact_session_consumed_and_stale_refused(self):
+        m=EditorModel();v=m.ready();self.assertEqual(m.page.editor_apply(v),'applied')
+        self.assertIsNone(m.page.editor);self.assertEqual(m.page.editor_apply(v),'rejected')
+        calls=[x for x in m.calls if x[0]=='Input.insertText'];self.assertEqual(calls,[('Input.insertText',{'text':v['text']},True)])
+    def test_focus_or_document_changed_before_insertion_never_types(self):
+        m=EditorModel();v=m.ready();m.matches=[False]
+        self.assertEqual(m.page.editor_apply(v),'rejected');self.assertFalse(any(x[0].startswith('Input.')for x in m.calls))
+    def test_tab_switch_invalidates_before_native_input(self):
+        m=EditorModel();v=m.ready();m.page.target='other'
+        self.assertEqual(m.page.editor_apply(v),'rejected');self.assertFalse(any(x[0].startswith('Input.')for x in m.calls))
+    def test_navigation_invalidation(self):
+        m=EditorModel();v=m.ready();m.page.invalidate_editor();self.assertEqual(m.page.editor_apply(v),'rejected')
+    def test_changed_focus_after_insertion_unknown_no_replay(self):
+        m=EditorModel();v=m.ready();m.matches=[True,False]
+        self.assertEqual(m.page.editor_apply(v),'unknown');self.assertEqual(m.page.editor_apply(v),'rejected')
+        self.assertEqual(sum(x[0]=='Input.insertText'for x in m.calls),1)
+    def test_combined_insert_enter_checks_between_stages(self):
+        for stays in (True,False):
+            m=EditorModel();v=m.ready();v['action']='insert-enter';m.matches=[True,stays,True]
+            self.assertEqual(m.page.editor_apply(v),'applied'if stays else'unknown')
+            actions=[x for x in m.calls if x[0].startswith('Input.')]
+            self.assertEqual([x[0]for x in actions],['Input.insertText']+(['Input.dispatchKeyEvent']*2 if stays else []))
+            if stays:self.assertEqual([x[1]['type']for x in actions[1:]],['keyDown','keyUp']);self.assertEqual(actions[1][1]['text'],'\r')
+    def test_enter_dispatch_survives_expected_form_focus_change(self):
+        for action in ('enter','insert-enter'):
+            m=EditorModel();v=m.ready();v['action']=action
+            if action=='enter':del v['text']
+            original=m.page._call
+            def submit(method,params,session=False):
+                answer=original(method,params,session)
+                if method=='Input.dispatchKeyEvent' and params['type']=='keyDown':m.matches=[False]
+                return answer
+            m.page._call=submit
+            self.assertEqual(m.page.editor_apply(v),'applied')
+            self.assertEqual(m.matches,[False])  # No stale post-submit element proof.
+            self.assertEqual([x[1]['type']for x in m.calls if x[0]=='Input.dispatchKeyEvent'],['keyDown','keyUp'])
+            self.assertEqual(m.page.editor_apply(v),'rejected')
+    def test_reverting_enter_completion_is_detected(self):
+        source=textwrap.dedent(inspect.getsource(p.TabSession.editor_apply))
+        self.assertIn("if key=='Enter':return 'applied'",source)
+        source=source.replace("if key=='Enter':return 'applied'","if False:return 'applied'")
+        namespace={};exec(compile(source,'isolated-enter-reversion','exec'),p.__dict__,namespace)
+        with patch.object(p.TabSession,'editor_apply',namespace['editor_apply']):
+            result=unittest.TestResult();Keyboard('test_enter_dispatch_survives_expected_form_focus_change').run(result)
+        self.assertEqual(len(result.failures),1);self.assertEqual(result.errors,[])
+    def test_enter_missing_keyup_ack_still_unknown(self):
+        m=EditorModel();v=m.ready();v['action']='enter';del v['text'];original=m.page._call
+        def fail_up(method,params,session=False):
+            if method=='Input.dispatchKeyEvent' and params['type']=='keyUp':raise p.ProofError('KEYUP_LOST')
+            return original(method,params,session)
+        m.page._call=fail_up
+        self.assertEqual(m.page.editor_apply(v),'unknown');self.assertEqual(m.page.editor_apply(v),'rejected')
+    def test_completed_enter_with_navigating_document_unlocks_controls(self):
+        m=EditorModel();v=m.ready();v['action']='insert-enter'
+        tr=test_tabs.Integration().trial();tr.editor_state=focus(v['focusId']);self.assertTrue(tr.queue_text(v))
+        m.page.editor_probe=Mock(side_effect=p.ProofError('PAGE_CONTEXT_TRANSITION'))
+        with patch.object(t,'prove_selected_tab',return_value=True):t.service_editor(tr,m.page,Mock())
+        state=tr.text_snapshot();self.assertEqual(state['edit'],{'id':OID,'status':'applied'});self.assertEqual(state['state'],'unavailable')
+        self.assertTrue(tr.queue_navigation({'url':'https://example.com'}))
+    def test_keyup_attempted_after_uncertain_keydown(self):
+        m=EditorModel();v=m.ready();v={'action':'enter','id':OID,'focusId':v['focusId']};m.fail='Input.dispatchKeyEvent'
+        self.assertEqual(m.page.editor_apply(v),'unknown')
+        self.assertEqual([x[1]['type']for x in m.calls if x[0]=='Input.dispatchKeyEvent'],['keyDown','keyUp'])
+    def test_multiline_rejects_newline_for_single_input(self):
+        m=EditorModel();v=m.ready();v['text']='x\ny';self.assertEqual(m.page.editor_apply(v),'rejected')
+        self.assertFalse(any(x[0].startswith('Input.')for x in m.calls))
+    def test_private_queue_once_blocks_navigation_input_then_clears(self):
+        tr=test_tabs.Integration().trial();tr.editor_state=focus();self.assertTrue(tr.queue_text(body('insert-enter')))
+        self.assertFalse(tr.queue_text(body()));self.assertFalse(tr.queue_navigation({'url':'https://example.com'}));self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertNotIn('synthetic',json.dumps(tr.text_snapshot()));tr.request_stop('viewer-ended')
+        self.assertIsNone(tr.editor_pending);self.assertIsNone(tr.editor_result);self.assertEqual(tr.editor_ids,set())
+    def test_single_line_rejection_and_duplicate_operation_id(self):
+        tr=test_tabs.Integration().trial();tr.editor_state=focus();self.assertFalse(tr.queue_text(body(text='x\ny')))
+        self.assertTrue(tr.queue_text(body()));tr.editor_pending=None;tr.editor_state=focus('3'*16)
+        self.assertFalse(tr.queue_text(dict(body(),focusId='3'*16)))
+    def test_actual_input_invalidates_none_cache(self):
+        tr=test_tabs.Integration().trial();tr.editor_state={'state':'none','kind':None,'multiline':None,'focusId':None}
+        self.assertTrue(tr.queue_input({'kind':'point','x':.5,'y':.5,'click':True}));self.assertEqual(tr.editor_state['state'],'pending')
+        tr.editor_probe_requested=False;tr.worker_command=Mock(side_effect=[{'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}},{'applied':'key'}])
+        tr.apply_input({'kind':'key','key':'Enter'});self.assertTrue(tr.editor_probe_requested)
+    def test_separate_get_budget_and_escaped_text_body_limit(self):
+        tr=test_tabs.Integration().trial();tr.editor_state=focus();tr.editor_probe_at=t.time.monotonic();tr.get_budget.take=Mock(return_value=False)
+        cls=t.handler_for(tr);h=cls.__new__(cls);h.route=lambda:'text-focus';h.reply=Mock();h.do_GET();self.assertEqual(h.reply.call_args.args[0],200);tr.get_budget.take.assert_not_called()
+        raw=json.dumps(body(text='水'*1024)).encode();self.assertGreater(len(raw),2048);self.assertLess(len(raw),8192)
+        # Text-size business rule after admission; test_server covers the real gate.
+        tr.media_stream.permits_input=Mock(return_value=True)
+        h.route=lambda:'text';h.headers={'Content-Type':'application/json','Content-Length':str(len(raw))};h.rfile=io.BytesIO(raw);h.reply=Mock();h.do_POST();self.assertEqual(h.reply.call_args.args[0],200)
+        h.route=lambda:'navigate';h.reply=Mock();h.do_POST();self.assertEqual(h.reply.call_args.args[0],413)
+    def test_serialized_service_records_only_operation_status(self):
+        tr=test_tabs.Integration().trial();tr.editor_state=focus();self.assertTrue(tr.queue_text(body()))
+        page=Mock();page.editor_apply.return_value='unknown';page.editor_probe.return_value=focus('3'*16)
+        with patch.object(t,'prove_selected_tab',return_value=True):t.service_editor(tr,page,Mock())
+        self.assertEqual(tr.text_snapshot()['edit'],{'id':OID,'status':'unknown'});self.assertIsNone(tr.editor_pending);self.assertFalse(tr.editor_active)
+        self.assertNotIn('synthetic',json.dumps(tr.text_snapshot()));self.assertEqual(page.editor_apply.call_count,1)
+    def test_native_preflight_fixed_keys_unicode_and_cleared(self):
+        page=p.TabSession.__new__(p.TabSession);page.start_url='http://{{SPARK_IP}}:4177/'+TOKEN+'/start';page.editor=None
+        page._evaluate=Mock(return_value=True);page.editor_probe=Mock(side_effect=[focus(),{'state':'unavailable','kind':'password','multiline':False,'focusId':None}]+[dict(focus(),multiline=m)for m in (True,True,True,False,False)])
+        page.editor_apply=Mock(side_effect=['applied','rejected','applied','applied','applied','applied','applied'])
+        page.assert_alive=Mock();page.snapshot=Mock(return_value=test_tabs.scalars())
+        result=page.keyboard_preflight();self.assertEqual(set(result),{'qualified','text','password','multiline','shadow','keys','cleared'});self.assertTrue(all(result.values()))
+        actions=[x.args[0]for x in page.editor_apply.call_args_list];self.assertEqual([x['action']for x in actions],['insert','insert','insert','backspace','insert-enter','insert','insert-enter']);self.assertEqual(actions[4]['text'],'é水')
+        self.assertIn('Ré', '\n'.join(x.args[0]for x in page._evaluate.call_args_list).replace('\\u00e9','é'));self.assertIn('remove()',page._evaluate.call_args.args[0]);page.assert_alive.assert_called_once();page.snapshot.assert_called_once()
+        self.assertTrue(any('h.dataset.submits==="1"'in x.args[0]for x in page._evaluate.call_args_list))
+    def test_preflight_failure_still_removes_sentinel(self):
+        page=p.TabSession.__new__(p.TabSession);page.start_url='http://{{SPARK_IP}}:4177/'+TOKEN+'/start';page.editor=None
+        page._evaluate=Mock(return_value=True);page.editor_probe=Mock(return_value=focus());page.editor_apply=Mock(return_value='unknown')
+        with self.assertRaisesRegex(p.ProofError,'KEYBOARD_PREFLIGHT_INSERT'):page.keyboard_preflight()
+        self.assertIn('remove()',page._evaluate.call_args.args[0]);self.assertIsNone(page.editor)
+    def test_native_locator_no_values_open_shadow_same_origin_and_unsupported_frame(self):
+        js=r'''const vm=require('vm'),assert=require('assert');const locate=SOURCE;
+        function element(tag,extra={}){const e=Object.assign({tagName:tag,isConnected:true,type:'text',disabled:false,readOnly:false},extra);Object.defineProperty(e,'value',{get(){throw Error('private value read')}});return e}
+        function run(e){let document={activeElement:e,hasFocus:()=>true};return vm.runInNewContext(locate+';locate()',{document})}
+        const input=element('INPUT');assert.strictEqual(run(input).e,input);assert.strictEqual(run(element('INPUT',{type:'password'})).kind,'password');assert.strictEqual(run(element('TEXTAREA')).multiline,true);
+        assert.strictEqual(run(element('INPUT',{readOnly:true})).e,null);assert.strictEqual(run(element('INPUT',{type:'hidden'})).e,null);assert.strictEqual(run(element('DIV',{isContentEditable:true})).multiline,true);
+        assert.strictEqual(run(element('DIV',{shadowRoot:{activeElement:input}})).e,input);assert.strictEqual(run(element('IFRAME',{contentDocument:{activeElement:input}})).e,input);assert.strictEqual(run(element('IFRAME',{contentDocument:null})).unavailable,true);
+        const cross=element('IFRAME');Object.defineProperty(cross,'contentDocument',{get(){throw Error('cross-origin')}});assert.strictEqual(run(cross).unavailable,true);console.log('10 focus resolver cases passed');'''.replace('SOURCE',json.dumps(p.EDITOR_LOCATE))
+        out=subprocess.run(['node','-e',js],capture_output=True,text=True,timeout=5);self.assertEqual(out.returncode,0,out.stderr)
+    def test_per_command_frame_budget_exact_boundary_without_native_pipe(self):
+        # Consume buffered fixed JSON through the real parser. This proves its
+        # per-command boundary after a long session, without native I/O.
+        page=p.SessionPage.__new__(p.SessionPage)
+        page.buffer=bytearray(b'{}\0{}\0');page.frames=10**9
+        page._command_frames_start=page.frames-63
+        self.assertEqual(page._message(),{});self.assertEqual(page.frames,10**9+1)
+        with self.assertRaisesRegex(p.ProofError,'CDP_FRAME_COUNT'):page._message()
+        self.assertEqual(page.frames,10**9+2)
+
+if __name__=='__main__':unittest.main(verbosity=2)

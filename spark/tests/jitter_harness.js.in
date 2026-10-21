@@ -1,0 +1,211 @@
+'use strict';
+// Virtual-time simulation of the ring receiver (viewer.js) against a fake MSE
+// video element and a fake live server. Node only: no network, no TV, no media.
+//
+//   node jitter_harness.js [viewer.js] [scenario] [--json]
+//   scenarios: steady | stall1500 | stall3500 | servergap | streamend
+//
+// The fake <video> plays buffered media at 1.0x, fires 'waiting' when it runs
+// out and 'playing' when data returns, takes 30 ms to complete a seek, and
+// never changes rate. The fake server streams a live 60 fps source in 33 ms
+// fragments starting from an IDR 0.3 s old, like MediaStream.open(latest=True).
+// Results are a model of the receiver policy, not a TV or decoder measurement.
+const fs = require('fs');
+const vm = require('vm');
+
+const args = process.argv.slice(2).filter(a => a !== '--json');
+const viewerPath = args[0] || require('path').join(__dirname, 'viewer.js'), scenario = args[1] || 'steady';
+const asJson = process.argv.includes('--json');
+const src = fs.readFileSync(viewerPath, 'utf8');
+let U8 = Uint8Array; // replaced by the viewer context's own constructor (instanceof checks)
+const TOKEN = 'c'.repeat(48), ORIGIN = 'http://{{SPARK_IP}}:4177', BASE = '/' + TOKEN + '/';
+
+// ------------------------------------------------------------- virtual clock
+let now = 1_700_000_000_000; const T0 = now; let tid = 1; const timers = new Map();
+const vSetTimeout = (fn, ms) => { const id = tid++; timers.set(id, { at: now + Math.max(0, ms || 0), fn, iv: 0 }); return id; };
+const vSetInterval = (fn, ms) => { const id = tid++; timers.set(id, { at: now + ms, fn, iv: ms }); return id; };
+const vClear = (id) => { timers.delete(id); };
+class VDate extends Date { static now() { return now; } }
+async function flush() { for (let i = 0; i < 20; i++) await Promise.resolve(); await new Promise(r => setImmediate(r)); for (let i = 0; i < 20; i++) await Promise.resolve(); }
+
+// ------------------------------------------------------------- fake DOM
+class El extends EventTarget {
+  constructor(id) { super(); this.id = id; this.hidden = false; this.disabled = false; this.textContent = ''; this.value = ''; this.readOnly = true;
+    this.style = {}; this.dataset = {}; this.classList = { toggle() {}, add() {}, remove() {}, contains() { return false; } }; this.children = []; }
+  focus() { doc.activeElement = this; } blur() {} click() { this.dispatchEvent(new Event('click')); }
+  getBoundingClientRect() { return { left: 0, top: 0, width: 1920, height: 1080 }; }
+  replaceChildren() { this.children = []; } appendChild(c) { this.children.push(c); } setAttribute() {} scrollIntoView() {}
+  getContext() { return null; }
+}
+const ranges = []; // [start,end] in presentation time
+function addRange(s, e) {
+  ranges.push([s, e]); ranges.sort((a, b) => a[0] - b[0]);
+  for (let i = 0; i < ranges.length - 1;) { if (ranges[i + 1][0] <= ranges[i][1] + 0.001) { ranges[i][1] = Math.max(ranges[i][1], ranges[i + 1][1]); ranges.splice(i + 1, 1); } else i++; }
+}
+function removeRange(s, e) {
+  for (let i = 0; i < ranges.length; i++) { const [a, b] = ranges[i]; if (e <= a || s >= b) continue; const keep = []; if (a < s) keep.push([a, s]); if (b > e) keep.push([e, b]); ranges.splice(i, 1, ...keep); i += keep.length - 1; }
+}
+const buffered = { get length() { return ranges.length; }, start(i) { if (i >= ranges.length) throw Error('INDEX'); return ranges[i][0]; }, end(i) { if (i >= ranges.length) throw Error('INDEX'); return ranges[i][1]; } };
+class FakeSB extends EventTarget {
+  constructor() { super(); this.updating = false; this.timestampOffset = 0; this.buffered = buffered; this.appends = 0; }
+  appendBuffer(u8) {
+    if (this.updating) throw Error('InvalidStateError');
+    this.updating = true; this.appends++;
+    const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const kind = dv.getUint8(0);
+    if (kind === 2) { addRange(dv.getFloat64(1) + this.timestampOffset, dv.getFloat64(9) + this.timestampOffset); video._hasMedia = true; }
+    vSetTimeout(() => { this.updating = false; this.dispatchEvent(new Event('updateend')); video._dataArrived(); }, 2);
+  }
+  remove(s, e) { this.updating = true; vSetTimeout(() => { removeRange(s, e); this.updating = false; this.dispatchEvent(new Event('updateend')); }, 2); }
+  abort() { this.updating = false; }
+}
+const objectUrls = new Map();
+class FakeMS extends EventTarget {
+  constructor() { super(); this.readyState = 'closed'; this.sb = null; }
+  static isTypeSupported() { return true; }
+  addSourceBuffer() { this.sb = new FakeSB(); stats.sourceBuffers++; return this.sb; }
+  endOfStream() {}
+}
+const stats = { notAdvancingMs: 0, pausedMs: 0, playCalls: 0, firstPlayAt: null, waitingEvents: 0, seeks: 0, frozenMs: 0, playedMs: 0, sourceBuffers: 0, posts: [], aheadSamples: [], maxAhead: 0, events: [] };
+class FakeVideo extends El {
+  constructor() { super('video'); this._t = 0; this.paused = true; this.seeking = false; this._waiting = false; this._hasMedia = false; this._src = ''; this.muted = true; this.error = null; this._frames = 0; }
+  get currentTime() { return this._t; }
+  set currentTime(t) { this.seeking = true; this._t = t; stats.seeks++; this.dispatchEvent(new Event('seeking')); log('seek', t);
+    vSetTimeout(() => { this.seeking = false; this.dispatchEvent(new Event('seeked')); if (!this.paused && this._range()) { this._waiting = false; this.dispatchEvent(new Event('playing')); }
+      if (server.postSeekWaiting && !this.paused) vSetTimeout(() => { if (!this.paused && !this.seeking) { this._waiting = true; stats.waitingEvents++; log('waiting'); this.dispatchEvent(new Event('waiting')); } }, 20);
+    }, 30); }
+  get videoWidth() { return this._hasMedia ? 3840 : 0; } get videoHeight() { return this._hasMedia ? 2160 : 0; }
+  _range() { return ranges.find(([a, b]) => this._t >= a - 0.001 && this._t < b - 0.001); }
+  get readyState() { if (!this._hasMedia) return 0; const r = this._range(); if (!r) return 1; return r[1] - this._t > 0.05 ? 4 : 2; }
+  set src(u) { this._src = u; const ms = objectUrls.get(u); if (ms) vSetTimeout(() => { ms.readyState = 'open'; ms.dispatchEvent(new Event('sourceopen')); }, 1); }
+  get src() { return this._src; }
+  removeAttribute() { this._src = ''; ranges.length = 0; this._hasMedia = false; this._t = 0; }
+  load() {}
+  play() { stats.playCalls++; if (stats.firstPlayAt === null) stats.firstPlayAt = now - T0; this.paused = false; log('play');
+    if (this.readyState >= 3) this.dispatchEvent(new Event('playing')); else { this._waiting = true; stats.waitingEvents++; this.dispatchEvent(new Event('waiting')); }
+    return Promise.resolve(); }
+  pause() { if (!this.paused) log('pause'); this.paused = true; this.dispatchEvent(new Event('pause')); }
+  getVideoPlaybackQuality() { return { totalVideoFrames: this._frames, droppedVideoFrames: 0 }; }
+  _dataArrived() { if (this._waiting && !this.paused && !this.seeking && this.readyState >= 3) { this._waiting = false; this.dispatchEvent(new Event('playing')); } }
+  _tick(dt) {
+    if (this.paused || this.seeking || !this._hasMedia) return;
+    const r = this._range();
+    if (r && this._t + dt <= r[1]) { this._t += dt; stats.playedMs += dt * 1000; this._frames += dt * 60; return; }
+    if (r) this._t = r[1];
+    stats.frozenMs += dt * 1000;
+    if (!this._waiting) { this._waiting = true; stats.waitingEvents++; log('waiting'); this.dispatchEvent(new Event('waiting')); }
+  }
+}
+const video = new FakeVideo();
+const els = new Map([['video', video]]);
+const doc = new (class extends EventTarget {
+  constructor() { super(); this.hidden = false; this.activeElement = null; this.body = new El('body'); }
+  getElementById(id) { if (!els.has(id)) els.set(id, new El(id)); return els.get(id); }
+  createElement(t) { return new El(t); }
+})();
+function log(kind, v) { if (stats.events.length < 400) stats.events.push([Math.round(now - T0), kind, v === undefined ? null : Math.round(v * 1000) / 1000]); }
+
+// ------------------------------------------------------------- fake server
+const server = { epoch: 'e'.repeat(32), generation: 0, active: false, ended: false, stream: null, liveStart: T0 - 10_000, sentUntil: null,
+  stallFrom: null, stallTo: null, skipBehind: false, postSeekWaiting: false, endAt: null };
+function liveEdge() { return (now - server.liveStart) / 1000; }
+function chunk(kind, s, e) { const u = new U8(17); const dv = new DataView(u.buffer); dv.setUint8(0, kind); dv.setFloat64(1, s); dv.setFloat64(9, e); return u; }
+function textBody(obj) { const bytes = U8.from(new TextEncoder().encode(JSON.stringify(obj))); let sent = false;
+  return { getReader() { return { read() { if (sent) return Promise.resolve({ done: true }); sent = true; return Promise.resolve({ done: false, value: bytes }); }, cancel() { return Promise.resolve(); } }; } }; }
+function reply(path, status, obj) { return Promise.resolve({ status, ok: status >= 200 && status < 300, url: ORIGIN + path, body: obj === undefined ? null : textBody(obj) }); }
+function vFetch(path, opts = {}) {
+  const route = path.slice(BASE.length), sig = opts.signal;
+  if (sig && sig.aborted) return Promise.reject(new Error('AbortError'));
+  if (route === 'metrics') { try { stats.posts.push(JSON.parse(opts.body)); } catch (e) {} return reply(path, 200, { ok: true }); }
+  if (route === 'stream-state') return reply(path, 200, { schema: 1, epoch: server.epoch, generation: server.generation, active: server.active, started: server.generation > 0, ended: server.ended, error: null });
+  if (route === 'stream-open') {
+    const edge = liveEdge(), idr = Math.floor(edge) + 0.0, start = Math.max(0, edge - 0.3);
+    server.generation++; server.openStart = Math.round(start * 1000) / 1000;
+    return reply(path, 200, { schema: 1, epoch: server.epoch, generation: server.generation, index: 0, startNumerator: Math.round(start * 1000), startDenominator: 1000, initBytes: 100 });
+  }
+  if (route === 'stream-ready') return reply(path, 200, { ok: true });
+  if (route === 'stream.mp4') {
+    const queue = [], waiters = []; let closed = false;
+    const stream = { push(u) { if (waiters.length) waiters.shift().resolve({ done: false, value: u }); else queue.push(u); },
+      end() { closed = true; while (waiters.length) waiters.shift().resolve({ done: true }); } };
+    server.stream = stream; server.active = true; server.sentUntil = server.openStart;
+    stream.push(chunk(1, 0, 0));
+    stream.push(chunk(2, server.openStart, liveEdge())); server.sentUntil = liveEdge();
+    if (sig) sig.addEventListener('abort', () => { closed = true; server.active = false; if (server.stream === stream) server.stream = null; while (waiters.length) waiters.shift().reject(new Error('AbortError')); });
+    const reader = { read() { if (queue.length) return Promise.resolve({ done: false, value: queue.shift() }); if (closed) return Promise.resolve({ done: true });
+        return new Promise((resolve, reject) => waiters.push({ resolve, reject })); },
+      cancel() { closed = true; server.active = false; return Promise.resolve(); } };
+    return Promise.resolve({ status: 200, ok: true, url: ORIGIN + path, body: { getReader: () => reader } });
+  }
+  return reply(path, 404);
+}
+function serverTick() {
+  const st = server.stream; if (!st) return;
+  const t = now - T0;
+  if (server.endAt !== null && t >= server.endAt) { server.endAt = null; server.stream = null; server.active = false; st.end(); log('server-end'); return; }
+  if (server.stallFrom !== null && t >= server.stallFrom && t < server.stallTo) return;
+  if (server.skipBehind && liveEdge() - server.sentUntil > 3.0) {
+    // trial.py STREAM_MAX_BEHIND / MediaStream.skip_to_latest: drop the backlog
+    // and resume at the newest IDR (here 0.6 s old). The TV gets one gap.
+    const edge = liveEdge(); server.sentUntil = edge - 0.6; log('server-skip', edge - 0.6);
+  }
+  const edge = liveEdge();
+  if (edge - server.sentUntil >= 0.0333) { st.push(chunk(2, server.sentUntil, edge)); server.sentUntil = edge; }
+}
+
+// ------------------------------------------------------------- run
+const ctx = { document: doc, location: { origin: ORIGIN, pathname: BASE + 'viewer' }, history: { state: null, replaceState(s) { this.state = s; }, pushState(s) { this.state = s; } },
+  MediaSource: FakeMS, URL: { createObjectURL(ms) { const u = 'blob:' + (tid++); objectUrls.set(u, ms); return u; }, revokeObjectURL() {} },
+  fetch: vFetch, ReadableStream, TextEncoder, TextDecoder, AbortController, Event, EventTarget, console,
+  setTimeout: vSetTimeout, setInterval: vSetInterval, clearTimeout: vClear, clearInterval: vClear, Date: VDate,
+  crypto: { getRandomValues(a) { return a; } }, addEventListener() {}, removeEventListener() {} };
+ctx.window = ctx;
+ctx.BAAZ_STREAM = { token: TOKEN, codec: 'hvc1.1.6.L153.B0', history: true, tabs: true, text: true, audio: true, layout: true, fixedViewport: true, ring: true, origin: ORIGIN };
+vm.createContext(ctx);
+U8 = vm.runInContext('Uint8Array', ctx);
+
+const plans = {
+  steady: { seconds: 20 },
+  stall1500: { seconds: 25, stallFrom: 8000, stallTo: 9500 },
+  stall3500: { seconds: 30, stallFrom: 8000, stallTo: 11500 },
+  postseekwait: { seconds: 30, stallFrom: 8000, stallTo: 11500, postSeekWaiting: true },
+  servergap: { seconds: 30, stallFrom: 8000, stallTo: 12000, skipBehind: true },
+  streamend: { seconds: 25, endAt: 8000 },
+};
+const plan = plans[scenario]; if (!plan) throw Error('scenario');
+Object.assign(server, { stallFrom: plan.stallFrom ?? null, stallTo: plan.stallTo ?? null, skipBehind: !!plan.skipBehind, postSeekWaiting: !!plan.postSeekWaiting, endAt: plan.endAt ?? null });
+
+(async () => {
+  vm.runInContext(src, ctx, { filename: 'viewer.js' });
+  const end = now + plan.seconds * 1000; let nextSample = now + 250;
+  while (now < end) {
+    now += 5;
+    for (const [id, t] of [...timers.entries()].sort((a, b) => a[1].at - b[1].at)) {
+      if (t.at > now || !timers.has(id)) continue;
+      if (t.iv) t.at += t.iv; else timers.delete(id);
+      try { t.fn(); } catch (e) { log('timer-error', null); }
+    }
+    serverTick();
+    const before = video._t, wasSeeking = video.seeking;
+    video._tick(0.005);
+    if (stats.firstPlayAt !== null && video._t === before) { stats.notAdvancingMs += 5; if (video.paused && !wasSeeking) stats.pausedMs += 5; }
+    await flush();
+    if (now >= nextSample) { nextSample += 250; const r = video._range(); const ahead = r && !video.paused ? r[1] - video._t : null;
+      if (ahead !== null && now - T0 > 3000) { stats.aheadSamples.push(ahead); stats.maxAhead = Math.max(stats.maxAhead, ahead); } }
+  }
+  const last = stats.posts.filter(p => p && p.schema === 1).slice(-1)[0] || {};
+  const tail = stats.aheadSamples.slice(-8);
+  const out = {
+    scenario, viewer: viewerPath.split('/').slice(-2).join('/'),
+    firstPlayMs: stats.firstPlayAt, playCalls: stats.playCalls, seeks: stats.seeks,
+    videoWaitingEvents: stats.waitingEvents, pictureFrozenMs: stats.notAdvancingMs, ofWhichPausedMs: stats.pausedMs, playedMs: Math.round(stats.playedMs),
+    endAheadS: tail.length ? Math.round(tail.reduce((a, b) => a + b, 0) / tail.length * 1000) / 1000 : null,
+    maxAheadS: Math.round(stats.maxAhead * 1000) / 1000,
+    pausedAtEnd: video.paused, generation: server.generation, sourceBuffers: stats.sourceBuffers,
+    stateTitle: els.get('state-title') ? els.get('state-title').textContent : null,
+    statePanelHidden: els.get('state-panel') ? els.get('state-panel').hidden : null,
+    viewerCounters: ['cushionMs', 'stallEvents', 'gapSkips', 'liveJumps', 'autoReconnects', 'minAheadMs', 'state', 'error'].reduce((o, k) => (o[k] = last[k], o), {}),
+    events: asJson ? stats.events.slice(0, 60) : undefined,
+  };
+  console.log(JSON.stringify(out));
+})().catch(e => { console.error('HARNESS', e && e.stack || e); process.exit(2); });

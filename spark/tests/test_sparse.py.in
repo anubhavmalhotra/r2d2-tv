@@ -1,0 +1,154 @@
+"""Generated independently populated tracks, bootstrap and reconnect controls."""
+import io,struct,unittest
+from fractions import Fraction
+import media_ring as m
+import test_media_ring as f
+from test_initial import native_init
+
+def sparse_pair(seq,*,video=None,audio=None,vd=0,ad=0,sync=False,defaults=False,tail=b''):
+    # video/audio are explicit sample durations. None omits the whole traf.
+    rows=[]
+    if video is not None:rows.append((1,vd,list(video),[f.nal(19 if sync and i==0 else 1)for i in range(len(video))]))
+    if audio is not None:rows.append((2,ad,list(audio),[b'aa']*len(audio)))
+    def build(offsets):
+        trafs=[]
+        for ident,start,durations,data in rows:
+            flags=0x01010000 if ident==1 else 0x02000000
+            tfhd=f.full(b'tfhd',f.words(ident,durations[0],0,flags),0x20038)
+            tfdt=f.full(b'tfdt',struct.pack('>Q',start),version=1)
+            trflags=0x201 if defaults else 0x701
+            if defaults and ident==1 and sync:trflags|=4
+            raw=f.words(len(data))+struct.pack('>i',offsets.get(ident,0))
+            if trflags&4:raw+=f.words(0x02000000)
+            for i,(duration,datum)in enumerate(zip(durations,data)):
+                if trflags&0x100:raw+=f.words(duration)
+                raw+=f.words(len(datum))
+                if trflags&0x400:raw+=f.words(0x02000000 if ident==2 or(sync and i==0)else 0x01010000)
+            trafs.append(f.box(b'traf',tfhd+tfdt+f.full(b'trun',raw,trflags)))
+        return f.box(b'moof',f.full(b'mfhd',f.words(seq))+b''.join(trafs))
+    moof=build({});offset=len(moof)+8;offsets={}
+    for ident,start,durations,data in rows:offsets[ident]=offset;offset+=sum(map(len,data))
+    return build(offsets),f.box(b'mdat',b''.join(d for _,_,_,data in rows for d in data)+tail)
+
+def ring(**kw):
+    r=m.MediaRing('a'*32,**kw);r.initialize(*native_init());return r
+
+def observed_prefix(r):
+    r.append(*sparse_pair(1,video=[256,256],audio=[931,1024],sync=True))
+    r.append(*sparse_pair(2,video=[256,256],audio=[1024],vd=512,ad=1955))
+
+class SparseTracks(unittest.TestCase):
+    def test_observed_video_only_shape_preserves_audio_clock_and_bytes(self):
+        r=ring();observed_prefix(r);pair=sparse_pair(3,video=[256,256],vd=1024,defaults=True)
+        self.assertEqual(r.prior,{1:1024,2:2979})
+        try:r.append(*pair)
+        except m.MediaError as exc:self.fail('valid sparse pair rejected: '+str(exc))
+        self.assertEqual(r.prior,{1:1536,2:2979});self.assertEqual(r.next_index,3)
+        frag,_=r.read(m.Cursor(r.epoch,2));self.assertEqual((frag.moof,frag.mdat),pair);self.assertFalse(frag.access_point)
+        self.assertEqual(frag.track_spans,((1,1024,1536),));self.assertEqual(dict(frag.decode_ends),r.prior)
+    def test_audio_only_successor_retains_video_and_exact_dts(self):
+        r=ring();observed_prefix(r);r.append(*sparse_pair(3,video=[256,256],vd=1024));pair=sparse_pair(4,audio=[1024,1024],ad=2979,defaults=True)
+        r.append(*pair);self.assertEqual(r.prior,{1:1536,2:5027});self.assertEqual(r.next_index,4)
+        frag,_=r.read(m.Cursor(r.epoch,3));self.assertEqual((frag.moof,frag.mdat),pair)
+    def test_missing_track_cannot_hide_accumulated_skew(self):
+        r=ring();observed_prefix(r);r.append(*sparse_pair(3,video=[256,256],vd=1024))
+        before=(r.next_index,dict(r.prior),r.bytes,r.count,tuple(tuple(x)for x in r.groups))
+        r.append(*sparse_pair(4,video=[256]*8,vd=1536))
+        self.assertEqual((r.next_index,dict(r.prior),r.bytes,r.count,tuple(tuple(x)for x in r.groups)),before)
+        self.assertGreater(r.snapshot()['pendingBytes'],0)
+        with self.assertRaisesRegex(m.MediaError,'AV_INTERLEAVE_BOUND'):r.append(*sparse_pair(5,video=[256]*64,vd=3584))
+        self.assertEqual((r.next_index,dict(r.prior),r.bytes,r.count,tuple(tuple(x)for x in r.groups)),before)
+    def test_each_track_gap_overlap_or_restart_refused(self):
+        for kind,dts in [('video',1023),('video',1025),('audio',2978),('audio',2980),('audio',0)]:
+            r=ring();observed_prefix(r)
+            kw={'video':[256],'vd':dts}if kind=='video'else{'audio':[1024],'ad':dts}
+            with self.subTest(kind=kind,dts=dts),self.assertRaisesRegex(m.MediaError,'DECODE_GAP_OR_OVERLAP'):r.append(*sparse_pair(3,**kw))
+            self.assertEqual(r.prior,{1:1024,2:2979})
+    def test_audio_prefix_waits_for_first_closed_video_idr(self):
+        r=ring();a=sparse_pair(1,audio=[815,1024]);r.append(*a)
+        with self.assertRaisesRegex(m.MediaError,'NO_ACCESS_POINT'):r.resume()
+        v=sparse_pair(2,video=[256,256],sync=True);r.append(*v);res=r.resume()
+        self.assertEqual((res.cursor.index,res.start),(0,Fraction(0)))
+        x,c=r.read(res.cursor);self.assertEqual((x.moof,x.mdat),a);self.assertFalse(x.access_point)
+        x,c=r.read(c);self.assertEqual((x.moof,x.mdat),v);self.assertTrue(x.access_point)
+    def test_video_prefix_accepts_first_audio_trim_at_track_beginning(self):
+        r=ring();r.append(*sparse_pair(1,video=[256,256],sync=True))
+        with self.assertRaisesRegex(m.MediaError,'NO_ACCESS_POINT'):r.resume()
+        r.append(*sparse_pair(2,audio=[815,1024]));self.assertTrue(r.initial_audio_trim);self.assertEqual(r.prior,{1:512,2:1839});self.assertEqual(r.resume().cursor.index,0)
+    def test_initial_delta_refused_even_after_audio_prefix(self):
+        for audio in (False,True):
+            r=ring()
+            if audio:r.append(*sparse_pair(1,audio=[1024]))
+            with self.assertRaisesRegex(m.MediaError,'INITIAL_IDR_REQUIRED'):r.append(*sparse_pair(2 if audio else 1,video=[256],sync=False))
+    def test_incomplete_bootstrap_time_and_fragment_bound_are_transactional(self):
+        r=ring();before=(r.next_index,r.bytes,r.count,dict(r.prior))
+        with self.assertRaisesRegex(m.MediaError,'AV_INTERLEAVE_BOUND'):r.append(*sparse_pair(1,audio=[1024]*48))
+        self.assertEqual((r.next_index,r.bytes,r.count,dict(r.prior)),before)
+        r=ring()
+        for n in range(64):r.append(*sparse_pair(n+1,video=[1],vd=n,sync=n==0))
+        self.assertEqual(r.next_index,0);self.assertEqual(len(r.unpublished),64)
+        with self.assertRaisesRegex(m.MediaError,'AV_INTERLEAVE_BOUND'):r.append(*sparse_pair(65,video=[1],vd=64))
+        self.assertEqual(r.next_index,0)
+    def test_latest_resume_waits_for_audio_and_uses_earliest_original_clock(self):
+        r=ring();r.append(*sparse_pair(1,video=[256,256],audio=[1024],sync=True))
+        r.append(*sparse_pair(2,video=[256],vd=512,sync=True));self.assertEqual(r.resume().cursor.index,0)
+        v,_=r.read(m.Cursor(r.epoch,1));self.assertEqual(v.start,Fraction(512,15360))
+        r.append(*sparse_pair(3,audio=[1024],ad=1024))
+        res=r.resume();self.assertEqual(res.cursor.index,1);self.assertEqual(res.start,Fraction(1024,48000));self.assertLess(res.start,v.start)
+        v,c=r.read(res.cursor);a,c=r.read(c);self.assertTrue(v.access_point);self.assertEqual(a.track_spans,((2,1024,2048),))
+    def test_repeated_alternation_eviction_keeps_complete_av_bootstrap(self):
+        r=ring(max_seconds=2);vd=256;ad=1024;seq=1;source={}
+        pair=sparse_pair(seq,video=[256],audio=[1024],sync=True);source[0]=pair;r.append(*pair);seq+=1
+        while max(Fraction(vd,15360),Fraction(ad,48000))<8:
+            if Fraction(vd,15360)<=Fraction(ad,48000):
+                pair=sparse_pair(seq,video=[256],vd=vd,sync=(vd//256)%60==0);vd+=256
+            else:pair=sparse_pair(seq,audio=[1024],ad=ad);ad+=1024
+            source[seq-1]=pair;r.append(*pair);seq+=1
+            self.assertLessEqual(r.bytes,r.max_bytes);self.assertLessEqual(r.count,r.max_fragments)
+        self.assertGreater(r.groups[0][0].index,0);res=r.resume();group=next(g for g in r.groups if g[0].index==res.cursor.index)
+        self.assertTrue(r._bootstrap(group)[0]);self.assertEqual(res.start,min(frag.start for frag in group))
+        cursor=res.cursor;seen={};first_video=None
+        for _ in range(len(group)):
+            frag,cursor=r.read(cursor);self.assertEqual((frag.moof,frag.mdat),source[frag.index])
+            for ident,begin,end in frag.track_spans:
+                seen.setdefault(ident,begin)
+                if ident==1 and first_video is None:first_video=frag
+        self.assertEqual(set(seen),{1,2});self.assertTrue(first_video.access_point);self.assertEqual(r.prior,{1:vd,2:ad})
+        with self.assertRaises(m.Lagged):r.read(m.Cursor(r.epoch,0))
+    def test_unknown_duplicate_empty_traf_and_unaccounted_data_still_refused(self):
+        r=ring();observed_prefix(r);a,z=sparse_pair(3,video=[256],vd=1024);bad=bytearray(a);p=bad.index(b'tfhd');bad[p+8:p+12]=f.words(3)
+        for pair in ((bytes(bad),z),sparse_pair(3),sparse_pair(3,video=[256],vd=1024,tail=b'x')):
+            with self.assertRaises(m.MediaError):m.parse_fragment(r.init,*pair,2,3,r.prior)
+        a,z=sparse_pair(3,video=[256],audio=[1024],vd=1024,ad=2979);bad=bytearray(a);p=bad.index(b'tfhd',bad.index(b'tfhd')+1);bad[p+8:p+12]=f.words(1)
+        with self.assertRaisesRegex(m.MediaError,'FRAGMENT_TRACK_ID'):m.parse_fragment(r.init,bytes(bad),z,2,3,r.prior)
+    def test_clock_map_scope_cannot_forge_omitted_tracks(self):
+        init=m.parse_init(*native_init());pair=sparse_pair(1,video=[256],sync=True)
+        for prior in ({3:0},{1:True},{True:0},{1:-1},{1:2**64},[(1,0)]):
+            with self.assertRaisesRegex(m.MediaError,'PRIOR_CLOCK_SCOPE'):m.parse_fragment(init,*pair,0,1,prior)
+    def test_clean_eof_cannot_qualify_audio_only_or_video_only_source(self):
+        for pair in (sparse_pair(1,audio=[1024]),sparse_pair(1,video=[256],sync=True)):
+            raw=b''.join(native_init()+pair);r=ring();p=m.Producer(r,io.BytesIO(raw).read)
+            # Producer owns a fresh ring initialized by its own ftyp/moov.
+            r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read);p.step();p.step()
+            with self.assertRaisesRegex(m.MediaError,'AV_CHECKPOINT_REQUIRED'):p.step()
+            self.assertFalse(r.ended)
+    def test_valid_final_video_only_group_may_finish_after_older_bootstrap_evicted(self):
+        first=sparse_pair(1,video=[256,256],audio=[1024],sync=True)
+        last=sparse_pair(2,video=[256],vd=512,sync=True)
+        cap=sum(map(len,native_init()+first+last))-1
+        r=ring(max_bytes=cap);r.append(*first);self.assertTrue(r.bootstrap_seen)
+        r.append(*last);self.assertEqual(len(r.groups),1);self.assertEqual(r.groups[0][0].index,1)
+        self.assertFalse(r._bootstrap(r.groups[0])[0]);r.finish();self.assertTrue(r.ended)
+        with self.assertRaisesRegex(m.MediaError,'NO_ACCESS_POINT'):r.resume()
+        x,_=r.read(m.Cursor(r.epoch,1));self.assertEqual((x.moof,x.mdat),last)
+
+    def test_sparse_terminal_audio_trim_needs_exact_eof(self):
+        from test_terminal import trailer
+        first=sparse_pair(1,video=[256,256],audio=[1024],sync=True);last=sparse_pair(2,audio=[256],ad=1024)
+        raw=b''.join(native_init()+first+last)+trailer();r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read)
+        p.step();p.step();self.assertEqual(p.step(),'fragment');self.assertTrue(r.ended);self.assertTrue(r.terminal_audio_trim);self.assertEqual(r.prior,{1:512,2:1280})
+        raw=b''.join(native_init()+first+last+sparse_pair(3,video=[256],vd=512));r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read);p.step();p.step()
+        with self.assertRaisesRegex(m.MediaError,'TERMINAL_AUDIO_NOT_LAST'):p.step()
+        self.assertEqual(r.next_index,1)
+
+if __name__=='__main__':unittest.main()

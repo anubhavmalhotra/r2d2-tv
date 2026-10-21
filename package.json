@@ -1,0 +1,14 @@
+{
+  "name": "r2d2-tv",
+  "version": "0.2.3",
+  "private": true,
+  "license": "MIT AND GPL-3.0-or-later",
+  "engines": {"node": ">=20"},
+  "scripts": {
+    "test:home": "node tests/test_home_ui.js",
+    "test:browser": "node tests/test_browser_ui.js"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

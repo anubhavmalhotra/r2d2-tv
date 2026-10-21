@@ -1,0 +1,13 @@
+{
+ "schema": 1,
+ "about": "Synthetic resident phase pings, byte for byte as voice/tv/resident_mic.js signs them for the all-'a' fixture voice key and this fixture TV certificate pin. voice/tv/test_resident_mic.js regenerates them; voice/backend/test_voice_e2e.py posts them to Spark's /voice-phase route.",
+ "tvCertificateSha256": "714f7108ae1387dc72ec6b79a0c0f8e596205dbc8159d2c538493ba664ed26a9",
+ "pings": [
+  "{\"boot\":\"00000000000000b1\",\"code\":null,\"cut\":false,\"deadlineMs\":null,\"mac\":\"e3165ad98b0c1fa8c565dc618d704e6da6eb775be81cf26b445fff8dee2821b0\",\"phase\":\"pressed\",\"press\":\"0123456789abcdef\",\"schema\":1,\"seq\":1}",
+  "{\"boot\":\"00000000000000b1\",\"code\":null,\"cut\":false,\"deadlineMs\":5499,\"mac\":\"fbb33573d9df5e314c0ea4411457287a99298004ab3919f63b35ff065c42e2f2\",\"phase\":\"listening\",\"press\":\"0123456789abcdef\",\"schema\":1,\"seq\":2}",
+  "{\"boot\":\"00000000000000b1\",\"code\":null,\"cut\":false,\"deadlineMs\":null,\"mac\":\"842d7f96a85f29a0ed49d659ebdf9e13804546995b9fb61c98ebd0642586b9f8\",\"phase\":\"released\",\"press\":\"0123456789abcdef\",\"schema\":1,\"seq\":3}",
+  "{\"boot\":\"00000000000000b1\",\"code\":null,\"cut\":false,\"deadlineMs\":null,\"mac\":\"01f943cb4b5a4a93d9bd2ea7636c0393f9c999db2da0587d91e7e01a611a6655\",\"phase\":\"pressed\",\"press\":\"fedcba9876543210\",\"schema\":1,\"seq\":4}",
+  "{\"boot\":\"00000000000000b1\",\"code\":null,\"cut\":false,\"deadlineMs\":5499,\"mac\":\"c8a74233bdb90a0a82571f11b4a6616ff573358041bfb87e5be9fb75e2dbb992\",\"phase\":\"listening\",\"press\":\"fedcba9876543210\",\"schema\":1,\"seq\":5}",
+  "{\"boot\":\"00000000000000b1\",\"code\":\"NO_SPEECH\",\"cut\":false,\"deadlineMs\":null,\"mac\":\"c7edf49b30f1ae21382fe360bed93ad9fbe9551241a42c278bf20555af5b6895\",\"phase\":\"fault\",\"press\":\"fedcba9876543210\",\"schema\":1,\"seq\":6}"
+ ]
+}

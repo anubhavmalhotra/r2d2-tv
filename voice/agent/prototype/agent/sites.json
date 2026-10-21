@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "sites": [
+    {"key": "youtube", "name": "YouTube", "url": "https://www.youtube.com",
+     "aliases": ["youtube", "you tube"]},
+    {"key": "duckduckgo", "name": "DuckDuckGo", "url": "https://duckduckgo.com",
+     "aliases": ["duckduckgo", "duck duck go"]}
+  ]
+}

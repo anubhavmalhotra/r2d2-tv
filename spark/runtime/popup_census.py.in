@@ -1,0 +1,69 @@
+"""GPL-3.0-or-later. Bounded popup reconciliation for an exclusive owned Chromium context.
+
+Call under the existing single CDP owner/io lock before ordinary strict census,
+NEVER inside the explicit manual-new-tab adoption transition. No URLs are read.
+The caller still runs its unchanged strict target/window/focus proof afterward.
+"""
+import re
+import time
+
+class PopupError(RuntimeError):
+    pass
+
+def ident(value):
+    return type(value) is str and re.fullmatch('[A-Za-z0-9_-]{1,128}',value) is not None
+
+class PopupCensus:
+    def __init__(self):
+        self.attempted=set()
+        self.closed=0
+        self.attempt_count=0
+        self.last_closed=0
+
+    def reconcile(self, call, context, expected, infos, *, selected, closing=None, wait=time.sleep):
+        self.last_closed=0
+        if not ident(context) or type(expected) is not set or not 1<=len(expected)<=8 or not all(ident(x) for x in expected) or selected not in expected:
+            raise PopupError('POPUP_AUTHORITY')
+        if closing is not None and (not ident(closing) or closing in expected): raise PopupError('POPUP_CLOSING')
+        def census(items):
+            if type(items) is not list or not 1<=len(items)<=12: raise PopupError('POPUP_CENSUS')
+            seen=set(); extra=set()
+            for info in items:
+                if (type(info) is not dict or info.get('type')!='page' or info.get('browserContextId')!=context or
+                    not ident(info.get('targetId')) or info['targetId'] in seen): raise PopupError('POPUP_FOREIGN')
+                target=info['targetId'];seen.add(target)
+                if target in expected:
+                    if info.get('attached') is not True: raise PopupError('POPUP_OWNER_LOST')
+                elif target!=closing:
+                    if info.get('attached') is not False: raise PopupError('POPUP_ATTACHED_UNKNOWN')
+                    extra.add(target)
+            if not expected<=seen or len(extra)>4: raise PopupError('POPUP_OWNER_LOST')
+            return extra
+        extra=census(infos)
+        if self.attempted: raise PopupError('POPUP_UNRESOLVED_NO_REPLAY')
+        for target in sorted(extra):
+            info=call('Target.getTargetInfo',{'targetId':target}).get('targetInfo')
+            if (type(info) is not dict or info.get('targetId')!=target or info.get('type')!='page' or
+                info.get('browserContextId')!=context or info.get('attached') is not False): raise PopupError('POPUP_IDENTITY')
+            self.attempted.add(target)  # Admission is consumed even if reply is lost.
+            self.attempt_count=min(2147483647,self.attempt_count+1)
+            result=call('Target.closeTarget',{'targetId':target})
+            if type(result) is not dict or result.get('success') is not True: raise PopupError('POPUP_CLOSE_UNCERTAIN')
+        if not extra: return infos
+        for i in range(3):
+            current=call('Target.getTargets',{'filter':[{'type':'page','exclude':False}]}).get('targetInfos')
+            remaining=census(current)
+            if not remaining:
+                # A script popup may have taken focus. Restore only the already
+                # selected owned target, then caller re-proves window/geometry.
+                call('Target.activateTarget',{'targetId':selected})
+                self.last_closed=len(extra)
+                self.closed=min(2147483647,self.closed+len(extra))
+                self.attempted.difference_update(extra)
+                return current
+            if not remaining<=extra: raise PopupError('POPUP_NEW_DURING_CLEANUP')
+            if i<2: wait(0.05)
+        raise PopupError('POPUP_CLOSE_PENDING')
+
+    def evidence(self):
+        return {'popupCloseAttempts':self.attempt_count,'popupClosed':self.closed,'popupUnresolved':len(self.attempted),'urlsExported':False}

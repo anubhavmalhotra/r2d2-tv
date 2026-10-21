@@ -1,0 +1,23 @@
+"""Two bounded same-attempt authored startup observations; no raw JS/SDP/URL."""
+import hashlib,hmac,json,re
+from .signal_protocol import canonical,need
+
+STAGES=('CLOCK_BEFORE','CLOCK_AFTER','CLOCK_WITHIN','CLOCK_INVALID','API_FETCH_MISSING','API_ABORT_MISSING','API_PROMISE_MISSING','API_PERFORMANCE_MISSING','API_MEDIASTREAM_MISSING','API_PEER_MISSING','SCRIPT_SYNTAX_ERROR','SCRIPT_REFERENCE_ERROR','SCRIPT_TYPE_ERROR','SCRIPT_OTHER_ERROR','UNHANDLED_REJECTION','CSP_BLOCKED')
+def unsigned(attempt,stage):
+    need(type(attempt)is str and re.fullmatch('[a-f0-9]{64}',attempt) and stage in STAGES,'STAGE_SCOPE')
+    return {'schema':1,'attempt':attempt,'kind':'stage','sequence':1 if stage in STAGES[:4]else 2,'payload':{'stage':stage}}
+def sign(key,attempt,stage):
+    need(type(key)is bytes and len(key)==32,'STAGE_SCOPE');v=unsigned(attempt,stage)
+    return canonical(dict(v,mac=hmac.new(key,canonical(v),hashlib.sha256).hexdigest())).decode('ascii')
+def verify(key,attempt,raw):
+    need(type(raw)is bytes and 0<len(raw)<=1024,'STAGE_BOUND')
+    def pairs(v):
+        need(len(v)==len({k for k,_ in v}),'STAGE_SCOPE');return dict(v)
+    v=json.loads(raw,object_pairs_hook=pairs)
+    need(type(v)is dict and set(v)=={'schema','attempt','kind','sequence','payload','mac'} and
+         type(v['payload'])is dict and set(v['payload'])=={'stage'} and type(v['payload']['stage'])is str,'STAGE_SCOPE')
+    expected=unsigned(attempt,v['payload']['stage']);mac=v.pop('mac')
+    need(type(v['schema'])is int and type(v['sequence'])is int and v==expected and
+         type(mac)is str and re.fullmatch('[a-f0-9]{64}',mac) and
+         hmac.compare_digest(mac,hmac.new(key,canonical(v),hashlib.sha256).hexdigest()),'STAGE_AUTH')
+    return v['sequence'],v['payload']['stage']

@@ -1,0 +1,334 @@
+"""Owned Pulse null sink and fixed HEVC/AAC arguments. No default-device capture.
+Native calls occur only in Pulse()/OwnedAudio.prepare(), never on import.
+The shared same-user Pulse server is not a hostile-client security boundary.
+"""
+import ctypes as C
+import hashlib
+import os
+import re
+import secrets
+import stat
+import threading
+import time
+
+SERVER = 'unix:/run/user/1000/pulse/native'
+LIBRARY = '/usr/lib/aarch64-linux-gnu/libpulse.so.0'
+AUDIO_CODEC = 'mp4a.40.2'
+MIME = 'video/mp4; codecs="hvc1.1.6.L153.B0,mp4a.40.2"'
+INVALID = 0xffffffff
+
+class AudioError(RuntimeError): pass
+
+class Sample(C.Structure):
+    _fields_ = [('format', C.c_int), ('rate', C.c_uint32), ('channels', C.c_uint8)]
+class ChannelMap(C.Structure):
+    _fields_ = [('channels', C.c_uint8), ('map', C.c_int * 32)]
+class Volume(C.Structure):
+    _fields_ = [('channels', C.c_uint8), ('values', C.c_uint32 * 32)]
+class Module(C.Structure):
+    _fields_ = [('index', C.c_uint32), ('name', C.c_char_p), ('argument', C.c_char_p),
+                ('n_used', C.c_uint32), ('auto_unload', C.c_int), ('proplist', C.c_void_p)]
+class Sink(C.Structure):
+    _fields_ = [('name', C.c_char_p), ('index', C.c_uint32), ('description', C.c_char_p),
+        ('sample', Sample), ('map', ChannelMap), ('owner_module', C.c_uint32), ('volume', Volume),
+        ('mute', C.c_int), ('monitor_source', C.c_uint32), ('monitor_name', C.c_char_p)]
+class Server(C.Structure):
+    _fields_ = [('user', C.c_char_p), ('host', C.c_char_p), ('version', C.c_char_p), ('name', C.c_char_p),
+        ('sample', Sample), ('default_sink', C.c_char_p), ('default_source', C.c_char_p), ('cookie', C.c_uint32)]
+class SinkInput(C.Structure):
+    _fields_ = [('index', C.c_uint32), ('name', C.c_char_p), ('owner_module', C.c_uint32),
+        ('client', C.c_uint32), ('sink', C.c_uint32), ('sample', Sample), ('map', ChannelMap),
+        ('volume', Volume), ('buffer_usec', C.c_uint64), ('sink_usec', C.c_uint64),
+        ('resample', C.c_char_p), ('driver', C.c_char_p), ('mute', C.c_int), ('proplist', C.c_void_p), ('corked', C.c_int)]
+class SourceOutput(C.Structure):
+    _fields_ = [('index', C.c_uint32), ('name', C.c_char_p), ('owner_module', C.c_uint32),
+        ('client', C.c_uint32), ('source', C.c_uint32), ('sample', Sample), ('map', ChannelMap),
+        ('buffer_usec', C.c_uint64), ('source_usec', C.c_uint64), ('resample', C.c_char_p),
+        ('driver', C.c_char_p), ('proplist', C.c_void_p), ('corked', C.c_int)]
+
+def _ascii(raw, limit=1024):
+    if raw is None: return None
+    if len(raw) > limit: raise AudioError('AUDIO_METADATA_LIMIT')
+    try: return raw.decode('ascii')
+    except UnicodeError: raise AudioError('AUDIO_METADATA_ENCODING') from None
+
+def _digest(raw): return hashlib.sha256(raw or b'').hexdigest()
+
+class Pulse:
+    """Small synchronous facade over nonblocking libpulse introspection, 2s/op.
+    Unrelated stream names/properties are never decoded, retained or exported.
+    """
+    def __init__(self,server=SERVER):
+        self.server_address=server
+        self.isolated=bool(re.fullmatch(r"unix:/run/user/1000/snap\.chromium/r2d2-audio-[a-f0-9]{16}/pulse/native",server))
+        if server!=SERVER and not self.isolated:raise AudioError("AUDIO_SERVER_SCOPE")
+        if os.getuid() != 1000 or os.geteuid() != 1000: raise AudioError('AUDIO_USER')
+        info = os.stat(server[5:], follow_symlinks=False)
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 1000: raise AudioError('AUDIO_SOCKET')
+        self.lib = C.CDLL(LIBRARY)
+        self.loop = self.context = None
+        self.lock = threading.RLock()
+        self._bind()
+        try:
+            self.loop = self.lib.pa_mainloop_new()
+            if not self.loop: raise AudioError('AUDIO_MAINLOOP')
+            self.context = self.lib.pa_context_new(self.lib.pa_mainloop_get_api(self.loop), b'R2D2Audio')
+            if not self.context: raise AudioError('AUDIO_CONTEXT')
+            # NOAUTOSPAWN: a missing server must not start or change user services.
+            if self.lib.pa_context_connect(self.context, server.encode(), 1, None) < 0: raise AudioError('AUDIO_CONNECT')
+            self._wait(lambda: self.lib.pa_context_get_state(self.context) == 4)
+        except BaseException:
+            self.close(); raise
+
+    def _bind(self):
+        v, i, u = C.c_void_p, C.c_int, C.c_uint32
+        specs = {
+          'pa_mainloop_new': (v, []), 'pa_mainloop_free': (None,[v]),
+          'pa_mainloop_get_api': (v,[v]), 'pa_mainloop_iterate': (i,[v,i,C.POINTER(i)]),
+          'pa_context_new': (v,[v,C.c_char_p]), 'pa_context_connect': (i,[v,C.c_char_p,i,v]),
+          'pa_context_get_state': (i,[v]), 'pa_context_errno': (i,[v]),
+          'pa_context_disconnect': (None,[v]), 'pa_context_unref': (None,[v]),
+          'pa_operation_cancel': (None,[v]), 'pa_operation_unref': (None,[v]),
+          'pa_operation_get_state': (i,[v]), 'pa_proplist_gets': (C.c_char_p,[v,C.c_char_p]),
+          'pa_context_get_server_info': (v,[v,v,v]),
+          'pa_context_get_module_info': (v,[v,u,v,v]),
+          'pa_context_get_module_info_list': (v,[v,v,v]),
+          'pa_context_get_sink_info_by_name': (v,[v,C.c_char_p,v,v]),
+          'pa_context_get_sink_input_info_list': (v,[v,v,v]),
+          'pa_context_get_source_output_info_list': (v,[v,v,v]),
+          'pa_context_load_module': (v,[v,C.c_char_p,C.c_char_p,v,v]),
+          'pa_context_unload_module': (v,[v,u,v,v]),
+        }
+        for name, (ret,args) in specs.items():
+            f=getattr(self.lib,name); f.restype=ret; f.argtypes=args
+
+    def _wait(self, done):
+        end=min(time.monotonic()+2,getattr(self,"deadline",float("inf")))
+        while not done():
+            if self.lib.pa_context_get_state(self.context) in (5,6): raise AudioError('AUDIO_CONNECTION_LOST')
+            if time.monotonic() >= end: raise AudioError('AUDIO_TIMEOUT')
+            if self.lib.pa_mainloop_iterate(self.loop,0,None)<0: raise AudioError('AUDIO_MAINLOOP')
+            time.sleep(.002)
+
+    def _operation(self, fn, args, callback, done):
+        with self.lock:
+            op=fn(self.context,*args,callback,None)
+            if not op: raise AudioError('AUDIO_OPERATION')
+            try: self._wait(done)
+            finally:
+                if self.lib.pa_operation_get_state(op)==0: self.lib.pa_operation_cancel(op)
+                self.lib.pa_operation_unref(op)
+
+    def _info(self, kind, args=(), selected=None):
+        structs={'module':Module,'modules':Module,'sink':Sink,'inputs':SinkInput,'outputs':SourceOutput}
+        funcs={'module':'get_module_info','modules':'get_module_info_list','sink':'get_sink_info_by_name',
+               'inputs':'get_sink_input_info_list','outputs':'get_source_output_info_list'}
+        rows=[]; state={'done':False,'error':None,'count':0}
+        @C.CFUNCTYPE(None,C.c_void_p,C.POINTER(structs[kind]),C.c_int,C.c_void_p)
+        def cb(_,ptr,eol,__):
+            if eol:
+                state['done']=True
+                if eol<0 and self.lib.pa_context_errno(self.context)!=5: state['error']='AUDIO_QUERY'
+                return
+            try:
+                state['count']+=1
+                if not ptr or state['count']>256: raise AudioError('AUDIO_METADATA_LIMIT')
+                x=ptr.contents
+                if kind in ('module','modules'):
+                    # Only own nonce marker modules are materialized for recovery.
+                    if kind=='modules' and (not selected or x.argument!=selected.encode()): return
+                    arg=_ascii(x.argument)
+                    rows.append({'index':x.index,'name':_ascii(x.name),'argument':arg})
+                elif kind=='sink':
+                    rows.append({'index':x.index,'name':_ascii(x.name),'module':x.owner_module,
+                        'monitor':x.monitor_source,'monitorName':_ascii(x.monitor_name),
+                        'rate':x.sample.rate,'channels':x.sample.channels})
+                else:
+                    destination=x.sink if kind=='inputs' else x.source
+                    if destination!=selected:return
+                    pid=_ascii(self.lib.pa_proplist_gets(x.proplist,b'application.process.id'),20)
+                    rows.append({'index':x.index,'pid':int(pid) if pid and pid.isdecimal() else None,
+                        'bufferUsec':x.buffer_usec,'deviceUsec':x.sink_usec if kind=='inputs' else x.source_usec,
+                        'corked':bool(x.corked)})
+            except (AudioError,ValueError): state['error']='AUDIO_METADATA_INVALID'
+        self._operation(getattr(self.lib,'pa_context_'+funcs[kind]),args,cb,lambda:state['done'])
+        if state['error']:raise AudioError(state['error'])
+        return rows
+
+    def server(self):
+        state={}
+        @C.CFUNCTYPE(None,C.c_void_p,C.POINTER(Server),C.c_void_p)
+        def cb(_,ptr,__):
+            if not ptr: state['error']=True; return
+            x=ptr.contents
+            state.update(cookie=x.cookie,defaultSinkHash=_digest(x.default_sink),defaultSourceHash=_digest(x.default_source))
+        self._operation(self.lib.pa_context_get_server_info,(),cb,lambda:bool(state))
+        if state.get('error'):raise AudioError('AUDIO_SERVER_INFO')
+        return state
+
+    def sink(self,name):return self._info('sink',(name.encode(),))
+    def module(self,index):return self._info('module',(index,))
+    def own_modules(self,args):return self._info('modules',selected=args)
+    def streams(self,sink,monitor):return self._info('inputs',selected=sink),self._info('outputs',selected=monitor)
+    def load(self,args):
+        result=[]
+        @C.CFUNCTYPE(None,C.c_void_p,C.c_uint32,C.c_void_p)
+        def cb(_,index,__): result.append(index)
+        self._operation(self.lib.pa_context_load_module,(b'module-null-sink',args.encode()),cb,lambda:bool(result))
+        if result[0]==INVALID: raise AudioError('AUDIO_MODULE_REJECTED')
+        return result[0]
+    def unload(self,index):
+        result=[]
+        @C.CFUNCTYPE(None,C.c_void_p,C.c_int,C.c_void_p)
+        def cb(_,ok,__):result.append(ok)
+        self._operation(self.lib.pa_context_unload_module,(index,),cb,lambda:bool(result))
+        if result[0]!=1:raise AudioError('AUDIO_UNLOAD_REJECTED')
+    def close(self):
+        if self.context:self.lib.pa_context_disconnect(self.context);self.lib.pa_context_unref(self.context);self.context=None
+        if self.loop:self.lib.pa_mainloop_free(self.loop);self.loop=None
+
+class OwnedAudio:
+    def __init__(self,pulse,nonce=None,private_graph=False):
+        self.pulse=pulse;self.server=getattr(pulse,'server_address',SERVER);self.isolated=private_graph is True and getattr(pulse,'isolated',False);self.nonce=nonce or secrets.token_hex(16)
+        if not re.fullmatch('[0-9a-f]{32}',self.nonce):raise AudioError('AUDIO_NONCE')
+        if private_graph is not False and not self.isolated:raise AudioError('AUDIO_PRIVATE_GRAPH_SCOPE')
+        self.name='r2d2_'+self.nonce;self.monitor=self.name+'.monitor'
+        self.args=('sink_name='+self.name+' rate=48000 channels=2 channel_map=front-left,front-right '
+            'sink_properties="device.description=R2D2Private node.virtual=true priority.session=0"')
+        self.module_id=None;self.identity=None;self.baseline=None;self.intent=False;self.removed=False
+        self.max_playback_buffer_us=0;self.max_capture_buffer_us=0;self.samples=0
+
+    def prepare(self):
+        if self.intent:raise AudioError('AUDIO_PREPARE_REPLAY')
+        self.baseline=self.pulse.server()
+        if self.pulse.sink(self.name) or self.pulse.own_modules(self.args):raise AudioError('AUDIO_COLLISION')
+        self.intent=True
+        self.module_id=self.pulse.load(self.args)
+        self._identity(initial_private_load=self.isolated)
+        if self.isolated:self.baseline=self.pulse.server()
+        self.verify(lambda _:False,lambda _:False)
+        return self
+
+    def _identity(self,initial_private_load=False):
+        now=self.pulse.server()
+        if now['cookie']!=self.baseline['cookie'] or (not (initial_private_load and self.isolated) and now!=self.baseline):raise AudioError('AUDIO_SERVER_OR_DEFAULT_CHANGED')
+        if self.module_id is None:
+            rows=self.pulse.own_modules(self.args)
+            if len(rows)!=1 or rows[0]['name']!='module-null-sink':raise AudioError('AUDIO_MODULE_UNKNOWN')
+            self.module_id=rows[0]['index']
+        rows=self.pulse.module(self.module_id)
+        if rows != [{'index':self.module_id,'name':'module-null-sink','argument':self.args}]:raise AudioError('AUDIO_MODULE_IDENTITY')
+        sinks=self.pulse.sink(self.name)
+        if len(sinks)!=1:raise AudioError('AUDIO_SINK_IDENTITY')
+        s=sinks[0]
+        if (s['name']!=self.name or s['module']!=self.module_id or s['monitorName']!=self.monitor or
+            s['rate']!=48000 or s['channels']!=2 or s['index']==INVALID or s['monitor']==INVALID):raise AudioError('AUDIO_SINK_IDENTITY')
+        if self.identity is not None and self.identity!=s:raise AudioError('AUDIO_SINK_CHANGED')
+        self.identity=s
+        return s
+
+    def verify(self,owns_playback,owns_capture,require_playback=False,require_capture=False):
+        s=self._identity();ins,outs=self.pulse.streams(s['index'],s['monitor'])
+        if any(type(x['pid']) is not int or not owns_playback(x['pid']) for x in ins):raise AudioError('AUDIO_FOREIGN_PLAYBACK')
+        if any(type(x['pid']) is not int or not owns_capture(x['pid']) for x in outs):raise AudioError('AUDIO_FOREIGN_CAPTURE')
+        if require_playback and not ins:raise AudioError('AUDIO_ROUTE_UNPROVED')
+        if require_capture and not outs:raise AudioError('AUDIO_CAPTURE_UNPROVED')
+        self.samples+=1
+        self.max_playback_buffer_us=max([self.max_playback_buffer_us]+[min(10000000,x['bufferUsec']) for x in ins])
+        self.max_capture_buffer_us=max([self.max_capture_buffer_us]+[min(10000000,x['bufferUsec']) for x in outs])
+        return {'playbackStreams':len(ins),'captureStreams':len(outs),'ownedRoute':bool(ins),'ownedCapture':bool(outs)}
+
+    def environment(self):
+        self._identity()
+        return {'PULSE_SERVER':self.server,'PULSE_SINK':self.name,'PULSE_LATENCY_MSEC':'30'}
+
+    def close(self,children_gone):
+        if not children_gone:raise AudioError('AUDIO_CHILDREN_STILL_LIVE')
+        if not self.intent:return {'ownedAbsent':True,'defaultsUnchanged':True}
+        # Recover a lost load ACK only through exact fresh marker/argument identity.
+        rows=self.pulse.own_modules(self.args)
+        if not rows:
+            if self.pulse.sink(self.name):raise AudioError('AUDIO_RESIDUAL_SINK')
+            self.removed=True
+            return {'ownedAbsent':True,'defaultsUnchanged':self.pulse.server()==self.baseline}
+        if len(rows)!=1 or rows[0]['name']!='module-null-sink':raise AudioError('AUDIO_RECOVERY_AMBIGUOUS')
+        if self.module_id is not None and rows[0]['index']!=self.module_id:raise AudioError('AUDIO_MODULE_CHANGED')
+        self.module_id=rows[0]['index']
+        # A defaults change prevents further capture but does not prevent exact own cleanup.
+        old=self.baseline;now=self.pulse.server()
+        if now['cookie']!=old['cookie']:raise AudioError('AUDIO_SERVER_CHANGED')
+        self.baseline=now
+        try:
+            s=self._identity();ins,outs=self.pulse.streams(s['index'],s['monitor'])
+            if ins or outs:raise AudioError('AUDIO_STREAMS_REMAIN')
+            try:self.pulse.unload(self.module_id)
+            except AudioError:pass  # Never repeat a write; read back exact own absence.
+            if self.pulse.own_modules(self.args) or self.pulse.sink(self.name):raise AudioError('AUDIO_CLEANUP_UNRESOLVED')
+            self.removed=True
+            return {'ownedAbsent':True,'defaultsUnchanged':self.pulse.server()==old}
+        finally:self.baseline=old
+
+    def view(self):
+        return {'prepared':self.identity is not None,'ownedRemoved':self.removed,'samples':min(self.samples,100000),
+          'maxPlaybackBufferUs':self.max_playback_buffer_us,'maxCaptureBufferUs':self.max_capture_buffer_us}
+
+# Video rate control presets. 25 Mbit/s is the default, sized for a wireless LAN.
+# 38 Mbit/s stays under HEVC Main tier level 5.1 (40 Mbit/s) and is intended
+# only for a wired, low-loss LAN between Spark and the TV. The VBV grows
+# with it so IDR pictures are not starved; the receiver cushion absorbs it.
+VIDEO_RATE_CONTROL = {25: '2M', 30: '4M', 38: '6M'}
+# x11grab queue in frames (each 3840x2160 bgr0 frame is ~33 MB). With 2, the
+# grab thread blocks for ~0.3 s while NVENC initialises, then catches up with
+# back-to-back grabs: measured 17-22 lost + 20-30 duplicated source frames at
+# every encoder start. 32 frames absorbed that stall in our Spark probe
+# (720/720 unique IDs, max capture gap 16.7 ms). Transient RAM <= ~1.1 GB.
+CAPTURE_QUEUE_FRAMES = 32
+# FFmpeg's 2-input transcode loop advances video only once the audio input PTS
+# has reached the video PTS. With -fragment_size 4096 (21.3 ms) and Pulse buffer
+# delivery, audio wallclock timestamps trail x11grab by ~20-45 ms, holding each
+# video frame ~38 ms before NVENC sees it. Shifting audio PTS forward by 55 ms
+# (with ~26 ms of initial silence from aresample) removes that wait while
+# keeping the two inputs on the same wallclock rate; A/V offset stays within
+# ITU-R BT.1359 (+45/-125 ms).
+AUDIO_LEAD_MS = 55
+AUDIO_FIRST_PTS = 1024 + 240
+
+def ffmpeg_args(display,audio,duration=1800,lower_delay=False,bitrate_mbps=25,progress_path=None,short_fragment=False):
+    if not re.fullmatch(r':[0-9]{1,5}',display) or type(duration)is not int or not 1<=duration<=1800 or type(short_fragment) is not bool:raise AudioError('AUDIO_ENCODER_ARGS')
+    if type(bitrate_mbps) is not int or bitrate_mbps not in VIDEO_RATE_CONTROL:raise AudioError('AUDIO_ENCODER_ARGS')
+    if progress_path is not None and (type(progress_path) is not str or not re.fullmatch(r'/[A-Za-z0-9_./-]{1,200}/encoder-progress',progress_path) or '..' in progress_path):raise AudioError('AUDIO_ENCODER_ARGS')
+    audio._identity()
+    rate='%dM'%bitrate_mbps
+    # Pulse and x11grab both timestamp from the wall clock; isync preserves input-open offset.
+    args=['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin']
+    # Scalar counters only (frame, fps, dup_frames, drop_frames, speed); no media.
+    # Caveat (measured): these counters stayed 0 while the frame-ID probe saw
+    # duplicated/lost source frames, so they are a liveness signal, not a loss gate.
+    if progress_path is not None:args+=['-stats_period','1','-progress',progress_path]
+    args+=['-thread_queue_size',str(CAPTURE_QUEUE_FRAMES),'-f','x11grab','-draw_mouse','0','-video_size','3840x2160','-framerate','60','-i',display+'.0',
+      '-thread_queue_size','32','-isync','0','-f','pulse','-server',audio.server,'-name','R2D2Capture',
+      '-sample_rate','48000','-channels','2','-fragment_size','4096','-wallclock','1','-i',audio.monitor,
+      '-map','0:v:0','-map','1:a:0','-map_metadata','-1','-t',str(duration),
+      # No -pix_fmt: hevc_nvenc accepts bgr0 and converts to 4:2:0 on the GPU.
+      # Measured on Spark: removes ~38 ms CPU per 4K frame (~2.3 cores at 60 fps);
+      # the output still passes the ring (Main, 8-bit, chroma_format_idc 1).
+      '-c:v','hevc_nvenc','-preset','p1','-tune','ull','-profile:v','main','-level:v','5.1',
+      '-rc','cbr','-b:v',rate,'-maxrate',rate,'-bufsize',VIDEO_RATE_CONTROL[bitrate_mbps],'-g','60','-bf','0','-tag:v','hvc1']
+    if lower_delay:args+=['-zerolatency','1','-delay','0']
+    interleave='1000' if short_fragment else '20000'
+    frag_duration='16667' if short_fragment else '33333'
+    return args+['-c:a','aac','-profile:a','aac_low','-b:a','128k','-ar','48000','-ac','2',
+      '-af','asetpts=PTS+%d/1000/TB,aresample=async=1:first_pts=%d,asetnsamples=n=1024:p=1'%(AUDIO_LEAD_MS,AUDIO_FIRST_PTS),'-max_interleave_delta',interleave,'-flush_packets','1',
+      '-movflags','frag_keyframe+empty_moov+default_base_moof','-frag_duration',frag_duration,'-f','mp4','pipe:1']
+
+def browser_launch(private,args,audio):
+    """Patch only the known private bootstrap after Snap's command chain. No user rc."""
+    env=audio.environment();argv=private.launch(args)
+    pos=argv.index('-c')+1;script=argv[pos]
+    marker='exec "$SNAP/usr/lib/chromium-browser/chrome"'
+    if script.count(marker)!=1:raise AudioError('AUDIO_BOOTSTRAP_CHANGED')
+    # Every substituted value has a fixed grammar; no shell/user text is accepted.
+    exports='export PULSE_SERVER='+audio.server+'\nexport PULSE_SINK='+audio.name+'\nexport PULSE_LATENCY_MSEC=30\n'
+    argv[pos]=script.replace(marker,exports+marker)
+    if '--mute-audio' in argv:raise AudioError('AUDIO_BROWSER_MUTED')
+    return argv,env

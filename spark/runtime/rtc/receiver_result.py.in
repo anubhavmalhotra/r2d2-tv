@@ -1,0 +1,92 @@
+"""One fixed authenticated receiver scalar result; no raw SDP, ids or addresses.
+MAC verification preserves received numeric bytes instead of reformatting floats.
+"""
+import hashlib
+import hmac
+import json
+import math
+import re
+from .signal_protocol import need
+
+OBSERVATIONS = ('peerConstructed','peerClosed','offerAuthenticated','remoteDescriptionAccepted',
+    'answerGatherComplete','answerPosted','receiveOnlyObserved','h264DescriptionObserved','av1DescriptionObserved','vp9DescriptionObserved',
+    'opusDescriptionObserved','connectedObserved','selectedLanTupleObserved','dtlsConnectedObserved',
+    'videoTrackObserved','audioTrackObserved','playResolved','playBlocked')
+FALSE_ONLY = ('rawSdpRetainedInReport','devicesAccessed','captureRequested','dataChannelOpened',
+    'hardwareDecodeProven','physical60Proven','sustained4k60Proven','wholeTvZeroLgTrafficProven','measuredLatencyProven')
+FAILURES = ('ATTEMPT_CLOSED','CONFIG_SCOPE','ATTEMPT_EXPIRED','RECEIVER_API','SIGNAL_SCOPE','SIGNAL_AUTH',
+    'OFFER_HASH','SDP_SCOPE','SDP_MEDIA','SDP_LAN','SDP_CANDIDATE','ICE_NO_EXACT_UDP_HOST','SDP_FINGERPRINT','SDP_ICE','SDP_ROLE',
+    'SDP_DIRECTION','SDP_DUPLICATE','SDP_CODEC','TRANSCEIVER_SCOPE','ANSWER_SCOPE','ICE_TIMEOUT',
+    'ANSWER_NOT_ACKNOWLEDGED','CONNECTION_FAILED','CONNECTION_TIMEOUT','SELECTED_LAN_UNCONFIRMED',
+    'STATS_SCOPE','PHASE_TIMEOUT','PHASE_FAILED','RECEIVER_FAILED','VIDEO_SIZE','VIDEO_FRAME_COUNT','VIDEO_COUNTER_RESET','VIDEO_CALLBACK_SCOPE','VIDEO_WINDOW_SCOPE','VIDEO_WINDOW_SHORT','UNEXPECTED_CHANNEL','TRACK_SCOPE')
+KEYS = set(('codecCaps','candidateShape','schema','kind','statsSamples','videoFramesDecoded','videoFramesDropped',
+            'videoWidth','videoHeight','videoFps','failure',*OBSERVATIONS,*FALSE_ONLY))
+
+CANDIDATE_COUNTS=('candidateTotal', 'exactUdpHost', 'discardedTcp', 'discardedIpv6', 'discardedForeignAddress', 'discardedMdns', 'discardedHostname', 'discardedNonHost', 'discardedMalformed', 'discardedOtherTransport')
+CANDIDATE_KEYS=set((*CANDIDATE_COUNTS,'unsupportedIceOptions','inputLimitHit'))
+def candidate_shape(v):
+    need(type(v)is dict and set(v)==CANDIDATE_KEYS,'RESULT_CANDIDATE_SHAPE')
+    need(all(type(v[k])is int and 0<=v[k]<=16 for k in CANDIDATE_COUNTS)and all(type(v[k])is bool for k in ('unsupportedIceOptions','inputLimitHit'))and v['candidateTotal']==sum(v[k]for k in CANDIDATE_COUNTS[1:]),'RESULT_CANDIDATE_SHAPE')
+    return dict(v)
+
+CODEC_COUNTS=('h264Count', 'vp8Count', 'vp9Count', 'av1Count', 'hevcCount', 'packetization1Count', 'levelAsymmetryAllowedCount')
+CODEC_LEVELS=('h264BaselineMaxLevel', 'h264MainMaxLevel', 'h264HighMaxLevel')
+def codec_caps(v):
+    need(type(v)is dict and set(v)==set((*CODEC_COUNTS,*CODEC_LEVELS,'status'))and v['status']in('available','unavailable','invalid','budget-exceeded'),'RESULT_CODEC_CAPS')
+    need(all(type(v[k])is int and 0<=v[k]<=32 for k in CODEC_COUNTS)and all(v[k]is None or type(v[k])is int and 0<=v[k]<=255 for k in CODEC_LEVELS)and v['packetization1Count']<=v['h264Count']and v['levelAsymmetryAllowedCount']<=v['h264Count'],'RESULT_CODEC_CAPS')
+    need(v['status']=='available'or all(v[k]==0 for k in CODEC_COUNTS)and all(v[k]is None for k in CODEC_LEVELS),'RESULT_CODEC_CAPS')
+    return dict(v)
+
+VIDEO_DIAGNOSTIC_KEYS={'framesReceived','keyFramesDecoded','packetsReceived','packetsLost','bytesReceived','totalDecodeTime','jitterBufferDelay','jitterBufferEmittedCount','decoderImplementation','powerEfficientDecoder'}
+def video_diagnostics(v):
+    need(type(v)is dict and set(v)==VIDEO_DIAGNOSTIC_KEYS,'RESULT_VIDEO_DIAGNOSTICS')
+    for k in ('framesReceived','keyFramesDecoded','packetsReceived','jitterBufferEmittedCount'):
+        need(v[k]is None or type(v[k])is int and 0<=v[k]<=2147483647,'RESULT_VIDEO_DIAGNOSTICS')
+    need(v['packetsLost']is None or type(v['packetsLost'])is int and -2147483648<=v['packetsLost']<=2147483647,'RESULT_VIDEO_DIAGNOSTICS')
+    need(v['bytesReceived']is None or type(v['bytesReceived'])is int and 0<=v['bytesReceived']<=17179869184,'RESULT_VIDEO_DIAGNOSTICS')
+    for k in ('totalDecodeTime','jitterBufferDelay'):
+        need(v[k]is None or type(v[k])in(int,float)and math.isfinite(v[k])and 0<=v[k]<=3600,'RESULT_VIDEO_DIAGNOSTICS')
+    need(v['decoderImplementation']in(None,'hardware','software','other')and type(v['powerEfficientDecoder'])in(type(None),bool),'RESULT_VIDEO_DIAGNOSTICS')
+    return dict(v)
+
+def validate(result):
+    need(type(result)is dict and set(result)in(KEYS,KEYS|{'videoDiagnostics'},KEYS|{'videoDiagnostics','videoMeasurement'}),'RESULT_KEYS')
+    if 'videoMeasurement'in result and result['videoMeasurement']is not None:
+        from .video_measurement import validate as measurement
+        measurement(result['videoMeasurement'])
+    if 'videoDiagnostics'in result:video_diagnostics(result['videoDiagnostics'])
+    need(type(result['schema'])is int and result['schema']==1 and
+         result['kind']=='receiver-negotiation-observation','RESULT_IDENTITY')
+    need(all(type(result[k])is bool for k in OBSERVATIONS) and
+         all(result[k] is False for k in FALSE_ONLY),'RESULT_BOOLEAN')
+    need(result['h264DescriptionObserved'] is False and result['av1DescriptionObserved'] is False,'RESULT_BOOLEAN')
+    for key,maximum in (('statsSamples',64),('videoFramesDecoded',2147483647),('videoFramesDropped',2147483647)):
+        need(type(result[key])is int and 0<=result[key]<=maximum,'RESULT_COUNTER')
+    for key in ('videoWidth','videoHeight'):
+        need(result[key]is None or type(result[key])is int and 1<=result[key]<=8192,'RESULT_DIMENSION')
+    if result['codecCaps']is not None:codec_caps(result['codecCaps'])
+    if result['candidateShape']is not None:candidate_shape(result['candidateShape'])
+    fps=result['videoFps']
+    need(fps is None or type(fps)in(int,float) and math.isfinite(fps) and 0<=fps<=240,'RESULT_FPS')
+    need(result['failure']is None or type(result['failure'])is str and result['failure']in FAILURES,'RESULT_FAILURE')
+    return dict(result)
+
+def verify_result(key,attempt,raw):
+    need(type(key)is bytes and len(key)==32 and type(attempt)is str and re.fullmatch('[a-f0-9]{64}',attempt),'RESULT_SCOPE')
+    need(type(raw)is bytes and 0<len(raw)<=4096 and all(32<=x<=126 for x in raw) and
+         not any(x in raw for x in (b' ',b'\t',b'\r',b'\n',b'\\')),'RESULT_BYTES')
+    def pairs(items):
+        names=[k for k,v in items]
+        need(names==sorted(names) and len(names)==len(set(names)),'RESULT_JSON_ORDER')
+        return dict(items)
+    def constant(value):raise ValueError('RESULT_NONFINITE')
+    obj=json.loads(raw.decode('ascii'),object_pairs_hook=pairs,parse_constant=constant)
+    need(type(obj)is dict and set(obj)=={'schema','attempt','kind','sequence','payload','mac'},'RESULT_ENVELOPE')
+    need(type(obj['schema'])is int and obj['schema']==1 and type(obj['sequence'])is int and obj['sequence']==1 and
+         obj['attempt']==attempt and obj['kind']=='result' and type(obj['mac'])is str and
+         re.fullmatch('[a-f0-9]{64}',obj['mac']),'RESULT_SCOPE')
+    matches=list(re.finditer(b'"mac":"([a-f0-9]{64})",',raw))
+    need(len(matches)==1,'RESULT_MAC_MEMBER')
+    match=matches[0];unsigned=raw[:match.start()]+raw[match.end():]
+    need(hmac.compare_digest(obj['mac'],hmac.new(key,unsigned,hashlib.sha256).hexdigest()),'RESULT_AUTH')
+    return validate(obj['payload'])

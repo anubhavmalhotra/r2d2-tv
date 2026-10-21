@@ -1,0 +1,277 @@
+"""Actual rendered startup with inert model, TLS-file, server and TV boundaries."""
+import contextlib
+import importlib.util
+import os
+from pathlib import Path
+import ssl
+import sys
+import tempfile
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+HERE = Path(__file__).resolve().parent.parent
+spec = importlib.util.spec_from_file_location('voice_startup_manager', HERE / 'manager.py')
+manager = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(manager)
+
+
+class AssemblyTests(unittest.TestCase):
+    def config(self):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.verify_mode = ssl.CERT_REQUIRED
+        return {'enabled': True, 'python': str(Path(sys.executable).resolve()),
+                'asr_path': '/synthetic/asr', 'intent_path': '/synthetic/intent',
+                'certificate_sha256': 'a' * 64, 'device_key': '11' * 32,
+                'context': context}
+
+    def test_disabled_config_requires_no_voice_dependencies_or_private_inputs(self):
+        for cfg in ({'enabled': False}, {}):
+            with self.subTest(cfg=cfg), patch('builtins.__import__', side_effect=AssertionError('no imports')):
+                self.assertIsNone(manager.assemble_voice_owner(object(), 'b' * 64, cfg))
+
+    def test_enabled_must_be_bool_and_real_launch_is_required_before_resources(self):
+        for value in (True, 'false', 1, None):
+            with self.subTest(value=value), patch('builtins.__import__', side_effect=AssertionError('no imports')):
+                with self.assertRaisesRegex(ValueError, 'VOICE_(CONFIG|TV_LAUNCH_UNCONFIGURED)'):
+                    manager.assemble_voice_owner(object(), 'b' * 64, {'enabled': value})
+
+    def test_real_default_assembly_owns_one_pool_and_does_not_start_it(self):
+        mgr = manager.Manager(journal=None)
+        launch = Mock(side_effect=AssertionError('no TV'))
+        with patch('socket.socket', side_effect=AssertionError('no listener')):
+            owner = manager.assemble_voice_owner(mgr, 'b' * 64, self.config(), launch=launch, warm=False)
+        self.assertIs(owner.manager, mgr)
+        self.assertEqual(owner.pool.summary()['state'], 'empty')
+        self.assertIsNone(owner.service.listener)
+        self.assertTrue(owner.close())
+        launch.assert_not_called()
+        mgr.close()
+
+    def test_resident_mode_uses_actual_packaged_entry_without_launch_callable(self):
+        import hashlib
+        import json
+        import time
+        cert = ssl.DER_cert_to_PEM_cert(b'\x30\x03\x02\x01\x01')
+        tv_cert = ssl.DER_cert_to_PEM_cert(b'\x30\x03\x02\x01\x02')
+        # Synthetic envelope only; connection TLS tests verify real certificates.
+        key_pem = '-----BEGIN ' + 'PRIVATE KEY' + '-----\nMAA=\n-----END PRIVATE KEY-----\n'
+        sha = lambda pem: hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+        now = int(time.time())
+        cfg = dict(enabled=True, mode='resident', python=str(Path(sys.executable).resolve()),
+                   asr_path='/synthetic/asr', intent_path='/synthetic/intent')
+        mgr = manager.Manager(journal=None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = dict(schema=1, kind='r2d2-tv-enrollment', tvCertificate=tv_cert,
+                tvCertificateSha256=sha(tv_cert), sparkCertificateSha256=sha(cert),
+                deviceId='e'*16, enrolledAt=now-10, expiresAt=now+1000)
+            values = dict(voice_key_path='a'*64, certificate=cert, private_key=key_pem,
+                enrollment_path=json.dumps(record), ssap_key_path=json.dumps({'client-key':'c'*64}),
+                ssap_pin_path=json.dumps({'sha256':'d'*64}))
+            for field,value in values.items():
+                path=root/field; path.write_text(value); path.chmod(0o600); cfg[field]=str(path)
+            with patch('socket.socket',side_effect=AssertionError('no socket')), \
+                 patch('subprocess.Popen',side_effect=AssertionError('no model')):
+                owner=manager.assemble_voice_owner(mgr,'b'*64,cfg,warm=False)
+                self.assertEqual(type(owner).__module__,'voice_control.resident_entry')
+                self.assertIs(owner.helper.manager,mgr)
+                self.assertIs(owner.helper.runtime.control_spawn,mgr.control_spawn)
+                self.assertIs(owner.helper.controller,owner.helper.resident._controller)
+                self.assertEqual(owner.pool.summary()['state'],'empty')
+                self.assertEqual(owner.pool.factory.prompt_phase,'P5')
+                self.assertTrue(issubclass(owner.http_handler, manager.http.server.BaseHTTPRequestHandler))
+                self.assertFalse(owner.hook.running)
+                # One VoiceStatus, made before the controller, feeds every surface.
+                for holder in (owner.helper, owner.helper.resident, owner.helper.controller):
+                    self.assertIs(holder.voice_status, owner.voice_status)
+                self.assertEqual(type(owner.helper.controller.feedback).__name__, 'StatusFeedback')
+            # socketpair() needs the real socket class; the inert assembly is done.
+            try:
+                raw = self.voice_get(owner.http_handler, '/' + 'b' * 64 + '/voice/0')
+                self.assertTrue(raw.startswith(b'HTTP/1.1 200 '))
+                self.assertIn(b'Access-Control-Allow-Origin: null', raw)
+                body = json.loads(raw.split(b'\r\n\r\n', 1)[1])
+                self.assertEqual((body['v'], body['phase'], body['chip']), (1, 'idle', 'starting'))
+                self.assertIn(b' 404 ', self.voice_get(owner.http_handler, '/' + 'b' * 64 + '/voice/01'))
+            finally:
+                self.assertTrue(owner.close())
+        mgr.close()
+
+    def voice_get(self, handler, path):
+        import socket, threading
+        server, client = socket.socketpair(); client.settimeout(2)
+        thread = threading.Thread(target=lambda: (handler(server, (manager.TV, 1), None), server.close()))
+        thread.start()
+        try:
+            client.sendall(('GET ' + path + ' HTTP/1.1\r\nHost: ' + manager.SPARK + ':4181\r\nOrigin: null\r\n\r\n').encode())
+            out = bytearray()
+            while True:
+                piece = client.recv(4096)
+                if not piece: break
+                out.extend(piece)
+            return bytes(out)
+        finally:
+            client.close(); thread.join(2); self.assertFalse(thread.is_alive())
+
+    def test_resident_warm_failure_closes_created_owner(self):
+        # The branch owns cleanup if its optional asynchronous monitor fails.
+        from voice_control import resident_entry
+        owner=Mock()
+        owner.warm.side_effect=RuntimeError('MONITOR_START')
+        with patch.object(resident_entry,'ResidentEntry',return_value=owner):
+            with self.assertRaisesRegex(RuntimeError,'MONITOR_START'):
+                manager.assemble_voice_owner(object(),'b'*64,dict(enabled=True,mode='resident'))
+        owner.close.assert_called_once()
+
+    def test_tls_setup_failure_creates_no_pool_reader_or_owner(self):
+        cfg = self.config(); cfg.pop('context')
+        cfg.update(certificate='public-cert', private_key='private-key', client_ca='client-cert')
+        mgr = manager.Manager(journal=None)
+        from voice_control import pool, shared_owner
+        with patch.object(pool, 'ProductionWorkerFactory', side_effect=AssertionError('no pool')) as factory, \
+             patch.object(pool, 'AuthenticatedTvPowerReader', side_effect=AssertionError('no reader')) as reader, \
+             patch.object(shared_owner, 'SharedVoiceOwner', side_effect=AssertionError('no owner')) as owner:
+            with self.assertRaisesRegex(ValueError, 'TLS_FIXTURE'):
+                manager.assemble_voice_owner(mgr, 'b' * 64, cfg, launch=lambda *a, **k: None,
+                    tls_factory=Mock(side_effect=ValueError('TLS_FIXTURE')), warm=False)
+        factory.assert_not_called(); reader.assert_not_called(); owner.assert_not_called()
+        mgr.close()
+
+    def test_actual_fifo_is_refused_without_waiting_for_a_writer(self):
+        cfg = self.config(); cfg.pop('device_key')
+        mgr = manager.Manager(journal=None)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'key'; os.mkfifo(path, 0o600)
+            cfg['device_key_path'] = path
+            # Bound the negative fixture itself if O_NONBLOCK is later removed.
+            import signal
+            def expired(*args): raise AssertionError('FIFO open blocked')
+            previous = signal.signal(signal.SIGALRM, expired)
+            signal.setitimer(signal.ITIMER_REAL, 1)
+            try:
+                with self.assertRaisesRegex(ValueError, 'VOICE_DEVICE_KEY'):
+                    manager.assemble_voice_owner(mgr, 'b' * 64, cfg, launch=lambda *a, **k: None, warm=False)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous)
+        mgr.close()
+
+    def test_device_key_file_metadata_is_checked_before_read(self):
+        cfg = self.config(); cfg.pop('device_key')
+        cfg['device_key_path'] = '/synthetic/key'
+        mgr = manager.Manager(journal=None)
+        with patch.object(manager.os, 'open', return_value=55) as opened, \
+             patch.object(manager.os, 'fstat', return_value=types.SimpleNamespace(st_mode=0o010600, st_uid=1000, st_nlink=1, st_size=0)), \
+             patch.object(manager.os, 'close') as closed, \
+             patch.object(manager.os, 'fdopen', side_effect=AssertionError('FIFO read')):
+            with self.assertRaisesRegex(ValueError, 'VOICE_DEVICE_KEY'):
+                manager.assemble_voice_owner(mgr, 'b' * 64, cfg, launch=lambda *a, **k: None, warm=False)
+        self.assertTrue(opened.call_args.args[1] & os.O_NONBLOCK)
+        closed.assert_called_once_with(55)
+        mgr.close()
+
+
+class StartupTests(unittest.TestCase):
+    def run_main(self, failure=None, cleanup_failure=False, stop_during_warm=False, voice_mode='enabled'):
+        events = []
+        voice = Mock(enabled=True, http_handler=object())
+        browser = Mock()
+        weather = Mock()
+        server = Mock()
+        threads = []
+        handlers = {}
+        voice.close.side_effect = RuntimeError('close failed') if cleanup_failure else lambda: events.append('voice-close') or True
+        browser.close.side_effect = lambda: events.append('manager-close')
+        weather.close.side_effect = lambda: events.append('weather-close')
+        server.server_close.side_effect = lambda: events.append('server-close')
+        def warm(**kwargs):
+            events.append('warm')
+            if stop_during_warm: handlers[manager.signal.SIGTERM](None, None)
+            if failure == 'warm': raise RuntimeError('warm failure')
+        voice.warm.side_effect = warm
+        if failure == 'serve': voice.serve.side_effect = RuntimeError('early serve refusal')
+        def thread(**kwargs):
+            item = Mock(); item.is_alive.return_value = False
+            number = len(threads)
+            def start():
+                events.append('thread-' + str(number))
+                if failure == 'thread-' + str(number): raise RuntimeError('thread failure')
+                if failure == 'serve' and number == 1:
+                    # A thread's exception does not propagate into main(). Run
+                    # its actual target with that boundary, without a listener.
+                    with self.assertRaisesRegex(RuntimeError, 'early serve refusal'):
+                        kwargs['target']()
+                    voice.close.assert_called_once()
+                    browser.close.assert_not_called()
+            item.start.side_effect = start
+            threads.append(item)
+            return item
+        def start_weather():
+            events.append('weather-start')
+            if failure == 'weather': raise RuntimeError('weather failure')
+            handlers[manager.signal.SIGTERM](None, None)
+        weather.start.side_effect = start_weather
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            key = Path(directory) / 'key'; key.write_text('b' * 64)
+            cfg = Path(directory) / 'voice.json'
+            if voice_mode != 'absent': cfg.write_text('{}')
+            stack.enter_context(patch.object(manager, 'CONFIG', key))
+            stack.enter_context(patch.object(manager, 'VOICE_CONFIG', cfg))
+            stack.enter_context(patch.object(manager.os, 'getuid', return_value=1000))
+            stack.enter_context(patch.object(manager.os, 'geteuid', return_value=1000))
+            stack.enter_context(patch.object(manager.platform, 'node', return_value='{{SPARK_HOSTNAME}}'))
+            stack.enter_context(patch.object(manager.os, 'umask'))
+            stack.enter_context(patch.object(manager.os, 'fstat', return_value=types.SimpleNamespace(st_mode=0o100600, st_uid=1000)))
+            close = stack.enter_context(patch.object(manager.os, 'close', wraps=os.close))
+            stack.enter_context(patch.dict(sys.modules, {'weather': types.SimpleNamespace(Weather=lambda: weather)}))
+            stack.enter_context(patch.object(manager, 'Manager', return_value=browser))
+            if voice_mode == 'disabled':
+                stack.enter_context(patch.object(manager, 'private_json', return_value={'enabled': False}))
+                assembly = stack.enter_context(patch.object(manager, 'assemble_voice_owner', wraps=manager.assemble_voice_owner))
+            else:
+                assembly = stack.enter_context(patch.object(manager, 'assemble_voice_owner', return_value=voice))
+            server_factory = stack.enter_context(patch.object(manager, 'Server', side_effect=RuntimeError('server failure') if failure == 'server' else lambda *a: server))
+            stack.enter_context(patch.object(manager.threading, 'Thread', side_effect=thread))
+            stack.enter_context(patch.object(manager.signal, 'signal', side_effect=lambda sig, fn: handlers.__setitem__(sig, fn)))
+            try:
+                manager.main()
+            except RuntimeError:
+                if failure is None and not cleanup_failure: raise
+            else:
+                self.assertIn(failure, (None, 'serve'))
+                self.assertFalse(cleanup_failure)
+            if voice_mode == 'absent': assembly.assert_not_called()
+            else: assembly.assert_called_once_with(browser, 'b' * 64, warm=False)
+            if voice_mode == 'enabled':
+                self.assertEqual(voice.close.call_count, 2 if failure == 'serve' else 1)
+            else:
+                voice.close.assert_not_called(); voice.warm.assert_not_called()
+                self.assertEqual(len(threads), 1)
+            browser.close.assert_called_once(); weather.close.assert_called_once()
+            self.assertEqual(close.call_count, 1)
+            if stop_during_warm or failure == 'warm': server_factory.assert_not_called()
+            elif failure != 'server': server.server_close.assert_called_once()
+            if failure in ('warm', 'server', 'thread-0') or stop_during_warm:
+                server.shutdown.assert_not_called()
+        return events
+
+    def test_normal_startup_and_shutdown(self): self.run_main()
+
+    def test_browser_still_runs_without_voice_or_with_explicit_disabled_config(self):
+        for mode in ('absent', 'disabled'):
+            with self.subTest(mode=mode): self.run_main(voice_mode=mode)
+
+    def test_every_startup_failure_closes_owned_resources(self):
+        for failure in ('warm', 'server', 'thread-0', 'thread-1', 'weather'):
+            with self.subTest(failure=failure): self.run_main(failure)
+
+    def test_one_cleanup_error_does_not_skip_other_owned_cleanup(self): self.run_main(cleanup_failure=True)
+
+    def test_early_serve_refusal_closes_owner_before_thread_exits(self): self.run_main(failure='serve')
+
+    def test_stop_during_warm_never_opens_listeners(self): self.run_main(stop_during_warm=True)
+
+
+if __name__ == '__main__': unittest.main()

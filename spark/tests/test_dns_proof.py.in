@@ -1,0 +1,111 @@
+import json,os,subprocess,sys,threading,time,unittest
+from pathlib import Path
+import dns_proof as d
+
+class Fixture:
+ def __init__(self,mode='ok'):
+  self.mode=mode;self.commands=[];self.fail=None
+  self.r,w=os.pipe();r,self.w=os.pipe()
+  self.stdin=os.fdopen(w,'wb',buffering=0);self.stdout=os.fdopen(r,'rb',buffering=0)
+  self.proof=d.DnsProof(self.stdin,self.stdout)
+  self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
+ def send(self,o):os.write(self.w,json.dumps(o,separators=(',',':')).encode()+b'\0')
+ def run(self):
+  try:
+   if self.mode=='missing-marker':return
+   os.write(self.w,b'package startup metadata discarded\n'+d.MARKER)
+   buf=b''
+   while True:
+    x=os.read(self.r,4096)
+    if not x:return
+    buf+=x
+    while b'\0' in buf:
+     raw,buf=buf.split(b'\0',1);cmd=json.loads(raw);self.commands.append(cmd)
+     method=cmd['method'];sid=cmd.get('sessionId');res={}
+     if method=='Target.createTarget':res={'targetId':'ownTarget'}
+     elif method=='Target.attachToTarget':res={'sessionId':'ownSession'}
+     elif method=='Runtime.evaluate':
+      assert cmd['params']['expression']==d.EXPRESSION
+      value=dict(d.EXPECTED)
+      if self.mode=='automatic':value['mode']='automatic'
+      if self.mode=='private-config':value['config']='https://secret.test/private'
+      if self.mode=='managed':value['managementMode']=1
+      if self.mode=='bool-management':value['managementMode']=False
+      res={'result':{'type':'object','value':value}}
+      if self.mode=='getter-exception':res['exceptionDetails']={'text':'https://must-not-export.test/secret'}
+     elif method=='Target.closeTarget':res={'success':self.mode!='close-false'}
+     if self.mode=='duplicate-key' and method=='Target.createTarget':
+      os.write(self.w,b'{"id":1,"id":1,"result":{}}\0');continue
+     if self.mode=='wrong-session' and method=='Runtime.evaluate':sid='foreignSession'
+     out={'id':cmd['id'],'result':res}
+     if sid:out['sessionId']=sid
+     self.send(out)
+     if method=='Page.navigate':
+      assert cmd['params']=={'url':d.SETTINGS_URL}
+      self.send({'method':'Page.frameNavigated','sessionId':'ownSession','params':{'frame':{'url':d.SETTINGS_URL,'id':'ownFrame'}}})
+      self.send({'method':'Page.loadEventFired','sessionId':'ownSession','params':{}})
+     if method=='Target.closeTarget':return
+  except (BrokenPipeError,OSError):pass
+  except BaseException as e:self.fail=e
+  finally:
+   os.close(self.r);os.close(self.w)
+ def finish(self):
+  self.proof.close();self.thread.join(1)
+  if self.fail:raise self.fail
+
+class Tests(unittest.TestCase):
+ def invoke(self,mode):
+  f=Fixture(mode)
+  try:r=f.proof.prove();return r,f.commands
+  finally:f.finish()
+ def test_exact_read_only_flow(self):
+  r,cs=self.invoke('ok');self.assertTrue(r['qualified']);self.assertTrue(r['target_closed']);self.assertTrue(r['pipe_marker_seen'])
+  self.assertEqual([c['method'] for c in cs],['Target.createTarget','Target.attachToTarget','Page.enable','Page.navigate','Runtime.evaluate','Target.closeTarget'])
+  self.assertEqual(cs[0]['params'],{'url':'about:blank','background':True});self.assertEqual(cs[1]['params'],{'targetId':'ownTarget','flatten':True})
+  self.assertEqual(cs[-1]['params'],{'targetId':'ownTarget'})
+  self.assertNotIn('package',json.dumps(r));self.assertFalse(r['browser_wire_behavior_proved'])
+ def test_automatic_and_managed_not_success(self):
+  for mode in ['automatic','managed','bool-management']:
+   with self.subTest(mode=mode):r,_=self.invoke(mode);self.assertFalse(r['qualified']);self.assertTrue(r['target_closed'])
+ def test_config_and_exception_contents_not_exported(self):
+  for mode in ['private-config','getter-exception']:
+   r,_=self.invoke(mode);self.assertFalse(r['qualified']);self.assertNotIn('secret',json.dumps(r));self.assertNotIn('https://',json.dumps(r))
+ def test_missing_marker_fails_before_commands(self):
+  r,cs=self.invoke('missing-marker');self.assertFalse(r['qualified']);self.assertFalse(r['pipe_marker_seen']);self.assertEqual(cs,[])
+ def test_wrong_reply_session_rejected(self):
+  r,_=self.invoke('wrong-session');self.assertEqual(r['error'],'CDP_REPLY_SESSION');self.assertFalse(r['qualified'])
+ def test_duplicate_keys_rejected(self):
+  r,_=self.invoke('duplicate-key');self.assertEqual(r['error'],'CDP_DUPLICATE_KEY');self.assertFalse(r['qualified'])
+ def test_unproved_target_close_not_success(self):
+  r,_=self.invoke('close-false');self.assertFalse(r['qualified']);self.assertEqual(r['error'],'CDP_TARGET_CLOSE_UNPROVED')
+ def test_single_use(self):
+  f=Fixture()
+  try:
+   self.assertTrue(f.proof.prove()['qualified'])
+   with self.assertRaises(d.ProofError):f.proof.prove()
+  finally:f.finish()
+ def test_timeout_still_closes_owned_target(self):
+  f=Fixture(); original=f.proof._call
+  def call(method,params,session=False):
+   if method=='Runtime.evaluate':f.proof.deadline=time.monotonic()-0.01
+   return original(method,params,session)
+  f.proof._call=call
+  try:
+   r=f.proof.prove();self.assertFalse(r['qualified']);self.assertEqual(r['error'],'CDP_TIMEOUT');self.assertTrue(r['target_closed'])
+   self.assertEqual(f.commands[-1]['method'],'Target.closeTarget')
+  finally:f.finish()
+ def test_fixed_shell_remaps_only_normal_pipes(self):
+  script=d.SHELL_PREFIX+"IFS= read -r -u 3 line; test \"$line\" = fixed; printf 'reply\\0' >&4"
+  p=subprocess.Popen(['/bin/bash','--noprofile','--norc','-c',script],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+  out,err=p.communicate(b'fixed\n',timeout=2)
+  self.assertEqual(p.returncode,0,err);self.assertEqual(out,d.MARKER+b'reply\0');self.assertEqual(err,b'')
+ def test_bad_json_and_frame_bound(self):
+  for raw in [b'{"v":NaN}',b'[]',b'{']:
+   if raw==b'[]':continue
+   with self.assertRaises(d.ProofError):d._json(raw)
+  f=Fixture('missing-marker')
+  try:
+   f.proof.deadline=999999999999;f.proof.buffer.extend(b'x'*(d.MAX_FRAME+1))
+   with self.assertRaisesRegex(d.ProofError,'CDP_FRAME_SIZE'):f.proof._message()
+  finally:f.finish()
+if __name__=='__main__':unittest.main(verbosity=2)

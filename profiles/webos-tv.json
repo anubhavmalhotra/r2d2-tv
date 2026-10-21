@@ -1,0 +1,25 @@
+{
+  "id": "webos-tv",
+  "platform": "webOS TV",
+  "status": "generic-webos-tv-profile",
+  "home_app_id": "local.owner.applibrary",
+  "receiver_app_id": "com.webos.app.tinybrowser",
+  "required_compute": {
+    "architecture": "aarch64",
+    "uid": 1000,
+    "browser": "Ubuntu Chromium snap with enforced sandbox",
+    "display": "isolated X server with Xauthority",
+    "encoder": "FFmpeg with HEVC NVENC",
+    "audio": "PipeWire, WirePlumber and pipewire-pulse"
+  },
+  "target_verification": [
+    "Model and regional firmware layouts can differ across webOS TV releases",
+    "Validate original file hashes and patch structure locally before applying optional system overlays",
+    "Prove application permissions and an authorized installation route on the target TV",
+    "Verify Home, browser, voice and AirPlay return paths on the actual device"
+  ],
+  "flash_supported": false,
+  "universal_root_installer": false,
+  "zero_vendor_egress_proved": false,
+  "native_remote_voice_proved": true
+}

@@ -1,0 +1,124 @@
+"""Browser WebRTC composition; no native work during import.
+
+Same Trial, ProcessOwner, private Xvfb and private Pulse graph. Supports full
+interactive browser sessions up to MAX_SESSION_SECONDS as well as finite test
+durations. Signaling is served only through the existing Trial handler.
+"""
+import time
+from rtc.vp9_media import PublicMedia
+from rtc.capture_clock import MAX_AGE_NS
+from rtc.live_source import DEFAULT_DURATION,OwnedLive4K
+from rtc.au_recovery import Recovery
+from rtc.signal_protocol import need
+from rtc_audio import PrivatePulseOpus
+from rtc_diagnostics import StartupDiagnostics
+
+class BrowserMedia(PublicMedia):
+    def __init__(self, trial, duration=DEFAULT_DURATION):
+        from protocol import SPARK,TV,PORT
+        need(getattr(trial,'xvfb',None) is not None,'RTC_XVFB_UNBOUND')
+        self.trial=trial;self.private_audio=None;self.intentional_stop=False;self.startup_diagnostics=StartupDiagnostics()
+        self.au_recovery=Recovery(trial.capture_allowed)
+        source=OwnedLive4K(trial,trial.xvfb,duration=duration,recovery=self.au_recovery)
+        super().__init__(trial.owner,source,trial.capture_allowed,SPARK,TV,PORT,
+                         duration=duration,max_restarts=0,codec='VP9')
+
+    def request_stop(self):
+        # Serialize the reason with fail(): an admitted watcher iteration may
+        # race Close, but a failure recorded before Close is never erased.
+        with self.lock:
+            self.intentional_stop=True
+            self.stop.set();self.offer_ready.set()
+            if self.loop:self.loop.quit()
+
+    def fail(self, code):
+        with self.lock:
+            if not self.intentional_stop:
+                super().fail(code)
+
+    def _admit_source(self):
+        need(type(self.source)is OwnedLive4K and self.source.admitted() and
+             self.source.owner is self.owner and self.trial.owner is self.owner,'RTC_SOURCE_SCOPE')
+
+    def _build_audio(self):
+        need(getattr(self.trial,'rtc_audio',None)is None,'RTC_AUDIO_REPLAY')
+        self.private_audio=PrivatePulseOpus(self.trial,self.Gst,self.pipeline,
+            lambda:self.answer_taken and self.connection_ready and not self.stop.is_set() and not self.media_ended.is_set(),
+            self.fail,self._audio_buffer,diagnostics=self.startup_diagnostics)
+        self.trial.rtc_audio=self.private_audio
+        pay=self.private_audio.build();self._link_rtp(pay)
+
+    def _audio_buffer(self):
+        self.audio_started_connected=True;self.audio_count+=1
+
+    def _video_feed(self):
+        if not self._wait_connected():return
+        need(self.guard()is True,'OWNER_GUARD');self.source.start()
+        for stamp,data,key in self.source.units():
+            if self.stop.is_set()or self.media_ended.is_set():return
+            with self.lock:
+                if self.pending_keyframe_request:
+                    self.pending_keyframe_request=False;self.source.pli_requests+=1
+            if self.source.age(stamp)>MAX_AGE_NS:
+                self.au_recovery.source_drop(stamp,'AU_TOO_OLD');self.source.stale_discarded+=1;continue
+            if not self.push_video(stamp,data,key):return
+            self.source.age(stamp,after_push=True)
+        self.fail('LIVE_CAPTURE_LIMIT')
+
+    def start(self):
+        need(not self.started and self.guard()is True,'START_REPLAY');self.started=True
+        # Existing heartbeat remains authoritative; this is an extra finite
+        # bound, never a fake ready_at renewal or an extension of ownership.
+        self.deadline=min(time.monotonic()+self.duration,self.trial.ready_at+self.duration,self.trial.deadline)
+        self.handshake_deadline=min(time.monotonic()+12,self.deadline)
+        self.created_unix_ms=int(time.time()*1000);self.signal_lifetime_seconds=12
+        try:
+            self.startup_diagnostics.phase("source-setup");self._setup()
+            self.startup_diagnostics.phase("audio-clock-bind");self.private_audio.bind_clock(cancelled=self.stop.is_set, deadline=min(self.deadline, self.handshake_deadline))
+            self.startup_diagnostics.phase("worker-start")
+            self._worker(self.loop.run);self._worker(self._video_feed)
+            def watch():
+                while not self.stop.wait(.025):
+                    self._maybe_offer()
+                    if time.monotonic()>=self.deadline or self.guard()is not True:
+                        self.fail('DEADLINE_OR_OWNER_LOST');return
+                    if not self.answer_taken and time.monotonic()>=self.handshake_deadline:
+                        self.fail('HANDSHAKE_TIMEOUT');return
+                    if self.connected_seen and not self.connection_ready:
+                        self.fail('RTC_CONNECTION_LOST');return
+            self._worker(watch);self.startup_diagnostics.phase("offer-ready");self.provisioning();self.startup_diagnostics.phase("complete");return self
+        except BaseException as error:
+            self.startup_diagnostics.failed(error)
+            # The GLib loop may not have started when pipeline startup fails.
+            # Peek only one ERROR message; never consume or log debug strings.
+            try:
+                if self.pipeline is not None:
+                    bus=self.pipeline.get_bus()
+                    if bus is not None:self.startup_diagnostics.message(bus.pop_filtered(self.Gst.MessageType.ERROR),self.Gst)
+            except BaseException:pass
+            self.close();raise
+
+    def _record_pipeline_state(self,state,current,pending):
+        self.startup_diagnostics.state(state,current,pending)
+
+    def _bus(self,bus,message):
+        self.startup_diagnostics.message(message,self.Gst)
+        return super()._bus(bus,message)
+
+    def _close(self):
+        super()._close()
+        # The superclass has set the pipeline NULL and joined feeds. Verify the
+        # state before claiming removal of capture from the private graph.
+        if self.pipeline:
+            state,current,_=self.pipeline.get_state(2*self.Gst.SECOND)
+            need(state!=self.Gst.StateChangeReturn.FAILURE and current==self.Gst.State.NULL,'RTC_PIPELINE_CLEANUP')
+        if self.private_audio:self.private_audio.close()
+        self.source.finish()
+
+    def counters(self):
+        result=super().counters()
+        result['privateAudio']=self.private_audio.snapshot()if self.private_audio else None
+        result['startupDiagnostics']=self.startup_diagnostics.snapshot()
+        return result
+
+def create(trial,duration=DEFAULT_DURATION):return BrowserMedia(trial,duration=duration)

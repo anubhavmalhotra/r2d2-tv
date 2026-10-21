@@ -1,0 +1,65 @@
+name: Offline source checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: python3 tools/privacy_check.py
+      - run: python3 -B -m unittest discover -s tests
+      - run: node tests/test_protection_proof.js
+      - run: node tests/test_home_core.js
+      - run: npm ci --ignore-scripts
+      - run: npx --no-install playwright install --with-deps chromium
+      - run: npm run test:home
+      - run: npm run test:browser
+      - run: python3 tools/build.py --config config/example.json --output .build/ci --include-tests
+      - run: python3 -B -m unittest discover -s . -p 'test_*.py'
+        working-directory: .build/ci/spark/runtime
+      - run: node .build/ci/spark/runtime/test_viewer.js
+      - run: node .build/ci/spark/runtime/test_ring_viewer.js
+      - run: node .build/ci/spark/runtime/test_jitter_viewer.js
+      - run: node .build/ci/spark/runtime/test_history_back.js
+      - run: python3 -B -m unittest discover -s tv/integration -p 'test_*.py'
+      - run: python3 -B -m unittest discover -s voice -p 'test_*.py'
+      - run: python3 -B tools/check_voice_backend.py
+      - run: node voice/backend/test_voice_route.js
+      - run: node voice/backend/test_open_handoff.js
+      - run: python3 -B -m unittest discover -s tests -t .
+        working-directory: voice/agent/prototype
+      - run: python3 -B -m unittest discover -s tests_adversarial -t .
+        working-directory: voice/agent/prototype
+      - run: python3 -B -m unittest discover -s voice/tv -p 'test_*.py'
+      - run: node voice/tv/test_preprocess.js
+      - run: node voice/tv/test_resident_mic.js
+      - run: node voice/tv/test_owner_key.js
+      - run: node voice/tv/test_resident_hid.js
+      - run: node voice/tv/test_device_identity.js
+      - run: python3 -B -m unittest discover -s voice/tv/local-capture -p 'test_*.py'
+      - run: node voice/tv/local-capture/test_controller.js
+      - run: node voice/tv/local-capture/test_session.js
+      - run: node voice/tv/local-capture/test_owner_service.js
+      - run: node voice/tv/local-capture/test_ui_capture.js
+      - run: node voice/tv/local-capture/test_ui_heartbeat.js
+      - run: node voice/tv/local-capture/test_ui_qualification.js
+      - run: node voice/tv/local-capture/test_release_drain.js
+      - run: node voice/tv/local-capture/test_quiescence.js
+      - run: node voice/tv/local-capture/test_main.js
+      - run: node voice/tv/local-capture/test_power_reader.js
+      - run: node voice/tv/local-capture/test_bus_context.js
+      - run: node voice/tv/local-capture/test_bootstrap_entry.js
+      - run: node voice/tv/local-capture/test_held_original.js
+      - run: python3 -B -m unittest discover -s voice/tv/control -p 'test_*.py'
+      - run: node voice/tv/control/test_retry.js
+      - run: node voice/tv/transport/test_unit.js
+      - run: python3 -B -m unittest discover -s voice/tv/transport -p test_tls_interop.py
+      - run: python3 -B -m unittest discover -s voice/tv/transport -p test_mutations.py
+

@@ -1,0 +1,244 @@
+"""Pure, bounded request and fMP4 validation for the finite LAN trial."""
+import hmac
+import ipaddress
+from urllib.parse import urlsplit
+import json
+import math
+import re
+import struct
+import threading
+import time
+
+SPARK, TV, PORT = "{{SPARK_IP}}", "{{TV_IP}}", 4177
+WIDTH, HEIGHT = 3840, 2160
+DEVICE_SCALE = 2
+CSS_WIDTH, CSS_HEIGHT = WIDTH // DEVICE_SCALE, HEIGHT // DEVICE_SCALE
+ORIGIN = "http://%s:%d" % (SPARK, PORT)
+CODEC = "hvc1.1.6.L153.B0"
+CODEC_4K120 = "hvc1.1.6.L156.B0"
+MSE_CODECS = (CODEC, CODEC_4K120)
+MAX_BYTES, MAX_BOX = 6442450944, 4194304
+KEYS = {"ArrowLeft": "Left", "ArrowRight": "Right", "ArrowUp": "Up",
+        "ArrowDown": "Down", "Enter": "Return", "Escape": "Escape"}
+ERRORS = {None, "UNSUPPORTED_API", "UNSUPPORTED_CODEC", "STREAM_RESPONSE", "STREAM_LIMIT",
+          "MEDIA_EVENT", "APPEND", "STREAM_ERROR", "STREAM_STALLED", "PLAY_REJECTED",
+          "PAGE_HIDDEN", "VIDEO_ERROR"}
+
+def valid_text(body):
+    if type(body) is not dict or body.get('action') not in ('insert','insert-enter','backspace','enter'):
+        return False
+    expected={'action','focusId','id'} | ({'text'} if body['action'] in ('insert','insert-enter') else set())
+    if set(body)!=expected or any(type(body[k]) is not str or not re.fullmatch('[a-f0-9]{16}',body[k]) for k in ('focusId','id')):
+        return False
+    if body['action'] not in ('insert','insert-enter'):return True
+    value=body['text']
+    if type(value) is not str or not 1<=len(value)<=1024 or any(ord(c)<32 and c not in '\n\t' or ord(c)==127 for c in value):return False
+    try:return len(value.encode('utf-8'))<=4096
+    except UnicodeError:return False
+
+def valid_tabs(body):
+    return (type(body) is dict and
+            ((set(body) == {'action'} and body['action'] == 'new') or
+             (set(body) == {'action', 'id'} and body['action'] in ('switch', 'close') and
+              type(body['id']) is str and re.fullmatch('[a-f0-9]{16}', body['id']) is not None)))
+
+def valid_history(body):
+    return (type(body) is dict and set(body) == {'action'} and
+            type(body['action']) is str and body['action'] in ('back', 'forward', 'reload'))
+
+def valid_navigation(body):
+    """Bounded HTTPS address submission; no credentials or control characters.
+
+    This validates submitted addresses, not subsequent website redirects/links.
+    """
+    if type(body) is not dict or set(body) != {'url'}:
+        return False
+    value=body['url']
+    if (type(value) is not str or not 1<=len(value)<=1600 or not value.isascii() or
+        not value.startswith('https://') or re.search(r'[\x00-\x20\x7f\\]',value) or
+        re.search(r'%0[ad]',value,re.I)):
+        return False
+    try:
+        parsed=urlsplit(value)
+        if parsed.scheme!='https' or not parsed.hostname or '@' in parsed.netloc or parsed.username is not None or parsed.password is not None:
+            return False
+        if parsed.port is not None and not 1<=parsed.port<=65535:return False
+        if parsed.netloc.startswith('['):
+            if not re.fullmatch(r'\[[0-9a-fA-F:.]+\](?::[0-9]{1,5})?',parsed.netloc):return False
+            return ipaddress.ip_address(parsed.hostname).version==6
+        if not re.fullmatch(r'[a-zA-Z0-9.-]+(?::[0-9]{1,5})?',parsed.netloc):return False
+        host=parsed.hostname.rstrip('.')
+        if len(host)>253 or any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?',label,re.I)for label in host.split('.')):
+            return False
+        if re.fullmatch(r'[0-9.]+',host):return ipaddress.ip_address(host).version==4
+        return True
+    except (ValueError,UnicodeError):return False
+
+def integer(value, maximum, nullable=False):
+    return (nullable and value is None) or (type(value) is int and 0 <= value <= maximum)
+
+def valid_input(body):
+    if type(body) is not dict:
+        return False
+    if set(body) == {"kind", "key"}:
+        return body["kind"] == "key" and type(body["key"]) is str and body["key"] in KEYS
+    if set(body) == {"kind", "x", "y", "click"} and body["kind"] == "point":
+        return type(body["click"]) is bool and all(type(body[k]) in (int, float)
+            and math.isfinite(body[k]) and 0 <= body[k] <= 1 for k in ("x", "y"))
+    if set(body)=={'kind','x','y','deltaY'} and body['kind']=='wheel':
+        return type(body['deltaY']) is int and 0<abs(body['deltaY'])<=1200 and all(type(body[k]) in (int,float) and math.isfinite(body[k]) and 0<=body[k]<=1 for k in ('x','y'))
+    return False
+
+def valid_fixture(body):
+    return (type(body) is dict and set(body) == {"width", "height", "dpr", "inputCount", "keyCount", "clickCount", "moveCount", "selection"}
+            and integer(body["width"], 8192) and integer(body["height"], 8192)
+            and type(body["dpr"]) in (int, float) and math.isfinite(body["dpr"])
+            and 0 < body["dpr"] <= 8 and all(integer(body[k], 1000) for k in ("inputCount","keyCount","clickCount","moveCount"))
+            and body["inputCount"] == body["keyCount"] + body["clickCount"]
+            and integer(body["selection"], 2))
+
+def fixture_ready(body):
+    return valid_fixture(body) and (body["width"], body["height"], body["dpr"]) == (CSS_WIDTH, CSS_HEIGHT, DEVICE_SCALE)
+
+def valid_metrics(body, token, transport="mse"):
+    from rtc_client_diagnostics import valid_client_diagnostic
+    from rtc_measurement_schema import valid_measurement
+    numbers = {"elapsedMs": 1800000, "videoWidth": 8192, "videoHeight": 8192,
+        "readyState": 4, "totalFrames": 1000000000, "droppedFrames": 1000000000,
+        "frameWidth": 8192, "frameHeight": 8192,
+        "currentTimeMs": 1800000, "bufferEndMs": 1800000, "bufferAheadMs": 1800000,
+        "minAheadMs": 1800000}
+    # Receiver jitter-buffer counters (viewer.js gate/onStall/liveControl/scheduleReconnect).
+    jitter = {"cushionMs": 10000, "stallEvents": 100000, "gapSkips": 100000,
+        "liveJumps": 100000, "autoReconnects": 100000}
+    playback = {"playRequests": 1000, "playResolved": 1000, "playRejected": 1000,
+        "playingEvents": 10000, "waitingEvents": 10000, "seekingEvents": 10000, "seekedEvents": 10000,
+        "playbackSamples": 1801, "playableSamples": 1801, "nonseekingProgressMs": 1800000}
+    expected = set(numbers) | set(playback) | set(jitter) | {"paused", "seeking", "schema", "token", "final", "state", "error", "failureStage", "mediaErrorCode", "codec", "support",
+                              "frameCallbackAvailable", "frameCallbacks", "receivedBytes",
+                              "inputActionsSent", "inputMovesSent", "inputRejected"}
+    if transport == "webrtc":expected.update(("rtcDiagnostic","rtcMeasurement"))
+    if type(body) is not dict or set(body) != expected:
+        return False
+    return ((transport != "webrtc" or valid_client_diagnostic(body["rtcDiagnostic"])and valid_measurement(body["rtcMeasurement"]))
+        and type(body["schema"]) is int and body["schema"] == 1
+        and type(body["token"]) is str and re.fullmatch('[a-f0-9]{48}', body["token"]) is not None
+        and hmac.compare_digest(body["token"], token)
+        and type(body["final"]) is bool and type(body["state"]) is str
+        and body["state"] in ("starting", "receiving", "failed", "finished")
+        and (body["error"] is None or type(body["error"]) is str) and body["error"] in ERRORS
+        and (body["failureStage"] is None or type(body["failureStage"]) is str and body["failureStage"] in ("open", "fetch", "read", "remove", "append", "video"))
+        and (body["mediaErrorCode"] is None or type(body["mediaErrorCode"]) is int and 1 <= body["mediaErrorCode"] <= 4)
+        and (body["final"] and body["error"] is not None or body["failureStage"] is None and body["mediaErrorCode"] is None)
+        and (body["codec"] == "VP9" if transport=="webrtc" else body["codec"] in MSE_CODECS) and type(body["support"]) is dict
+        and set(body["support"]) == {"hevc", "h264"}
+        and all(type(v) is bool for v in body["support"].values())
+        and type(body["paused"]) is bool and type(body["seeking"]) is bool
+        and all(integer(body[k], v) for k, v in playback.items())
+        and all(integer(body[k], v) for k, v in jitter.items())
+        and type(body["frameCallbackAvailable"]) is bool
+        and integer(body["frameCallbacks"], 1000000000)
+        and integer(body["receivedBytes"], MAX_BYTES)
+        and integer(body["inputActionsSent"], 2400) and integer(body["inputMovesSent"], 6000)
+        and integer(body["inputRejected"], 30000)
+        and all(integer(body[k], v, True) for k, v in numbers.items()))
+
+def parse_json(raw, maximum=2048):
+    if maximum not in (2048,8192,16384) or not 0 < len(raw) <= maximum:
+        raise ValueError("BODY_LIMIT")
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("DUPLICATE_KEY")
+            result[key] = value
+        return result
+    def constant(_):
+        raise ValueError("NONFINITE_JSON")
+    return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+
+def route_request(peer, method, path, headers, token):
+    """Headers is an email.message.Message; duplicate authority/body headers fail."""
+    for key in ("Host", "Origin", "Content-Type", "Content-Length", "Transfer-Encoding", "Expect", "X-R2D2-Media-Epoch", "X-R2D2-Media-Generation"):
+        if len(headers.get_all(key, [])) > 1:
+            return None
+    if peer not in (SPARK, TV) or headers.get("Host") != "%s:%d" % (SPARK, PORT):
+        return None
+    if headers.get("Origin") not in (None, ORIGIN) or headers.get("Transfer-Encoding") is not None or headers.get("Expect") is not None:
+        return None
+    match = re.fullmatch(r"/([a-f0-9]{48})/(fixture|start|viewer|stream\.mp4|stream-state|stream-open|stream-ready|rtc-offer|rtc-answer|fixture-metrics|metrics|input|navigate|history|tabs|text-focus|text|editor|presentation|layout|layout-seen|voice|end)", path)
+    if not match or not hmac.compare_digest(match[1], token):
+        return None
+    route = match[2]
+    expected_peer = SPARK if route in ("fixture", "start", "fixture-metrics") else TV
+    expected_method = "GET" if route in ("fixture", "start", "viewer", "stream.mp4", "stream-state", "text-focus", "rtc-offer") else "POST"
+    if route in ('tabs','editor','presentation','layout','voice') and method in ('GET', 'POST'):
+        expected_method = method
+    if peer != expected_peer or method != expected_method:
+        return None
+    if method == "GET" and headers.get("Content-Length") not in (None, "0"):
+        return None
+    if route == 'voice' and method == 'POST' and headers.get('Origin') != ORIGIN:
+        return None
+    return route
+
+class Budget:
+    def __init__(self, per_second, total):
+        self.rate, self.total, self.used, self.window = per_second, total, 0, []
+        self.lock = threading.Lock()
+
+    def take(self, now=None):
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            self.window = [t for t in self.window if now - t < 1]
+            if self.used >= self.total or len(self.window) >= self.rate:
+                return False
+            self.used += 1
+            self.window.append(now)
+            return True
+
+def read_exact(read, size, eof_ok=False):
+    result = bytearray()
+    while len(result) < size:
+        chunk = read(min(size - len(result), 65536))
+        if not chunk:
+            if eof_ok and not result:
+                return None
+            raise ValueError("TRUNCATED_MP4")
+        if len(chunk) > size - len(result):
+            raise ValueError("INVALID_READER")
+        result.extend(chunk)
+    return bytes(result)
+
+class MP4Reader:
+    def __init__(self, read):
+        self.read, self.total, self.stage, self.fragments = read, 0, "ftyp", 0
+
+    def next_box(self):
+        header = read_exact(self.read, 8, True)
+        if header is None:
+            if self.stage != "moof" or not self.fragments:
+                raise ValueError("INCOMPLETE_MP4")
+            return None
+        size, kind = struct.unpack(">I4s", header)
+        if not 8 <= size <= MAX_BOX or self.total + size > MAX_BYTES:
+            raise ValueError("MP4_LIMIT")
+        # The selected empty_moov/default_base_moof encoder has no extended sizes.
+        if kind == b"free" and self.stage != "ftyp":
+            pass
+        elif self.stage == "ftyp" and kind == b"ftyp":
+            self.stage = "moov"
+        elif self.stage == "moov" and kind == b"moov":
+            self.stage = "moof"
+        elif self.stage == "moof" and kind == b"moof":
+            self.stage = "mdat"
+        elif self.stage == "mdat" and kind == b"mdat":
+            self.stage = "moof"
+            self.fragments += 1
+        elif self.stage == "moof" and self.fragments and kind == b"mfra":
+            pass
+        else:
+            raise ValueError("MP4_ORDER")
+        data = header + read_exact(self.read, size - 8)
+        self.total += size
+        return data

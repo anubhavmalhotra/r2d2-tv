@@ -1,0 +1,35 @@
+"""Closed numeric receiver measurement vectors. Times are relative durations only."""
+import math
+FIELDS={'schema','error','samples','elapsedMs','dimensionsStable','layout','startup','steady','presentation','startupPresentation','steadyPresentation'}
+def mi(x,maximum,nullable=False):return x is None and nullable or type(x)is int and 0<=x<=maximum
+def vector(v,limits,nullable=()):return type(v)is list and len(v)==len(limits)and all(mi(x,limits[i],i in nullable)for i,x in enumerate(v))
+def valid_measurement(v):
+ if v is None:return True
+ if type(v)is not dict or set(v)!=FIELDS or type(v['schema'])is not int or v['schema']!=1 or v['error']not in (None,'RTC_STATS_UNCONFIRMED'):return False
+ if not mi(v['samples'],64)or not mi(v['elapsedMs'],32000)or v['dimensionsStable']is not None and type(v['dimensionsStable'])is not bool:return False
+ layout=v['layout']
+ if layout is not None:
+  if type(layout)is not list or len(layout)!=9 or not all(type(x)in(int,float)and math.isfinite(x)for x in layout):return False
+  if not all(1<=layout[i]<=16384 for i in(0,1))or not .125<=layout[2]<=8 or not all(abs(layout[i])<=16384 for i in(3,4))or not all(0<=layout[i]<=16384 for i in(5,6))or not all(mi(layout[i],8192)for i in(7,8)):return False
+ for key in ('startup','steady'):
+  if v[key]is not None and not vector(v[key],[32000,2147483647,2147483647,2147483647,3600000000,3600000000,2147483647],range(1,7)):return False
+ p=v['presentation']
+ if p is not None and not vector(p,[8192,2147483647,60000,60000,60000000,60000000,2147483647,2147483647],range(1,8)):return False
+ for key,window in [('startupPresentation',v['startup']),('steadyPresentation',v['steady'])]:
+  a=v[key]
+  if a is None:
+   if window is not None:return False
+  else:
+   if window is None or not vector(a,[32000,8192,2147483647,60000,60000,8191,1,60000000,60000000,2147483647,2147483647],(2,3,4,7,8,9,10)):return False
+   if a[0]!=window[0]or a[5]!=max(0,a[1]-1)or a[6]!=(1 if a[1]>0 and a[3]is not None else 0):return False
+   if a[5]==0:
+    if a[7]is not None or a[8]is not None:return False
+   elif a[7]is None or a[8]is None or a[7]>a[8]or a[8]>(a[0]+1)*1000:return False
+ if v['samples']==0:
+  return v['elapsedMs']==0 and v['dimensionsStable']is None and all(v[k]is None for k in('layout','startup','steady','presentation','startupPresentation','steadyPresentation'))
+ return p is not None
+
+def qualified_measurement(v):
+ if not valid_measurement(v)or v is None or v['error']is not None or v['dimensionsStable']is not True or not 30000<=v['elapsedMs']<=32000:return False
+ a,b,p=v['startup'],v['steady'],v['steadyPresentation']
+ return bool(a is not None and b is not None and p is not None and a[0]>=5000 and b[0]>=24000 and mi(b[1],2147483647)and b[1]>0 and mi(p[2],2147483647)and p[2]>0 and mi(p[9],2147483647)and mi(p[10],2147483647)and v['layout']is not None and v['layout'][7:]==[3840,2160])

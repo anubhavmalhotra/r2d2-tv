@@ -1,0 +1,266 @@
+"""Pure command builders and validators for Spark UxPlay AirPlay 4K60/4K120 ingress."""
+import re
+from media_profile import PROFILE_4K60_HEVC, PROFILE_4K120_HEVC, profile_for_name
+
+MIN_UXPLAY_VERSION = (1, 73, 7)
+LOOPBACK = '127.0.0.1'
+DEFAULT_VIDEO_RTP_PORT = 5000
+DEFAULT_AUDIO_RTP_PORT = 5002
+DEFAULT_AIRPLAY_PORT = 7000
+DEFAULT_RECEIVER_NAME = 'R2D2 4K (Spark)'
+
+
+def parse_uxplay_version(text):
+    """Extract (major, minor, patch) from `uxplay -v` output."""
+    if type(text) is not str or not 1 <= len(text) <= 4096:
+        raise ValueError('UXPLAY_VERSION_INPUT')
+    match = re.search(r'\bUxPlay\s+(?:version\s+)?(?:v)?(\d+)\.(\d+)(?:\.(\d+))?\b', text, re.I)
+    if not match:
+        raise ValueError('UXPLAY_VERSION_UNPARSABLE')
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    patch = int(match.group(3) or 0)
+    return (major, minor, patch)
+
+
+def require_uxplay_version(text, minimum=MIN_UXPLAY_VERSION):
+    """Require UxPlay >= 1.73.7 (fixes GHSA-479c-ww7g-wgp8 and iOS 27 TEARDOWN)."""
+    version = parse_uxplay_version(text)
+    if version < tuple(minimum):
+        raise ValueError('UXPLAY_VERSION_TOO_OLD')
+    return version
+
+
+def _valid_port(port):
+    return type(port) is int and 1024 <= port <= 65535
+
+
+def build_uxplay_command(
+    *,
+    uxplay_bin='uxplay',
+    profile_name='4k60_hevc',
+    receiver_name=DEFAULT_RECEIVER_NAME,
+    video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+    audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+    airplay_port=DEFAULT_AIRPLAY_PORT,
+    pin=None,
+    password=None,
+    device_id=None,
+    fps_data=False,
+):
+    """Build bounded UxPlay argv for 4K60 or 4K120 HEVC loopback RTP egress.
+
+    Never enables `-hls` (which reaches out to YouTube); binds RTP sinks strictly
+    to 127.0.0.1 with `timestamp-offset=0` on both audio and video payloaders.
+    """
+    if type(uxplay_bin) is not str or not 1 <= len(uxplay_bin) <= 256 or '\x00' in uxplay_bin:
+        raise ValueError('UXPLAY_BINARY')
+    profile = profile_for_name(profile_name)
+    if profile not in (PROFILE_4K60_HEVC, PROFILE_4K120_HEVC):
+        raise ValueError('UXPLAY_PROFILE_UNSUPPORTED')
+    if (type(receiver_name) is not str or not 1 <= len(receiver_name) <= 64 or
+            any(ord(c) < 32 or ord(c) == 127 for c in receiver_name)):
+        raise ValueError('UXPLAY_RECEIVER_NAME')
+    if not (_valid_port(video_rtp_port) and _valid_port(audio_rtp_port) and _valid_port(airplay_port)):
+        raise ValueError('UXPLAY_PORT')
+    if len({video_rtp_port, audio_rtp_port, airplay_port}) != 3:
+        raise ValueError('UXPLAY_PORT_COLLISION')
+    if pin is not None and password is not None:
+        raise ValueError('UXPLAY_AUTH_CONFLICT')
+    if pin is not None and (type(pin) is not int or not 1 <= pin <= 9999):
+        raise ValueError('UXPLAY_PIN')
+    if password is not None and (
+        type(password) is not str or not 8 <= len(password) <= 64 or
+        any(ord(c) < 32 or ord(c) == 127 for c in password)
+    ):
+        raise ValueError('UXPLAY_PASSWORD')
+    if device_id is not None and (
+        type(device_id) is not str or
+        not re.fullmatch(r'(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', device_id)
+    ):
+        raise ValueError('UXPLAY_DEVICE_ID')
+    if type(fps_data) is not bool:
+        raise ValueError('UXPLAY_FPSDATA_FLAG')
+
+    vrtp = f'config-interval=1 timestamp-offset=0 ! udpsink host={LOOPBACK} port={video_rtp_port}'
+    artp = f'pt=96 timestamp-offset=0 ! udpsink host={LOOPBACK} port={audio_rtp_port}'
+    cmd = [
+        uxplay_bin,
+        '-h265',
+        '-s', f'{profile.width}x{profile.height}@{profile.fps}',
+        '-fps', str(profile.fps),
+        '-n', receiver_name,
+        '-nh',
+        # A second family device may take over instead of waiting for the first to end.
+        '-nohold',
+        '-p', str(airplay_port),
+        '-vrtp', vrtp,
+        '-artp', artp,
+    ]
+    if device_id is not None:
+        cmd.extend(['-m', device_id])
+    if pin is not None:
+        cmd.extend(['-pin', f'{pin:04d}'])
+    if password is not None:
+        cmd.extend(['-pw', password])
+    if fps_data:
+        cmd.append('-FPSdata')
+    return tuple(cmd)
+
+
+def build_loopback_sdp(
+    *,
+    video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+    audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+):
+    """Build RFC 4566 SDP description for loopback RTP H265 + RTP L16 streams."""
+    if not (_valid_port(video_rtp_port) and _valid_port(audio_rtp_port)) or video_rtp_port == audio_rtp_port:
+        raise ValueError('SDP_PORT')
+    lines = (
+        'v=0',
+        f'o=- 0 0 IN IP4 {LOOPBACK}',
+        's=R2D2AirPlay4K',
+        f'c=IN IP4 {LOOPBACK}',
+        't=0 0',
+        f'm=video {video_rtp_port} RTP/AVP 96',
+        'a=rtpmap:96 H265/90000',
+        f'm=audio {audio_rtp_port} RTP/AVP 96',
+        'a=rtpmap:96 L16/44100/2',
+        '',
+    )
+    return '\r\n'.join(lines).encode('ascii')
+
+
+DEFAULT_SDP_TIMEOUT_S = 15
+# Loopback receive buffer for one 4K IDR burst (hundreds of RTP packets at once);
+# the kernel clamps it to net.core.rmem_max.
+RTP_RECEIVE_BUFFER_BYTES = 33554432
+# HEVC Main tier peak rates: L5.1 = 40 Mbit/s, L5.2 = 60 Mbit/s.
+REENCODE_RATE = {60: ('30M', '40M'), 120: ('45M', '60M')}
+
+
+def _rtp_input_args(listen_timeout_s):
+    # Apple senders may leave RTP timestamps unset, so stamp by arrival time.
+    return (
+        '-protocol_whitelist', 'pipe,udp,rtp',
+        '-buffer_size', str(RTP_RECEIVE_BUFFER_BYTES),
+        '-use_wallclock_as_timestamps', '1',
+        '-listen_timeout', str(listen_timeout_s),
+    )
+
+
+def build_remux_command(
+    *,
+    video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+    audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+    short_fragment=True,
+    listen_timeout_s=DEFAULT_SDP_TIMEOUT_S,
+):
+    """Build b1 (zero video re-encode) loopback RTP -> fMP4 stdout command.
+
+    Reads the SDP produced by `build_loopback_sdp` from stdin (`pipe:0`) so
+    FFmpeg depayloads both dynamic-PT 96 H.265 video RTP and PT 96 L16 stereo
+    44.1 kHz audio RTP (stripping the 12-byte RTP header and honoring RTP
+    sequence numbers and timestamps).
+    """
+    if not (_valid_port(video_rtp_port) and _valid_port(audio_rtp_port)) or video_rtp_port == audio_rtp_port:
+        raise ValueError('REMUX_PORT')
+    if type(short_fragment) is not bool:
+        raise ValueError('SHORT_FRAGMENT_TYPE')
+    if type(listen_timeout_s) is not int or not 1 <= listen_timeout_s <= 300:
+        raise ValueError('SDP_LISTEN_TIMEOUT')
+    frag_us = '16667' if short_fragment else '80000'
+    interleave_us = '1000' if short_fragment else '0'
+    return (
+        'ffmpeg', '-v', 'error',
+        *_rtp_input_args(listen_timeout_s),
+        '-f', 'sdp', '-i', 'pipe:0',
+        '-map', '0:v:0', '-map', '0:a:0',
+        '-c:v', 'copy', '-tag:v', 'hvc1',
+        '-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '48000', '-ac', '2', '-b:a', '128k',
+        '-af', 'aresample=48000,asetpts=N+1024,asetnsamples=n=1024:p=1',
+        '-max_interleave_delta', interleave_us,
+        '-movflags', '+empty_moov+default_base_moof+separate_moof+omit_tfhd_offset',
+        '-frag_duration', frag_us,
+        '-f', 'mp4', 'pipe:1',
+    )
+
+
+def build_reencode_command(
+    *,
+    profile_name='4k60_hevc',
+    video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+    audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+    short_fragment=True,
+    listen_timeout_s=DEFAULT_SDP_TIMEOUT_S,
+):
+    """Build b2 (NVDEC -> letterboxed CFR 60/120 -> NVENC) loopback RTP -> fMP4 stdout command.
+
+    Reads the SDP produced by `build_loopback_sdp` from stdin (`pipe:0`). Decoding
+    uses FFmpeg's own HEVC parser with CUDA hwaccel, allowing the filter graph to
+    reinitialize when sender dimensions change. Output is letterboxed to fixed
+    3840x2160, 8-bit Main with CFR and a one-second GOP. Actual CUDA/NVENC size
+    changes, throughput and TV presentation still require hardware qualification.
+    """
+    profile = profile_for_name(profile_name)
+    if profile not in (PROFILE_4K60_HEVC, PROFILE_4K120_HEVC):
+        raise ValueError('REENCODE_PROFILE_UNSUPPORTED')
+    if not (_valid_port(video_rtp_port) and _valid_port(audio_rtp_port)) or video_rtp_port == audio_rtp_port:
+        raise ValueError('REENCODE_PORT')
+    if type(short_fragment) is not bool:
+        raise ValueError('SHORT_FRAGMENT_TYPE')
+    if type(listen_timeout_s) is not int or not 1 <= listen_timeout_s <= 300:
+        raise ValueError('SDP_LISTEN_TIMEOUT')
+    frag_us = '16667' if short_fragment else '80000'
+    interleave_us = '1000' if short_fragment else '0'
+    level = '5.1' if profile.fps == 60 else '5.2'
+    gop = str(profile.fps)
+    rate, peak = REENCODE_RATE[profile.fps]
+    w, h = profile.width, profile.height
+    # Fit display aspect ratio, not just coded width/height: resetting a
+    # non-square input SAR after fitting coded dimensions would squash it.
+    video_filter = (
+        f"scale=w='max(2,trunc(min({w},{h}*dar)/2)*2)':"
+        f"h='max(2,trunc(min({h},{w}/dar)/2)*2)':flags=bicubic,setsar=1,"
+        f'pad=w={w}:h={h}:x=(ow-iw)/2:y=(oh-ih)/2:color=black,fps={profile.fps}'
+    )
+    return (
+        'ffmpeg', '-v', 'error',
+        *_rtp_input_args(listen_timeout_s),
+        '-hwaccel', 'cuda', '-f', 'sdp', '-i', 'pipe:0',
+        '-map', '0:v:0', '-map', '0:a:0',
+        '-vf', video_filter,
+        # A source-size change reinitializes fps's buffered frame. Enforce CFR
+        # again at the encoder boundary so that one lost filter frame becomes
+        # a repeated frame, rather than a longer frame in the 60/120 Hz stream.
+        '-fps_mode:v', 'cfr', '-r:v', str(profile.fps),
+        '-c:v', 'hevc_nvenc', '-preset', 'p4', '-tune', 'll',
+        # NVENC otherwise promotes 10-bit input to Main10 despite -profile:v
+        # main. The receiver contract is explicitly Main / 8-bit 4:2:0.
+        '-pix_fmt', 'yuv420p',
+        '-profile:v', 'main', '-level:v', level, '-tier', 'main',
+        '-rc', 'vbr', '-b:v', rate, '-maxrate', peak, '-bufsize', peak, '-spatial-aq', '1',
+        '-g', gop, '-keyint_min', gop, '-no-scenecut', '1', '-bf', '0',
+        '-forced-idr', '1', '-tag:v', 'hvc1',
+        '-c:a', 'aac', '-profile:a', 'aac_low', '-ar', '48000', '-ac', '2', '-b:a', '160k',
+        '-af', 'aresample=48000:async=1000:first_pts=0,asetnsamples=n=1024:p=1',
+        '-max_interleave_delta', interleave_us,
+        '-movflags', '+empty_moov+default_base_moof+separate_moof+omit_tfhd_offset',
+        '-frag_duration', frag_us,
+        '-f', 'mp4', 'pipe:1',
+    )
+
+
+def verify_av_sync(flash_pts_ms, beep_pts_ms, *, max_offset_ms=40):
+    """Evaluate A/V sync offset against the ±40 ms acceptance contract."""
+    if any(type(x) not in (int, float) or isinstance(x, bool) for x in (flash_pts_ms, beep_pts_ms, max_offset_ms)):
+        raise ValueError('AV_SYNC_INPUT')
+    if max_offset_ms <= 0 or max_offset_ms > 500:
+        raise ValueError('AV_SYNC_BOUND')
+    offset_ms = float(beep_pts_ms) - float(flash_pts_ms)
+    return {
+        'offsetMs': round(offset_ms, 3),
+        'absOffsetMs': round(abs(offset_ms), 3),
+        'maxOffsetMs': int(max_offset_ms),
+        'qualified': abs(offset_ms) <= max_offset_ms,
+    }

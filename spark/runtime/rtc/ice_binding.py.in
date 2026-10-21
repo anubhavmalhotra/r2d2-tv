@@ -1,0 +1,31 @@
+"""Exact upstream 1.24.2 local-IP GObject ACTION contract; no native on import.
+
+ice.c:561-576 declares add-local-ip-address, gboolean(string); nice.c:1646-1648
+overrides it. No public gst_webrtc_ice_add_local_ip_address C API is assumed.
+"""
+from .signal_protocol import ipv4,need
+
+def empty_optional_string(value):
+    return value is None or (type(value)is str and value=='')
+
+def checked_ice(peer,Gst,WebRTC,GObject):
+    _,current,_=peer.get_state(0)
+    need(current==Gst.State.NULL and peer.get_property('ice-gathering-state')==WebRTC.WebRTCICEGatheringState.NEW,
+         'ICE_PRE_GATHER_ONLY')
+    ice=peer.get_property('ice-agent')
+    need(ice is not None and GObject.type_name(ice.__gtype__)=='GstWebRTCNice' and
+         GObject.type_is_a(ice.__gtype__,WebRTC.WebRTCICE.__gtype__),'ICE_BACKEND_TYPE')
+    signal_id=GObject.signal_lookup('add-local-ip-address',ice.__gtype__)
+    need(type(signal_id)is int and signal_id>0,'ICE_LOCAL_SIGNAL_MISSING')
+    query=GObject.signal_query(signal_id)
+    need(query and query.signal_name=='add-local-ip-address' and
+         query.itype==WebRTC.WebRTCICE.__gtype__ and
+         bool(query.signal_flags&GObject.SignalFlags.ACTION) and
+         query.return_type==GObject.TYPE_BOOLEAN and tuple(query.param_types)==(GObject.TYPE_STRING,),
+         'ICE_LOCAL_SIGNAL_SIGNATURE')
+    return ice
+
+def bind_local_ip(peer,ice,address,Gst,WebRTC,GObject):
+    ipv4(address)
+    need(checked_ice(peer,Gst,WebRTC,GObject) is ice,'ICE_OBJECT_IDENTITY')
+    need(ice.emit('add-local-ip-address',address) is True,'LOCAL_INTERFACE_BIND')

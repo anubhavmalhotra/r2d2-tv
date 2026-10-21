@@ -1,0 +1,52 @@
+{
+  "commit": "0d79e9ea78e8bfe31fa139abbce5d63957638fa3",
+  "cosmeticInputs": {
+    "generic-details.json": {
+      "bytes": 44365,
+      "sha256": "06fb56119ba1ce8405da5db41489d8a4acc34b98f6015fc54401bf58588b878d",
+      "upstreamPath": "chromium/rulesets/generic-details.json",
+      "used": false
+    },
+    "scripting__generic__easylist.js": {
+      "bytes": 346065,
+      "sha256": "b84a5099e37db537de46b685d0e7aa56f6f19eae7e3002e74baf60ba718bccc1",
+      "upstreamPath": "chromium/rulesets/scripting/generic/easylist.js",
+      "used": true
+    },
+    "scripting__specific__easylist.json": {
+      "bytes": 566285,
+      "sha256": "7192c61de0dbcf0e92678d3b2f2c924bb94f93f1ba9e2fb130b496c7a3196107",
+      "upstreamPath": "chromium/rulesets/scripting/specific/easylist.json",
+      "used": false
+    }
+  },
+  "cosmeticOutput": {
+    "bundleSHA256": "c9db61de58e4b1cb91caf2ad72bff2487b8995999bcaa511dd62b9208026a94b",
+    "excludedHostPatterns": 494,
+    "genericGroups": 11408,
+    "outputSHA256": "fa88b96b06d338cd7c73121122e74e6581877b7481fb52ff05cb5e33c2680011",
+    "ownerPolicyRules": 5,
+    "ownerPolicySHA256": "3e3e344bb4e89bb189a17d9e6d56bfb38200d5d9fcba7c0c19b2609263aceaac"
+  },
+  "files": {
+    "easylist": {
+      "bytes": 1518777,
+      "outputSHA256": "6cc3a07e48cceef25e20bb8712233376e919aba29f37108eed4fe2fa5dc3e471",
+      "sha256": "072cc1f92b68b320fcf3027b9a19ddea17cb106af2f2490d0418c33223374738",
+      "upstreamPath": "chromium/rulesets/main/easylist.json"
+    },
+    "easyprivacy": {
+      "bytes": 2151026,
+      "outputSHA256": "4b3a3b017ae9b4b9997b96d93cf62df2fd582db223e7b617819e173698ab3895",
+      "sha256": "3a1f9408dc91f17db7d4ddeec176a7f7457616c67780f4855af076801dc495c0",
+      "upstreamPath": "chromium/rulesets/main/easyprivacy.json"
+    },
+    "ublock-badware": {
+      "bytes": 79344,
+      "outputSHA256": "dc0463d2fcbd7d8b271d31bdd93b1e5baafe25ca60680b362bd2e20b947cd0c9",
+      "sha256": "9d6274ae640afe02c8f9b1c80cdd42fe6672864169417a14c017f465c9800929",
+      "upstreamPath": "chromium/rulesets/main/ublock-badware.json"
+    }
+  },
+  "repository": "https://github.com/uBlockOrigin/uBOL-home"
+}

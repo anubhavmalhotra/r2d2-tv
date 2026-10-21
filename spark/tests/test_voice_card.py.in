@@ -1,0 +1,112 @@
+import json
+import unittest
+import voice_card as v
+
+# Synthetic copy only; never a real utterance.
+def card(**fields):
+    value = dict(v=1, seq=7, phase='result', ageMs=200, tone='sent', word='SENT',
+                 headline='Searching YouTube...', detail='', badge='sent', meter=None,
+                 meterMs=None, dwellMs=4000, mood='verified', echo='lo-fi music')
+    value.update(fields)
+    return value
+
+IDLE = dict(phase='idle', tone='ready', word='', headline='', detail='', badge=None, meter=None,
+            dwellMs=None, mood='idle', echo=None)
+
+class Clock:
+    def __init__(self): self.now = 100.0
+    def __call__(self): return self.now
+
+class CardShapeTests(unittest.TestCase):
+    def test_exact_closed_shape(self):
+        self.assertTrue(v.valid_card(card()))
+        self.assertTrue(v.valid_card(card(**IDLE)))
+        self.assertTrue(v.valid_card(card(phase='listening', tone='listen', word='LISTENING', headline='Listening...',
+                                          detail='Speak, then let go.', badge=None, meter='hold', meterMs=5500,
+                                          dwellMs=None, mood='listening', echo=None)))
+        missing = card(); del missing['echo']
+        bad = [None, [], {}, dict(card(), extra=1), missing, card(v=2), card(v=True), card(seq=-1),
+               card(seq=2**31), card(seq=True), card(ageMs=600001), card(ageMs=1.0), card(phase='speaking'),
+               card(tone='red'), card(mood=None), card(badge='done'), card(meter='bar'), card(meterMs=20001),
+               card(dwellMs=-1), card(dwellMs=1.5), card(word='Sent'), card(word='S'*21), card(headline='x'*41),
+               card(detail='y'*73), card(headline='Line\nbreak'), card(detail='caf\u00e9'), card(headline=None),
+               card(echo=''), card(echo='x'*49), card(echo='a\u202eb'), card(echo='a\x00b'), card(echo='a\u2028b'),
+               card(echo='\ud800'), card(echo='\ue000'), card(echo=5), card(phase='listening', echo='lo-fi music'),
+               card(**dict(IDLE, meter='sweep')), card(**dict(IDLE, headline='Listening...')),
+               card(**dict(IDLE, badge='sent')), card(**dict(IDLE, word='SENT'))]
+        for value in bad:
+            self.assertFalse(v.valid_card(value), repr(value)[:160])
+
+    def test_curly_copy_and_astral_echo_are_admitted(self):
+        self.assertTrue(v.valid_card(card(word='DIDN\u2019T WORK', headline='I\u2019m sorry, I cannot do that.',
+                                          detail='Say \u201cyes\u201d or \u201cno\u201d, then let go.', badge='nothing')))
+        self.assertTrue(v.valid_card(card(echo='\U0001f408' * 48)))
+        self.assertTrue(v.valid_card(card(phase='doing', echo='caf\u00e9 \u2026')))
+        # Spark now writes three periods; U+2026 copy from an older Spark is still admitted.
+        self.assertTrue(v.valid_card(card(headline='Searching YouTube\u2026', detail='Working on it\u2026')))
+
+class MirrorTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock(); self.card = v.VoiceCard(clock=self.clock)
+
+    def reply(self, close=False):
+        data, seq = self.card.reply(close)
+        self.assertLessEqual(len(data), v.MAX_REPLY); data.decode('ascii')
+        return json.loads(data), seq
+
+    def test_reply_carries_latest_push_with_trial_side_age(self):
+        self.assertEqual(self.reply(), ({'ok': True, 'voice': None}, None))
+        self.assertEqual(self.card.exchange(card()), {'delivered': None})
+        self.clock.now += .3
+        value, seq = self.reply()
+        self.assertEqual(seq, 7); self.assertEqual(set(value), {'ok', 'voice'})
+        self.assertEqual(value['voice'], card(ageMs=500))
+        self.assertEqual(self.reply(True)[0], {'ok': True, 'voice': card(ageMs=500), 'close': True})
+
+    def test_mirror_expires_without_fresh_pushes(self):
+        self.card.exchange(card())
+        self.clock.now += v.EXPIRY_S
+        self.assertEqual(self.reply()[1], 7)
+        self.clock.now += .01
+        self.assertEqual(self.reply(), ({'ok': True, 'voice': None}, None))
+        self.card.exchange(card(seq=8)); self.assertEqual(self.reply()[1], 8)
+        self.card.exchange(None); self.assertEqual(self.reply(), ({'ok': True, 'voice': None}, None))
+
+    def test_delivery_is_reported_once_and_only_while_recent(self):
+        self.card.exchange(card())
+        self.card.mark_delivered(7); self.card.mark_delivered(6)
+        self.assertEqual(self.card.exchange(card()), {'delivered': 7})
+        self.assertEqual(self.card.exchange(card()), {'delivered': None})
+        self.card.mark_delivered(7); self.clock.now += v.EXPIRY_S + .01
+        self.assertEqual(self.card.exchange(card()), {'delivered': None})
+        for seq in (True, -1, 2**31, '7'):
+            self.card.mark_delivered(seq)
+        self.assertEqual(self.card.exchange(card()), {'delivered': None})
+
+    def test_echo_has_its_own_ttl_and_never_breaks_the_reply_bound(self):
+        self.card.exchange(card(ageMs=7900)); self.clock.now += .2
+        self.assertIsNone(self.reply()[0]['voice']['echo'])
+        wide = card(headline='\u2019' * 40, detail='\u201c' * 72, echo='\U0001f408' * 48)
+        self.card.exchange(wide)
+        value, seq = self.reply()
+        self.assertEqual(seq, 7); self.assertIsNone(value['voice']['echo'])
+        self.assertEqual(value['voice']['headline'], '\u2019' * 40)
+        widest = dict(wide, word='\u2019' * 20, seq=2**31 - 1, ageMs=600000, phase='confirm', tone='nothing',
+                      mood='listening', badge='unconfirmed', meter='countdown', meterMs=20000, dwellMs=20000, echo=None)
+        self.assertTrue(v.valid_card(widest)); self.card.exchange(widest)
+        value, seq = self.reply(True)
+        self.assertEqual((value, seq), ({'ok': True, 'voice': None, 'close': True}, None))
+
+    def test_refused_card_clears_and_close_is_final(self):
+        self.card.exchange(card())
+        self.assertEqual(self.card.exchange(card(echo='a\u202eb')), {'delivered': None})
+        self.assertEqual(self.reply()[1], None)
+        self.card.exchange(card()); self.card.mark_delivered(7)
+        self.card.close()
+        self.assertEqual(self.reply(), ({'ok': True, 'voice': None}, None))
+        self.assertEqual(self.card.exchange(card()), {'delivered': None})
+        self.card.mark_delivered(7)
+        self.assertEqual(self.reply(), ({'ok': True, 'voice': None}, None))
+        self.assertIsNone(self.card.delivered)
+
+if __name__ == '__main__': unittest.main()

@@ -1,0 +1,126 @@
+"""Inert terminal-AAC transactions; no decoder, network or native execution."""
+import io,struct,unittest
+from unittest.mock import patch
+import media_ring as m
+import test_media_ring as f
+
+def short_pair(duration=256,*,index=-1,default_flags=False,**kw):
+ a,b=f.pair(default_flags=default_flags,**kw);a=bytearray(a)
+ p=a.index(b'trun',a.index(b'trun')+1);count=m.u32(a,p+8)
+ index=count-1 if index<0 else index
+ stride=8 if default_flags else 12
+ a[p+16+stride*index:p+20+stride*index]=f.words(duration)
+ return bytes(a),b
+
+def trailer():return f.box(b'mfra',f.full(b'mfro',f.words(24)))
+def producer(pair=None,tail=b'',read=None,**kw):
+ r=m.MediaRing('a'*32,**kw)
+ raw=b''.join(f.init_bytes()+(pair or short_pair()))+tail
+ p=m.Producer(r,read or io.BytesIO(raw).read);p.step();return r,p,raw
+
+class Terminal(unittest.TestCase):
+ def test_direct_parser_and_append_remain_strict(self):
+  pair=short_pair()
+  with self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):m.parse_fragment(m.parse_init(*f.init_bytes()),*pair,0,1,{})
+  r=f.ring()
+  with self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):r.append(*pair)
+  self.assertEqual((r.next_index,r.prior,r.count),(0,{},0))
+ def test_clean_eof_commits_original_short_last_pair_and_clocks(self):
+  pair=short_pair();r,p,_=producer(pair)
+  self.assertEqual(p.step(),'fragment');self.assertTrue(p.eof_seen);self.assertTrue(r.ended)
+  x,_=r.read(r.resume().cursor)
+  self.assertEqual((x.moof,x.mdat),pair);self.assertTrue(x.terminal_audio_trim)
+  self.assertEqual(r.prior,{1:16000,2:11520});self.assertEqual(p.step(),'end')
+ def test_valid_terminal_index_then_eof(self):
+  r,p,_=producer(tail=trailer());p.step()
+  self.assertTrue(p.terminal_index_seen and p.eof_seen);self.assertTrue(r.terminal_audio_trim)
+ def test_readers_cannot_observe_staged_pair_or_clock_advance(self):
+  first=f.pair();last=short_pair(seq=2,vd=16000,ad=12288,sync=False)
+  raw=b''.join(f.init_bytes()+first+last)+trailer();stream=io.BytesIO(raw)
+  r=m.MediaRing('a'*32);before=None;observed=[]
+  def read(n):
+   if stream.tell()==len(raw)-len(trailer()):
+    observed.append((r.next_index,r.count,dict(r.prior),r.bytes,r.snapshot()['pendingBytes']))
+    self.assertIsNone(r.read(m.Cursor(r.epoch,1)))
+    with self.assertRaisesRegex(m.MediaError,'TERMINAL_EOF_REQUIRED'):r.finish()
+   return stream.read(n)
+  p=m.Producer(r,read);p.step();p.step();before=(r.next_index,r.count,dict(r.prior),r.bytes)
+  p.step();self.assertEqual(observed[0][:4],before);self.assertEqual(observed[0][4],sum(map(len,last)))
+  self.assertEqual(r.next_index,2);self.assertEqual(r.snapshot()['pendingBytes'],0)
+ def test_short_midstream_next_moof_refused_without_advancing(self):
+  tail=b''.join(f.pair(2,16000,11520));r,p,raw=producer(tail=tail)
+  with self.assertRaisesRegex(m.MediaError,'TERMINAL_AUDIO_NOT_LAST'):p.step()
+  self.assertEqual((r.next_index,r.sequence,r.count,r.prior),(0,1,0,{}));self.assertFalse(r.ended)
+  self.assertEqual(r.snapshot()['pendingBytes'],0)
+ def test_failure_preserves_previously_committed_state(self):
+  first=f.pair();last=short_pair(seq=2,vd=16000,ad=12288,sync=False)
+  r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(b''.join(f.init_bytes()+first+last)+b'bad').read)
+  p.step();p.step();before=(r.next_index,r.sequence,r.bytes,r.count,dict(r.prior),tuple(tuple(g)for g in r.groups))
+  with self.assertRaisesRegex(m.MediaError,'TRUNCATED_STREAM'):p.step()
+  self.assertEqual((r.next_index,r.sequence,r.bytes,r.count,dict(r.prior),tuple(tuple(g)for g in r.groups)),before)
+ def test_partial_terminal_header_and_body_never_mean_eof(self):
+  for tail in (b'\0',trailer()[:7],trailer()[:-1]):
+   with self.subTest(tail=tail):
+    r,p,_=producer(tail=tail)
+    with self.assertRaisesRegex(m.MediaError,'TRUNCATED_STREAM'):p.step()
+    self.assertFalse(p.eof_seen);self.assertEqual(r.next_index,0)
+ def test_any_byte_after_index_refuses_terminal_commit(self):
+  r,p,_=producer(tail=trailer()+b'x')
+  with self.assertRaisesRegex(m.MediaError,'AFTER_TERMINAL_INDEX'):p.step()
+  self.assertFalse(p.eof_seen);self.assertEqual(r.next_index,0)
+ def test_unknown_index_and_bad_size_never_commit(self):
+  cases=[f.box(b'mfra'),f.box(b'mfra',f.box(b'free')),trailer()[:-4]+f.words(25),
+         f.words(m.MAX_TERMINAL_INDEX+1)+b'mfra',f.box(b'mfra',trailer()[8:]+trailer()[8:])]
+  for tail in cases:
+   with self.subTest(tail=tail):
+    r,p,_=producer(tail=tail)
+    with self.assertRaises(m.MediaError):p.step()
+    self.assertEqual(r.next_index,0);self.assertFalse(p.eof_seen)
+ def test_no_eof_timeout_is_sanitized_failure(self):
+  raw=b''.join(f.init_bytes()+short_pair());stream=io.BytesIO(raw)
+  def read(n):
+   if stream.tell()==len(raw):raise TimeoutError('never export timeout details')
+   return stream.read(n)
+  r,p,_=producer(read=read)
+  with self.assertRaisesRegex(m.MediaError,'^READER_FAILURE$'):p.step()
+  self.assertEqual(r.next_index,0);self.assertFalse(p.eof_seen);self.assertNotIn('details',str(r.snapshot()))
+ def test_only_one_last_sample_explicit_positive_shortening_allowed(self):
+  for pair in (short_pair(index=1),short_pair(0),short_pair(1025)):
+   with self.subTest(pair=pair[0][:8]):
+    r,p,_=producer(pair)
+    with self.assertRaises(m.MediaError):p.step()
+    self.assertEqual(r.next_index,0)
+  # middle and last shortened is still refused
+  pair=short_pair();a=bytearray(pair[0]);pos=a.index(b'trun',a.index(b'trun')+1);a[pos+28:pos+32]=f.words(256)
+  r,p,_=producer((bytes(a),pair[1]))
+  with self.assertRaises(m.MediaError):p.step()
+ def test_trim_flag_does_not_allow_bad_aac_flags_cts_or_unaccounted_bytes(self):
+  pair=short_pair();a=bytearray(pair[0]);pos=a.index(b'trun',a.index(b'trun')+1);a[pos+24:pos+28]=f.words(0x1010000)
+  for pair in ((bytes(a),pair[1]),short_pair(trun_flags=0xf01,cts=1),short_pair(tail=b'x')):
+   r,p,_=producer(pair)
+   with self.assertRaises(m.MediaError):p.step()
+   self.assertEqual(r.next_index,0)
+ def test_default_flags_same_narrow_duration_semantics(self):
+  r,p,_=producer(short_pair(default_flags=True));p.step();self.assertTrue(r.terminal_audio_trim)
+ def test_terminal_trim_keeps_no_b_idr_and_continuity_gates(self):
+  for pair in (short_pair(sync=False),short_pair(kind=21),short_pair(seq=3)):
+   r,p,_=producer(pair)
+   with self.assertRaises(m.MediaError):p.step()
+   self.assertEqual(r.next_index,0)
+ def test_single_group_overflow_not_bypassed_by_staging(self):
+  pair=short_pair();limit=sum(map(len,f.init_bytes()))+sum(map(len,pair))-1
+  r,p,_=producer(pair,max_bytes=limit)
+  with self.assertRaisesRegex(m.MediaError,'ACCESS_GROUP_OVERFLOW'):p.step()
+  self.assertEqual((r.count,r.next_index,r.snapshot()['pendingBytes']),(0,0,0))
+ def test_normal_stream_terminal_index_supported_without_trim(self):
+  r,p,_=producer(f.pair(),trailer());self.assertEqual(p.step(),'fragment');self.assertEqual(p.step(),'end')
+  self.assertTrue(p.terminal_index_seen and p.eof_seen);self.assertFalse(r.terminal_audio_trim)
+ def test_partial_reads_produce_exact_terminal_bytes(self):
+  pair=short_pair();raw=b''.join(f.init_bytes()+pair)+trailer();stream=io.BytesIO(raw)
+  r,p,_=producer(pair,read=lambda n:stream.read(min(n,3)));p.step()
+  x,_=r.read(r.resume().cursor);self.assertEqual((x.moof,x.mdat),pair);self.assertTrue(p.eof_seen)
+ def test_type_gate_rejects_truthy_candidate_parameter(self):
+  with self.assertRaisesRegex(m.MediaError,'TERMINAL_CANDIDATE_TYPE'):
+   m.parse_fragment(m.parse_init(*f.init_bytes()),*short_pair(),0,1,{},_terminal_candidate=1)
+
+if __name__=='__main__':unittest.main()

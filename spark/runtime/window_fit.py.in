@@ -1,0 +1,144 @@
+"""Replacement OwnedDisplay method retaining original private-X nonce selection.
+
+Attach as OwnedDisplay.fit_fixture = fit_fixture. Ordinary focus preserves the
+last requested height. Only fixed layout-fixture may supply height/marker.
+"""
+import ctypes
+import secrets
+from layout import WIDTH, HEIGHT, valid_height, valid_marker, window_matches
+from window_layout import Overlays
+
+def fit_fixture(self, focus=False, height=None, marker=None):
+    """Resize one uniquely marked browser client on this run's private X display."""
+    if height is not None and not valid_height(height):raise ValueError('LAYOUT_HEIGHT')
+    if marker is not None and (height is None or not valid_marker(marker)):raise ValueError('LAYOUT_MARKER')
+    if height is not None and getattr(self, 'fixture_window', None) is None:
+        raise RuntimeError('LAYOUT_REQUIRES_EXISTING_PIN')
+    target_height = height if height is not None else getattr(self, 'fixture_height', HEIGHT)
+    x = self.x11
+    ulong, uint, cint = ctypes.c_ulong, ctypes.c_uint, ctypes.c_int
+    x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]; x.XDefaultRootWindow.restype = ulong
+    x.XQueryTree.argtypes = [ctypes.c_void_p, ulong, ctypes.POINTER(ulong), ctypes.POINTER(ulong), ctypes.POINTER(ctypes.POINTER(ulong)), ctypes.POINTER(uint)]
+    x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, cint]; x.XInternAtom.restype = ulong
+    x.XGetWindowProperty.argtypes = [ctypes.c_void_p, ulong, ulong, ctypes.c_long, ctypes.c_long, cint, ulong, ctypes.POINTER(ulong), ctypes.POINTER(cint), ctypes.POINTER(ulong), ctypes.POINTER(ulong), ctypes.POINTER(ctypes.c_void_p)]
+    x.XFree.argtypes = [ctypes.c_void_p]
+    x.XGetGeometry.argtypes = [ctypes.c_void_p, ulong, ctypes.POINTER(ulong), ctypes.POINTER(cint), ctypes.POINTER(cint), ctypes.POINTER(uint), ctypes.POINTER(uint), ctypes.POINTER(uint), ctypes.POINTER(uint)]
+    x.XMoveResizeWindow.argtypes = [ctypes.c_void_p, ulong, cint, cint, uint, uint]
+    x.XSync.argtypes = [ctypes.c_void_p, cint]
+    x.XSetInputFocus.argtypes = [ctypes.c_void_p, ulong, cint, ulong]
+    x.XGetInputFocus.argtypes = [ctypes.c_void_p, ctypes.POINTER(ulong), ctypes.POINTER(cint)]
+    x.XRaiseWindow.argtypes = [ctypes.c_void_p, ulong]
+    x.XChangeProperty.argtypes = [ctypes.c_void_p, ulong, ulong, ulong, cint, cint, ctypes.c_void_p, cint]
+    class Attributes(ctypes.Structure):
+        _fields_ = [(name, cint) for name in ('x','y','width','height','border_width','depth')] + [
+            ('visual',ctypes.c_void_p),('root',ulong),('window_class',cint),('bit_gravity',cint),
+            ('win_gravity',cint),('backing_store',cint),('backing_planes',ulong),('backing_pixel',ulong),
+            ('save_under',cint),('colormap',ulong),('map_installed',cint),('map_state',cint),
+            ('all_event_masks',ctypes.c_long),('your_event_mask',ctypes.c_long),
+            ('do_not_propagate_mask',ctypes.c_long),('override_redirect',cint),('screen',ctypes.c_void_p)]
+    x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ulong, ctypes.POINTER(Attributes)]
+    root = x.XDefaultRootWindow(self.handle)
+    class_atom = x.XInternAtom(self.handle, b'WM_CLASS', 1)
+    string_atom = x.XInternAtom(self.handle, b'STRING', 1)
+    owner_atom = x.XInternAtom(self.handle, b'_BAAZ_PRIVATE_FIXTURE_OWNER', 0)
+    pending, seen, matches, diagnostics = [(root, 0)], set(), [], []
+    def geometry(window):
+        r, px, py, w, h, border, depth = ulong(), cint(), cint(), uint(), uint(), uint(), uint()
+        if not x.XGetGeometry(self.handle, window, ctypes.byref(r), ctypes.byref(px), ctypes.byref(py), ctypes.byref(w), ctypes.byref(h), ctypes.byref(border), ctypes.byref(depth)):
+            raise RuntimeError('PRIVATE_GEOMETRY_FAILED')
+        return {'x': px.value, 'y': py.value, 'width': w.value, 'height': h.value, 'border': border.value}
+    def property_bytes(window, atom):
+        if not atom or not string_atom:
+            return None
+        actual, fmt, count, after, data = ulong(), cint(), ulong(), ulong(), ctypes.c_void_p()
+        result = x.XGetWindowProperty(self.handle, window, atom, 0, 64, 0, string_atom,
+            ctypes.byref(actual), ctypes.byref(fmt), ctypes.byref(count), ctypes.byref(after), ctypes.byref(data))
+        try:
+            if result or actual.value != string_atom or fmt.value != 8 or count.value > 256 or after.value or not data.value:
+                return None
+            return ctypes.string_at(data.value, count.value)
+        finally:
+            if data.value:
+                x.XFree(data)
+    def marked(window):
+        value = property_bytes(window, class_atom)
+        return value is not None and b'BaazPrivateTrial' in value.split(b'\0')
+    def viewable(window):
+        attrs = Attributes()
+        return bool(x.XGetWindowAttributes(self.handle, window, ctypes.byref(attrs))) and attrs.map_state == 2 and attrs.window_class == 1 and attrs.root == root
+    pinned = getattr(self, 'fixture_window', None)
+    report = {'matched': 0, 'resized': False, 'visited': 0, 'windows': [], 'pinned': False}
+    if pinned is not None:
+        # A destroyed/recreated X ID loses our unpredictable per-run property.
+        # Never fall back to another same-class window after initial selection.
+        if (not marked(pinned) or property_bytes(pinned, owner_atom) != self.fixture_nonce or not viewable(pinned)):
+            report['pin_valid'] = False
+            return report
+        shape = geometry(pinned)
+        if not (3000 <= shape['width'] <= WIDTH and 1500 <= shape['height'] <= HEIGHT):
+            report['pin_valid'] = False
+            return report
+        window = pinned
+        report.update({'matched': 1, 'pinned': True, 'pin_valid': True, 'selection': 'pinned'})
+    elif focus:
+        # Focus is only legal after pre-DNS unique selection and nonce stamping.
+        return report
+    else:
+        while pending:
+            window, depth = pending.pop()
+            if window in seen:
+                continue
+            seen.add(window)
+            if len(seen) > 256:
+                raise RuntimeError('PRIVATE_WINDOW_LIMIT')
+            if window != root:
+                shape = geometry(window)
+                class_match = marked(window)
+                # WM_CLASS is supplied by our fixed Chromium launch, not page title/content.
+                if class_match and 3000 <= shape['width'] <= WIDTH and 1500 <= shape['height'] <= HEIGHT and viewable(window):
+                    matches.append(window)
+                if len(diagnostics) < 6:
+                    diagnostics.append({'marked': class_match, 'geometry': shape})
+            if depth >= 3:
+                continue
+            root_out, parent = ulong(), ulong()
+            children_ptr, count = ctypes.POINTER(ulong)(), uint()
+            if x.XQueryTree(self.handle, window, ctypes.byref(root_out), ctypes.byref(parent), ctypes.byref(children_ptr), ctypes.byref(count)):
+                try:
+                    if count.value > 256:
+                        raise RuntimeError('PRIVATE_WINDOW_LIMIT')
+                    pending.extend((children_ptr[i], depth + 1) for i in range(count.value))
+                finally:
+                    if children_ptr:
+                        x.XFree(children_ptr)
+        report.update({'matched': len(matches), 'visited': len(seen), 'windows': diagnostics})
+        if len(matches) != 1:
+            return report
+        window = matches[0]
+        nonce = secrets.token_bytes(16)
+        raw_nonce = ctypes.create_string_buffer(nonce)
+        x.XChangeProperty(self.handle, window, owner_atom, string_atom, 8, 0, raw_nonce, len(nonce))
+        x.XSync(self.handle, 0)
+        if property_bytes(window, owner_atom) != nonce:
+            raise RuntimeError('PRIVATE_WINDOW_PIN_FAILED')
+        self.fixture_window, self.fixture_nonce = window, nonce
+        report.update({'pinned': True, 'pin_valid': True, 'selection': 'unique-initial'})
+    before = geometry(window)
+    x.XMoveResizeWindow(self.handle, window, 0, 0, WIDTH, target_height)
+    x.XSync(self.handle, 0)
+    report.update({'resized': True, 'before': before, 'after': geometry(window)})
+    if not window_matches(report, target_height):raise RuntimeError('LAYOUT_WINDOW_GEOMETRY')
+    self.fixture_height = target_height
+    if focus:
+        x.XRaiseWindow(self.handle, window)
+        x.XSetInputFocus(self.handle, window, 1, 0)  # RevertToParent, CurrentTime
+        x.XSync(self.handle, 0)
+        actual, revert = ulong(), cint()
+        x.XGetInputFocus(self.handle, ctypes.byref(actual), ctypes.byref(revert))
+        report['focused'] = actual.value == window
+    if height is not None or getattr(self, 'layout_overlays', None) is not None:
+        if getattr(self, 'layout_overlays', None) is None:self.layout_overlays=Overlays(self)
+        self.layout_overlays.sync(target_height, marker)
+        if marker is not None:report['layoutMarker']=marker
+    return report
+

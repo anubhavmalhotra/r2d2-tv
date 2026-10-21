@@ -1,0 +1,140 @@
+"""Fixed local WebAudio self-test; never execute on a website or capture a default source.
+Call under the session's existing input/CDP lock before ready. Import is inert.
+"""
+import array
+import json
+import math
+import os
+from pathlib import Path
+import re
+import select
+import subprocess
+import sys
+import time
+from audio import AudioError
+
+ENV={'PATH':'/usr/bin:/bin','LC_ALL':'C','XDG_RUNTIME_DIR':'/run/user/1000'}
+START = r'''(async()=>{if(location.href!==START_URL||document.hidden||!document.hasFocus()||globalThis.__r2d2AudioProbe)return false;
+const ctx=new AudioContext({sampleRate:48000,latencyHint:'interactive'}),osc=ctx.createOscillator(),gain=ctx.createGain();
+osc.frequency.value=997;gain.gain.value=0.08;osc.connect(gain);gain.connect(ctx.destination);
+const p={ctx,osc,gain,timer:null};globalThis.__r2d2AudioProbe=p;
+p.timer=setTimeout(()=>{try{osc.stop()}catch(e){}gain.disconnect();ctx.close();delete globalThis.__r2d2AudioProbe},10000);
+await ctx.resume();osc.start();return ctx.state==='running'&&ctx.sampleRate===48000})()'''
+CLEAR = r'''(async()=>{if(location.href!==START_URL)return false;const p=globalThis.__r2d2AudioProbe;
+if(!p)return true;clearTimeout(p.timer);try{p.osc.stop()}catch(e){}p.gain.disconnect();await p.ctx.close();
+delete globalThis.__r2d2AudioProbe;return p.ctx.state==='closed'&&!globalThis.__r2d2AudioProbe})()'''
+
+def _eval(page, expression, deadline):
+    page.deadline=deadline
+    value=page._call('Runtime.evaluate',{'expression':expression,'returnByValue':True,
+        'awaitPromise':True,'userGesture':True,'timeout':1500},True)
+    r=value.get('result')
+    return ('exceptionDetails' not in value and type(r)is dict and r.get('value')is True)
+
+class BrowserOwner:
+    """Only pidfd-owned Chromium descendants; neither a PID string nor process name suffices.
+    The launcher's stable tracked handle anchors this already-exclusive owner tree.
+    Other directly spawned helpers/audio daemons cannot pass the executable/AppArmor checks.
+    """
+    def __init__(self,owner,launcher):
+        self.owner=owner
+        if launcher not in owner.processes or owner.process_refs.get(id(launcher)) is None:
+            raise AudioError('AUDIO_BROWSER_OWNER')
+        self.launcher=launcher;self.anchor=owner.process_refs[id(launcher)]
+    def __call__(self,pid):
+        if type(pid)is not int or pid<=1 or self.owner.process_refs.get(id(self.launcher))!=self.anchor:return False
+        self.owner.discover()
+        with self.owner.lock:
+            entry=self.owner.handles.get(pid)
+            if not entry or not self.owner.live(pid):return False
+            try:
+                path=Path('/proc')/str(pid)
+                before=(path/'stat').read_text().rsplit(')',1)[1].split()
+                exe=os.readlink(path/'exe')
+                with open(path/'attr/current','rb')as f:label=f.read(257).strip()
+                after=(path/'stat').read_text().rsplit(')',1)[1].split()
+                return (int(before[19])==entry[1]==int(after[19]) and self.owner.live(pid)
+                    and re.fullmatch(r'/snap/chromium/[0-9]+/usr/lib/chromium-browser/chrome',exe)is not None
+                    and label==b'snap.chromium.chromium (enforce)')
+            except (OSError,ValueError,IndexError):return False
+
+def capture_args(audio):
+    if not audio.isolated:raise AudioError('AUDIO_PRIVATE_GRAPH_REQUIRED')
+    audio._identity()
+    return ['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin',
+       '-f','pulse','-server',audio.server,'-name','R2D2AudioPreflight',
+       '-sample_rate','48000','-channels','2','-fragment_size','4096','-i',audio.monitor,
+       '-t','2','-map','0:a:0','-af','aresample=48000,atrim=end_sample=96000,asetpts=N/SR/TB',
+       '-ac','1','-ar','48000','-f','s16le','pipe:1']
+
+def signal_proved(raw):
+    if not 48000<=len(raw)<=192000 or len(raw)%2:return False
+    xs=array.array('h');xs.frombytes(raw)
+    if sys.byteorder!='little':xs.byteswap()
+    # Ignore start/end silence only for this known generated waveform.
+    active=[n for n,v in enumerate(xs)if abs(v)>100]
+    if not active:return False
+    lo,hi=active[0],active[-1]
+    if hi-lo<24000:return False
+    segment=xs[lo:hi+1]
+    rms=math.sqrt(sum(x*x for x in segment)/len(segment))
+    crossings=sum(a<=0<b for a,b in zip(segment,segment[1:]))
+    hz=crossings*48000/(len(segment)-1)
+    return 100<rms<5000 and 900<hz<1100
+
+def owns_browser_audio(owner,launcher,pid):
+    return BrowserOwner(owner,launcher)(pid)
+
+def audio_preflight(page,owner,launcher,audio,graph,*,capture=False):
+    if type(capture)is not bool:raise AudioError('AUDIO_PREFLIGHT_ARGUMENT')
+    if not re.fullmatch(r'http://{{SPARK_IP_REGEX}}:4177/[a-f0-9]{48}/start',page.start_url):
+        raise AudioError('AUDIO_LOCAL_START_REQUIRED')
+    if audio is not graph.audio:raise AudioError('AUDIO_GRAPH_IDENTITY')
+    if audio is None or not audio.isolated:raise AudioError('AUDIO_PRIVATE_GRAPH_REQUIRED')
+    owns=BrowserOwner(owner,launcher);child=None;started=False;cleared=False;captured=None
+    deadline=time.monotonic()+8
+    # A compound route verification shares the finite preflight deadline.
+    audio.pulse.deadline=deadline;graph.shared.deadline=deadline
+    try:
+        graph.assert_alive();page.deadline=deadline;page.assert_alive()
+        started=True  # Cleanup runs even if the one start reply is lost.
+        if not _eval(page,START.replace('START_URL',json.dumps(page.start_url)),deadline):
+            raise AudioError('AUDIO_WEB_TONE')
+        while True:
+            try:audio.verify(owns,lambda _:False,True);break
+            except AudioError as e:
+                if str(e)!='AUDIO_ROUTE_UNPROVED' or time.monotonic()+.1>=deadline:raise
+                time.sleep(.05)
+        if capture:
+            child=owner.spawn(capture_args(audio),env=ENV,stdout=subprocess.PIPE)
+            os.set_blocking(child.stdout.fileno(),False);raw=bytearray();route=False;check_at=0
+            while time.monotonic()<deadline:
+                now=time.monotonic()
+                if now>=check_at:
+                    sample=audio.verify(owns,lambda pid:pid==child.pid and owner.live(pid),True)
+                    route=route or sample['ownedCapture'];check_at=now+.2
+                if select.select([child.stdout],[],[],.05)[0]:
+                    part=os.read(child.stdout.fileno(),16384)
+                    if not part:break
+                    raw.extend(part)
+                    if len(raw)>192000:raise AudioError('AUDIO_PCM_LIMIT')
+            else:raise AudioError('AUDIO_CAPTURE_TIMEOUT')
+            child.wait(timeout=1)
+            captured=child.returncode==0 and route and signal_proved(raw)
+            raw.clear()
+            if not captured:raise AudioError('AUDIO_CAPTURE_SIGNAL')
+        graph.assert_alive()
+    finally:
+        if child:
+            if child.poll()is None:owner.terminate(child)
+            if child.stdout:child.stdout.close()
+        audio.pulse.deadline=graph.shared.deadline=time.monotonic()+3
+        try:
+            if started:
+                cleared=_eval(page,CLEAR.replace('START_URL',json.dumps(page.start_url)),time.monotonic()+2)
+                if not cleared:raise AudioError('AUDIO_TONE_CLEANUP')
+            graph.assert_alive()
+        finally:
+            del audio.pulse.deadline;del graph.shared.deadline
+    return {'passed':True,'browserRoute':True,'toneCleared':cleared,'captureVerified':captured,
+            'sharedDefaultsUnchanged':True,'sampleRate':48000}

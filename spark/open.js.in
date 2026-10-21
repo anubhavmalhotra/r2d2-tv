@@ -1,0 +1,90 @@
+(function () {
+  'use strict';
+  var match = /^\/([a-f0-9]{64})\/open$/.exec(location.pathname);
+  var status = document.getElementById('status'), id = null, handed = false, closed = false;
+  if (!match || location.origin !== 'http://{{SPARK_IP}}:4181') return;
+  var base = '/' + match[1] + '/', deadline = Date.now() + 110000, busyUntil = Date.now() + 30000;
+  function request(name, value, keepalive, allowBusy) {
+    var controller = new AbortController(), timer = setTimeout(function () { controller.abort(); }, 3000);
+    return fetch(base + name, {method:value === null ? 'GET' : 'POST', headers:value === null ? {} : {'Content-Type':'application/json'},
+      body:value === null ? undefined : JSON.stringify(value), credentials:'omit', cache:'no-store', redirect:'error', referrerPolicy:'no-referrer',
+      signal:controller.signal, keepalive:!!keepalive}).then(function (r) {
+        if (r.status !== 200 && r.status !== 202 && !(allowBusy && r.status === 409)) throw Error('Unavailable');
+        return r.text().then(function (s) {
+          if (s.length > 512) throw Error('Invalid');
+          return {code:r.status, value:JSON.parse(s)};
+        });
+      })
+      .finally(function () { clearTimeout(timer); });
+  }
+  function post(name, value, keepalive) {
+    return request(name,value,keepalive,false).then(function (r) { return r.value; });
+  }
+  function stop() {
+    if (closed) return; closed = true;
+    if (id && !handed) post('stop', {id:id}, true).catch(function () {});
+  }
+  function fail() { status.textContent = 'Spark could not start a private browser. Press Home, wait a moment, and try again.'; stop(); }
+  function poll() {
+    if (closed || handed) return;
+    if (Date.now() > deadline) { fail(); return; }
+    post('lease', {id:id}).then(function () { return post('claim', {id:id}); }).then(function (v) {
+      if (closed) return;
+      if (v.state === 'ready' && typeof v.url === 'string' && /^http:\/\/{{SPARK_IP_REGEX}}:4177\/[a-f0-9]{48}\/viewer$/.test(v.url)) {
+        handed = true; location.replace(v.url); return;
+      }
+      if (v.state !== 'starting') throw Error('Unavailable');
+      setTimeout(poll, 500);
+    }).catch(fail);
+  }
+  addEventListener('pagehide', stop);
+  document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); });
+  function waitForIdle() {
+    if (closed || handed) return;
+    if (Date.now() > busyUntil) { fail(); return; }
+    status.textContent = 'Finishing the previous private session...';
+    request('status',null,false,false).then(function (r) {
+      if (closed) return;
+      if (r.value.state === 'idle') { start(); return; }
+      if (['starting','ready','stopping'].indexOf(r.value.state) < 0) { fail(); return; }
+      setTimeout(waitForIdle,750);
+    }).catch(fail);
+  }
+  function start() {
+    if (closed || handed) return;
+    request('start',{},false,true).then(function (r) {
+    if (r.code === 409) {
+      if (['starting','ready','stopping'].indexOf(r.value.state) < 0) { fail(); return; }
+      waitForIdle(); return;
+    }
+    var v = r.value;
+    if (typeof v.id !== 'string' || !/^[a-f0-9]{32}$/.test(v.id)) throw Error('Invalid');
+    id = v.id;
+    if (closed) { post('stop', {id:id}, true).catch(function () {}); return; }
+    status.textContent = 'Starting your private browser...';
+    poll();
+  }).catch(fail);
+  }
+  // Voice has already created the exact owned manager session. The fragment is
+  // never an HTTP request parameter and is cleared before any lease/claim fetch.
+  var handoff = location.hash || '';
+  if (handoff) {
+    if (handoff === '#restart-tv') {
+      try { history.replaceState(null, '', location.pathname); } catch (_) { fail(); return; }
+      handoff = null;
+      status.textContent = 'Restarting TV...';
+      var Bridge = window.webOSServiceBridge || window.PalmServiceBridge;
+      if (typeof Bridge !== 'function') { fail(); return; }
+      try { var b = new Bridge(); b.call('luna://com.webos.service.tvpower/power/reboot', '{"reason":"reset"}'); } catch (_) { fail(); }
+      return;
+    }
+    var owned = /^#voice-session=([a-f0-9]{32})$/.exec(handoff);
+    try { history.replaceState(null, '', location.pathname); } catch (_) { fail(); return; }
+    handoff = null;
+    if (!owned) { fail(); return; }
+    id = owned[1]; owned = null;
+    poll();
+  } else {
+    start();
+  }
+}());

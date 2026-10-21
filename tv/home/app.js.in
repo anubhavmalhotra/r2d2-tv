@@ -1,0 +1,471 @@
+(function () {
+  "use strict";
+  var catalog = window.OwnerCatalog;
+  var service = new window.OwnerCore.Service(window.webOSServiceBridge || window.PalmServiceBridge, 7000, catalog.browser);
+  var chromiumSelected = false, browserState = "checking", browserChecking = false, browserGeneration = 0, inventoryReady = false;
+  var apps = [], selectedId = null, panel = null, busy = false, refreshSequence = 0, toastTimer, lastFocus = null;
+  var deleteCandidate = null, removalPending = false, removalInterrupted = false, removalGeneration = 0, manageFocusId = null, pulseButton, pulseTimer;
+  var $ = function (id) { return document.getElementById(id); };
+  var dockIds = ["netflix", "com.apple.appletv", "com.tubitv.ott.tubi", null, "youtube.leanback.v4", "amazon", "com.disney.disneyplus-prod"];
+  function appById(id) { return apps.find(function (app) { return app.id === id; }); }
+  function brandById(id) { return catalog.favorites.find(function (app) { return app.id === id; }); }
+  function titleFor(app) { var brand = brandById(app.id); return brand ? brand.title : app.title; }
+  function resize() { document.documentElement.style.setProperty("--scale", String(Math.min(window.innerWidth / 1920, window.innerHeight / 1080))); }
+  resize(); window.addEventListener("resize", resize);
+  try { document.body.classList.toggle("calm", localStorage.getItem("baaz.calm.v1") === "true"); } catch (_) {}
+
+  function notice(message) { clearTimeout(toastTimer); $("toast").textContent = message; $("toast").hidden = false; toastTimer = setTimeout(function () { $("toast").hidden = true; }, 3800); }
+  function focusables() {
+    var scope = panel ? $("overlay") : $("screen");
+    return Array.prototype.filter.call(scope.querySelectorAll("button:not(:disabled), input:not(:disabled)"), function (el) { return el.getClientRects().length > 0; });
+  }
+  function focus(el) {
+    if (!el || el.disabled) return;
+    if (panel && !$("overlay").contains(el)) el = $("panel-close");
+    el.focus({preventScroll:true});
+    if (panel && $("panel-content").contains(el)) el.scrollIntoView({block:"nearest",inline:"nearest"});
+  }
+  function firstDock() { return $("dock").querySelector("button:not(:disabled)") || $("search-open"); }
+  function move(direction) {
+    var candidates = focusables(), current = document.activeElement;
+    if (candidates.indexOf(current) < 0) { focus(panel ? $("panel-close") : firstDock()); return; }
+    var box = current.getBoundingClientRect(), x = box.left + box.width / 2, y = box.top + box.height / 2;
+    var best = null, score = Infinity;
+    candidates.forEach(function (candidate) {
+      if (candidate === current) return;
+      var b = candidate.getBoundingClientRect(), dx = b.left + b.width / 2 - x, dy = b.top + b.height / 2 - y;
+      var horizontal = direction === "left" || direction === "right";
+      var axis = direction === "left" ? -dx : direction === "right" ? dx : direction === "up" ? -dy : dy;
+      var cross = horizontal ? Math.abs(dy) : Math.abs(dx);
+      if (axis < 2) return;
+      if (horizontal && cross > Math.max(box.height, b.height) * 0.65) return;
+      var value = axis + cross * 3;
+      if (value < score) { score = value; best = candidate; }
+    });
+    if (best) focus(best);
+  }
+  function browserIcon() {
+    var ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns,"svg");
+    svg.setAttribute("viewBox","0 0 96 72"); svg.setAttribute("class","icon-browser"); svg.setAttribute("aria-hidden","true"); svg.setAttribute("focusable","false");
+    function shape(tag, attrs) { var el = document.createElementNS(ns,tag); Object.keys(attrs).forEach(function (key) { el.setAttribute(key,attrs[key]); }); svg.appendChild(el); }
+    // An original browser window with the home robot's screen face peeking in.
+    shape("rect",{x:6,y:6,width:84,height:60,rx:13,fill:"#aabed3",stroke:"#e5f2ff","stroke-width":1.5});
+    shape("rect",{x:9,y:9,width:78,height:54,rx:10,fill:"#e7eef5"});
+    shape("path",{d:"M19 9h58a10 10 0 0 1 10 10v7H9v-7A10 10 0 0 1 19 9Z",fill:"#2867c1"});
+    [19,27,35].forEach(function (x) { shape("circle",{cx:x,cy:18,r:2,fill:"#cfebff"}); });
+    shape("path",{d:"M48 37v-5",stroke:"#34464d","stroke-width":2,"stroke-linecap":"round"});
+    shape("circle",{cx:48,cy:31,r:2.5,fill:"#ee866a"});
+    shape("circle",{cx:25,cy:49,r:3.5,fill:"#34464d"}); shape("circle",{cx:71,cy:49,r:3.5,fill:"#34464d"});
+    shape("rect",{x:26,y:37,width:44,height:26,rx:9,fill:"#f3efe6",stroke:"#8f8676","stroke-width":1.5});
+    shape("rect",{x:31,y:41,width:34,height:17,rx:6,fill:"#0f1b24"});
+    shape("rect",{x:39,y:44,width:5,height:8,rx:2.5,fill:"#83ecff"}); shape("rect",{x:52,y:44,width:5,height:8,rx:2.5,fill:"#83ecff"});
+    return svg;
+  }
+  function gridIcon() { var el = document.createElement("span"); el.className = "icon-grid"; el.setAttribute("aria-hidden","true"); for (var i=0;i<9;i++) el.appendChild(document.createElement("i")); return el; }
+  // Logos are an optional private build input; without one a brand shows its text mark.
+  function logoFor(brand) { var logo = brand && catalog.logos.hasOwnProperty(brand.id) && catalog.logos[brand.id]; return typeof logo === "string" ? logo : null; }
+  function brandImage(brand, extraClass) {
+    var image = document.createElement("img"); image.className = "brand-image " + (extraClass || ""); image.src = logoFor(brand); image.alt = ""; image.setAttribute("aria-hidden","true"); return image;
+  }
+  function fitLine(el) {
+    // text-overflow:ellipsis draws U+2026, which the TV's fallback font sets mid-line, so
+    // cut an overflowing one-line label here and end it with three periods instead.
+    var full = el.textContent, low = 0, high = full.length;
+    if (!full || el.scrollWidth <= el.clientWidth) return;
+    while (low < high) {
+      var mid = Math.ceil((low + high) / 2);
+      el.textContent = full.slice(0, mid).replace(/\s+$/, "") + "...";
+      if (el.scrollWidth <= el.clientWidth) low = mid; else high = mid - 1;
+    }
+    el.textContent = full.slice(0, low).replace(/\s+$/, "") + "...";
+  }
+  function browserLabel() { return {idle:"Available",ready:"Available",starting:"Starting...",stopping:"Finishing...",error:"Unavailable",offline:"Spark offline",unavailable:"Unavailable",checking:"Checking..."}[browserState]; }
+  function renderBrowser() {
+    var button = $("chromium-browser");
+    if (button) {
+      button.setAttribute("aria-label", "R2D2 Browser — " + browserLabel());
+      button.setAttribute("aria-busy", String(browserChecking || browserState === "starting"));
+      button.querySelector(".browser-status").textContent = browserLabel();
+    }
+    if (!chromiumSelected) return;
+    $("hero-brand").textContent = "R2D2 BROWSER";
+    $("hero-kicker").textContent = "POWERED BY CHROMIUM";
+    $("hero-title").textContent = "A browser.\nOn your terms.";
+    $("hero-description").textContent = {unavailable:"Your Spark browser connection is not available yet.",offline:"Spark is not responding. Try again when it is available.",error:"The browser is unavailable right now. Please try again.",checking:"Checking your Spark browser connection...",stopping:"Your private session is finishing. Try again in a moment."}[browserState] || "Open a private browser session on Spark, here on your TV.";
+    fitLine($("hero-description")); $("hero-tags").replaceChildren(); voiceHint("chromium-browser");
+    ["Private session",browserLabel()].forEach(function (text) { var tag = document.createElement("span"); tag.textContent = text; $("hero-tags").appendChild(tag); });
+  }
+  function checkBrowser() {
+    if (browserChecking) return;
+    var generation = ++browserGeneration; browserChecking = true; browserState = "checking"; renderBrowser();
+    service.browserStatus().then(function (state) {
+      if (generation !== browserGeneration) return;
+      browserChecking = false; browserState = state; renderBrowser();
+    });
+  }
+  function selectChromium() { chromiumSelected = true; selectedId = null; renderBrowser(); checkBrowser(); }
+  function openBrowser() {
+    chromiumSelected = true; selectedId = null;
+    if (busy) return;
+    if (!service.browserAvailable()) { browserState = "unavailable"; renderBrowser(); notice("The Spark browser connection is unavailable."); return; }
+    busy = true; browserChecking = false; ++browserGeneration; browserState = "starting"; renderBrowser(); notice("Opening R2D2 Browser...");
+    service.launchBrowser().then(function () { busy = false; renderBrowser(); }, function () { busy = false; browserState = "error"; renderBrowser(); notice("R2D2 Browser could not open. Please try again."); });
+  }
+  function chromiumTile() {
+    var button = document.createElement("button"), tile = document.createElement("span"), label = document.createElement("span");
+    button.className = "dock-button chromium-browser"; button.id = "chromium-browser"; button.dataset.navrow = "dock"; button.title = "R2D2 Browser";
+    button.setAttribute("aria-label", "R2D2 Browser — " + browserLabel());
+    tile.className = "tile"; tile.appendChild(browserIcon());
+    var status = document.createElement("span"); status.className = "browser-status"; status.textContent = browserLabel(); tile.appendChild(status);
+    label.className = "dock-label"; label.textContent = "R2D2 Browser"; button.appendChild(tile); button.appendChild(label);
+    button.addEventListener("focus", selectChromium); button.addEventListener("mouseenter", selectChromium);
+    button.addEventListener("click", openBrowser);
+    return button;
+  }
+  function selectHero(id) {
+    var app = appById(id), brand = brandById(id);
+    if (!app || !brand) return;
+    chromiumSelected = false; selectedId = id;
+    $("hero-brand").textContent = brand.title.toUpperCase();
+    $("hero-kicker").textContent = "PICK YOUR NEXT ESCAPE";
+    $("hero-title").textContent = brand.headline;
+    $("hero-description").textContent = brand.description; fitLine($("hero-description"));
+    $("hero-tags").replaceChildren(); voiceHint(id);
+    [brand.tag || "Movies & series"].forEach(function (label) { var el = document.createElement("span"); el.textContent = label; $("hero-tags").appendChild(el); });
+  }
+  function launch(id) {
+    if (busy) return;
+    var app = appById(id);
+    if (!app) { notice("Refresh your apps before opening this item."); return; }
+    busy = true; notice("Opening " + titleFor(app) + "...");
+    service.launch(id).then(function () { busy = false; }, function (error) { busy = false; notice(error.message); });
+  }
+  function appButton(app, inDock) {
+    var brand = brandById(app.id), button = document.createElement("button"), tile = document.createElement("span"), label = document.createElement("span");
+    button.className = "dock-button " + (brand ? brand.tone : "utility"); button.dataset.appId = app.id;
+    button.setAttribute("aria-label", "Open " + titleFor(app));
+    tile.className = "tile"; label.className = "dock-label"; label.textContent = titleFor(app);
+    if (logoFor(brand)) tile.appendChild(brandImage(brand));
+    else tile.textContent = brand ? brand.mark : titleFor(app);
+    button.appendChild(tile); button.appendChild(label);
+    button.addEventListener("click", function () { launch(app.id); });
+    if (inDock) { button.dataset.navrow = "dock"; button.addEventListener("focus", function () { selectHero(app.id); }); button.addEventListener("mouseenter", function () { selectHero(app.id); }); }
+    return button;
+  }
+  function renderHome() {
+    $("dock").replaceChildren();
+    var shownApps = Object.create(null);
+    function append(id) {
+      if (id === null) { $("dock").appendChild(chromiumTile()); return; }
+      var app = appById(id);
+      if (app && app.visible && !shownApps[id]) {
+        shownApps[id] = true;
+        $("dock").appendChild(appButton(app,true));
+      }
+    }
+    // One collection: favorites first, then every remaining installed app once.
+    dockIds.forEach(append);
+    catalog.library.forEach(append);
+    var all = document.createElement("button"), tile = document.createElement("span"), label = document.createElement("span");
+    all.className = "dock-button utility"; all.dataset.navrow = "dock"; all.id = "all-apps"; all.setAttribute("aria-label","All apps"); tile.className = "tile"; tile.appendChild(gridIcon()); label.className = "dock-label"; label.textContent = "All apps"; all.appendChild(tile); all.appendChild(label); all.addEventListener("click", function () { openPanel("apps"); }); $("dock").appendChild(all);
+    Array.prototype.forEach.call($("dock").querySelectorAll(".dock-label"), fitLine);
+    var selected = appById(selectedId) || apps.find(function (app) { return app.visible && brandById(app.id); });
+    if (chromiumSelected) renderBrowser();
+    else if (selected) selectHero(selected.id);
+    else { selectedId = null; $("hero-brand").textContent = "R2D2"; $("hero-kicker").textContent = "PICK YOUR NEXT ESCAPE"; $("hero-title").textContent = "Your apps.\nYour space."; $("hero-description").textContent = "Everything you love, a little closer."; fitLine($("hero-description")); $("hero-tags").replaceChildren(); }
+  }
+  function visibleApps() { return apps.filter(function (app) { return app.visible; }); }
+  function renderPanelApps(query) {
+    $("panel-content").replaceChildren();
+    var normalized = (query || "").trim().toLowerCase();
+    var list = visibleApps().filter(function (app) { return (titleFor(app) + " " + app.title).toLowerCase().indexOf(normalized) !== -1; });
+    list.forEach(function (app) { $("panel-content").appendChild(appButton(app,false)); });
+    Array.prototype.forEach.call($("panel-content").querySelectorAll(".dock-label"), fitLine);
+    $("panel-empty").textContent = normalized ? "No apps found. Try another name." : "Your apps will appear here after a refresh."; $("panel-empty").hidden = list.length > 0;
+  }
+  function textBlock(paragraphs) {
+    var block = document.createElement("div"); block.className = "text-panel";
+    paragraphs.forEach(function (text) { var p = document.createElement("p"); p.textContent = text; block.appendChild(p); });
+    $("panel-content").appendChild(block); return block;
+  }
+  function localButton(label, action, pressed) { var button = document.createElement("button"); button.className = "secondary-button"; button.textContent = label; if (typeof pressed === "boolean") button.setAttribute("aria-pressed",String(pressed)); button.addEventListener("click",action); return button; }
+  function removable(app) {
+    return app && app.visible && app.removable === true && app.systemApp === false && catalog.library.indexOf(app.id) !== -1 && app.id !== catalog.appId && app.id !== "com.webos.app.tinybrowser";
+  }
+  function showPanelError(message) { $("panel-feedback").textContent = message; $("panel-feedback").hidden = false; }
+  function renderManage() {
+    $("panel-content").replaceChildren();
+    visibleApps().forEach(function (app) {
+      var row = document.createElement("div"), icon = document.createElement("span"), copy = document.createElement("span"), title = document.createElement("strong"), detail = document.createElement("span"), brand = brandById(app.id);
+      row.className = "manage-row"; row.dataset.manageId = app.id; icon.className = "manage-icon " + (brand ? brand.tone : "utility");
+      if (logoFor(brand)) icon.appendChild(brandImage(brand));
+      else if (brand) { icon.classList.add("manage-mark"); icon.textContent = brand.mark; }
+      copy.className = "manage-copy"; title.textContent = titleFor(app); detail.textContent = removable(app) ? "Installed app" : "Protected app"; copy.appendChild(title); copy.appendChild(detail); row.appendChild(icon); row.appendChild(copy);
+      if (removable(app)) {
+        var button = localButton("Delete",function () {
+          if (removalPending || busy) return;
+          deleteCandidate = {id:app.id,title:titleFor(app)}; manageFocusId = app.id; openPanel("confirm-delete");
+        });
+        button.classList.add("delete-button"); button.disabled = removalPending; button.dataset.deleteId = app.id; button.setAttribute("aria-label","Delete " + titleFor(app)); row.appendChild(button);
+      } else { var label = document.createElement("span"); label.className = "protected-label"; label.textContent = "Protected"; row.appendChild(label); }
+      $("panel-content").appendChild(row);
+    });
+    var browser = document.createElement("div"); browser.className = "manage-row";
+    var icon = document.createElement("span"); icon.className = "manage-icon browser-icon"; icon.appendChild(browserIcon()); browser.appendChild(icon);
+    var copy = document.createElement("span"); copy.className = "manage-copy";
+    var title = document.createElement("strong"); title.textContent = "R2D2 Browser"; copy.appendChild(title);
+    var detail = document.createElement("span"); detail.textContent = "Part of R2D2"; copy.appendChild(detail); browser.appendChild(copy);
+    var protectedLabel = document.createElement("span"); protectedLabel.className = "protected-label"; protectedLabel.textContent = "Protected"; browser.appendChild(protectedLabel); $("panel-content").appendChild(browser);
+  }
+  function cancelDelete() {
+    deleteCandidate = null; openPanel("manage");
+    var previous = Array.prototype.find.call($("panel-content").querySelectorAll("[data-delete-id]"),function (button) { return button.dataset.deleteId === manageFocusId; });
+    focus(previous && !previous.disabled ? previous : $("panel-content").querySelector("button:not(:disabled)") || $("panel-close"));
+  }
+  function confirmDelete() {
+    if (!deleteCandidate || removalPending || busy) return;
+    var candidate = deleteCandidate, app = appById(candidate.id);
+    if (!removable(app) || typeof service.removeApp !== "function") { showPanelError("This app cannot be deleted from R2D2."); return; }
+    var generation = ++removalGeneration; removalPending = true; busy = true;
+    $("delete-confirm").disabled = true; $("delete-confirm").textContent = "Deleting..."; $("delete-cancel").textContent = "Back to apps"; $("panel-close").setAttribute("aria-label","Back to app list"); $("panel-feedback").hidden = true;
+    Promise.resolve().then(function () { if (generation !== removalGeneration) throw new Error("Deletion was interrupted. Refresh your apps to check its result."); return service.removeApp(candidate.id); }).then(function () {
+      if (generation !== removalGeneration) return;
+      removalPending = false; busy = false; deleteCandidate = null;
+      if (panel === "confirm-delete") openPanel("manage");
+      refresh({removedId:candidate.id,title:candidate.title});
+    },function (error) {
+      if (generation !== removalGeneration) return;
+      removalPending = false; busy = false;
+      var message = error && error.message ? error.message : "The TV could not delete this app. Please try again.";
+      // The core revokes launch authority after an unconfirmed mutation.
+      // Refresh both inventories before exposing app actions again; never retry
+      // the removal itself or turn a failed check into a successful deletion.
+      refresh();
+      if (panel === "confirm-delete" && deleteCandidate && deleteCandidate.id === candidate.id) {
+        $("delete-confirm").disabled = true; $("delete-confirm").textContent = "Delete app"; $("delete-cancel").textContent = "Cancel"; $("delete-refresh").hidden = false; showPanelError(message); focus($("delete-cancel"));
+      } else notice(message);
+    });
+  }
+  function openStore() {
+    if (busy || removalPending) { notice("Please wait for the current app action to finish."); return; }
+    if (typeof service.openStore !== "function") { notice("The App Store is unavailable on this TV."); return; }
+    busy = true;
+    Promise.resolve().then(function () { return service.openStore(); }).then(function () { busy = false; },function (error) { busy = false; notice(error && error.message ? error.message : "The App Store could not open. Please try again."); });
+  }
+  function openPanel(next) {
+    if (!panel) lastFocus = document.activeElement;
+    panel = next; $("overlay").hidden = false; $("panel").setAttribute("role",next === "confirm-delete" ? "alertdialog" : "dialog"); $("panel-feedback").hidden = true; $("panel-close").setAttribute("aria-label",next === "confirm-delete" ? "Cancel deletion" : "Close"); $("panel-content").replaceChildren(); $("panel-content").scrollTop = 0; $("panel-empty").hidden = true; $("search-wrap").hidden = next !== "search";
+    $("panel-title").textContent = {apps:"All apps",search:"Find your app",inputs:"Inputs & AirPlay",preferences:"Home preferences",profile:"Remote & help","voice-help":"Voice commands",manage:"Manage apps","confirm-delete":"Delete " + (deleteCandidate ? deleteCandidate.title : "app") + "?"}[next];
+    $("panel-description").textContent = {apps:"Everything you watch, all together.",search:"A little less looking. A little more watching.",inputs:"Connect a screen, or choose an HDMI input.",preferences:"A few things to make yourself at home.",profile:"Everything you need, close at hand.","voice-help":"Hold the mic button on your remote, say one short command, then let go.",manage:removalPending ? "An app is being deleted. You can return to Home while it finishes." : "Delete apps you no longer use. R2D2 and system features stay protected.","confirm-delete":"The app and its saved data may be removed from this TV. You may need to sign in again if you reinstall it."}[next];
+    if (next === "apps" || next === "search") { $("search-input").value = ""; renderPanelApps(""); }
+    if (next === "inputs") {
+      catalog.shortcuts.filter(function (item) { return (item.kind === "input" || item.kind === "feature") && appById(item.id); }).forEach(function (item) {
+        var button = appButton({id:item.id,title:item.title},false); button.querySelector(".tile").textContent = item.symbol; button.querySelector(".tile").classList.add("utility-tile"); $("panel-content").appendChild(button);
+      });
+      $("panel-empty").textContent = "No inputs are available right now."; $("panel-empty").hidden = $("panel-content").children.length > 0;
+    }
+    if (next === "manage") renderManage();
+    if (next === "confirm-delete") {
+      var confirmation = textBlock(["Reinstalling later depends on the app’s availability in the App Store."]), actions = document.createElement("div"); actions.className = "inline-actions";
+      var cancel = localButton(removalPending ? "Back to apps" : "Cancel",cancelDelete); cancel.id = "delete-cancel"; actions.appendChild(cancel);
+      var confirm = localButton(removalPending ? "Deleting..." : "Delete app",confirmDelete); confirm.id = "delete-confirm"; confirm.classList.add("danger-button"); confirm.disabled = removalPending; actions.appendChild(confirm);
+      var refreshList = localButton("Refresh app list",function () { deleteCandidate = null; openPanel("manage"); refresh(); }); refreshList.id = "delete-refresh"; refreshList.hidden = true; actions.appendChild(refreshList); confirmation.appendChild(actions);
+    }
+    if (next === "preferences") {
+      var block = textBlock(["Choose how Home looks, manage your apps, or find something new in the App Store."]), actions = document.createElement("div"); actions.className = "inline-actions";
+      var calm = document.body.classList.contains("calm");
+      var toggle = localButton(calm ? "Soft colors · On" : "Soft colors · Off", function () {
+        var enabled = !document.body.classList.contains("calm"); document.body.classList.toggle("calm",enabled); toggle.textContent = enabled ? "Soft colors · On" : "Soft colors · Off"; toggle.setAttribute("aria-pressed",String(enabled));
+        try { localStorage.setItem("baaz.calm.v1",String(enabled)); } catch (_) { notice("Colors changed for this visit."); }
+      },calm);
+      var manage = localButton("Manage apps",function () { openPanel("manage"); }); manage.id = "manage-apps"; actions.appendChild(manage);
+      var store = localButton("App Store",openStore); store.id = "app-store"; actions.appendChild(store);
+      actions.appendChild(toggle); actions.appendChild(localButton("Refresh apps",function () { closePanel(); refresh(); })); actions.appendChild(localButton("Restart TV",function () { closePanel(); if (busy) return; if (!service.browserAvailable() || typeof service.restartTv !== "function") { notice("The Spark connection is unavailable."); return; } busy = true; notice("Restarting TV..."); service.restartTv().then(function () { busy = false; }, function () { busy = false; notice("TV could not restart. Please try again."); }); })); block.appendChild(actions);
+    }
+    if (next === "profile") {
+      var help = textBlock(["Point and click, or use the arrows and OK to open an app. Press Back to close a panel and return to your apps.","Find an app with Search. Open Inputs & AirPlay to share a screen or switch to a connected device. Refresh your app list in Home preferences."]);
+      if (voiceFeed.available()) { var helpActions = document.createElement("div"), voiceHelp = localButton("Voice commands",function () { openPanel("voice-help"); }); helpActions.className = "inline-actions"; voiceHelp.id = "voice-help-open"; helpActions.appendChild(voiceHelp); help.appendChild(helpActions); }
+    }
+    if (next === "voice-help") renderVoiceHelp();
+    focus(next === "search" ? $("search-input") : next === "confirm-delete" ? $("delete-cancel") : $("panel-content").querySelector("button:not(:disabled)") || $("panel-close"));
+    renderVoice();
+  }
+  function closePanel() { panel = null; deleteCandidate = null; $("overlay").hidden = true; focus(lastFocus && lastFocus.isConnected ? lastFocus : firstDock()); renderVoice(); }
+  function back() { if (panel === "confirm-delete") cancelDelete(); else if (panel === "manage") { openPanel("preferences"); focus($("manage-apps")); } else if (panel === "voice-help") { openPanel("profile"); focus($("voice-help-open")); } else if (panel) closePanel(); else focus(firstDock()); }
+  function refresh(removed) {
+    if (removalPending) { notice("Please wait for app deletion to finish before refreshing."); return; }
+    var sequence = ++refreshSequence; ++browserGeneration; browserChecking = false; browserState = "checking"; inventoryReady = false; service.cancelAll(); busy = false; apps = []; selectedId = null; renderHome(); $("status").textContent = "Getting your apps..."; $("status").classList.remove("error");
+    if (panel === "manage") { $("panel-content").replaceChildren(); textBlock(["Refreshing your apps..."]); focus($("panel-close")); }
+    service.refresh(catalog).then(function (result) {
+      if (sequence !== refreshSequence) return;
+      apps = result; inventoryReady = true; renderHome(); checkBrowser(); $("status").textContent = visibleApps().length ? "" : "No apps returned. Use Home preferences to refresh."; if (panel === "apps" || panel === "search") renderPanelApps($("search-input").value); else if (panel === "manage") { renderManage(); focus($("panel-content").querySelector("button:not(:disabled)") || $("panel-close")); } else if (!panel) focus(firstDock());
+      if (removed) notice(appById(removed.removedId) ? "The TV still lists " + removed.title + ". Refresh apps again in a moment." : removed.title + " deleted.");
+    },function (error) {
+      if (sequence !== refreshSequence) return;
+      apps = []; browserState = "unavailable"; renderHome(); renderBrowser(); $("status").textContent = error.message; $("status").classList.add("error"); if (panel === "manage") { $("panel-content").replaceChildren(); textBlock([error.message]); focus($("panel-close")); } if (removed) notice("Delete request accepted, but the app list could not refresh. " + error.message); if (!panel) focus($("preferences-open"));
+    });
+  }
+  $("search-open").addEventListener("click",function () { openPanel("search"); });
+  $("inputs-open").addEventListener("click",function () { openPanel("inputs"); });
+  $("preferences-open").addEventListener("click",function () { openPanel("preferences"); });
+  $("profile-open").addEventListener("click",function () { openPanel("profile"); });
+  $("panel-close").addEventListener("click",back);
+  $("search-input").addEventListener("input",function () { renderPanelApps($("search-input").value); });
+  document.addEventListener("keydown",function (event) {
+    var code = event.keyCode || event.which, direction = {37:"left",38:"up",39:"right",40:"down"}[code];
+    if (event.target === $("search-input") && (code === 37 || code === 39)) return;
+    if (event.target === $("search-input") && (code === 13 || code === 40)) { event.preventDefault(); focus($("panel-content").querySelector("button:not(:disabled)") || $("panel-close")); return; }
+    if (direction) { event.preventDefault(); move(direction); }
+    else if (code === 13) { event.preventDefault(); if (!event.repeat && document.activeElement && document.activeElement.tagName === "BUTTON") document.activeElement.click(); }
+    else if (code === 461 || code === 27) { event.preventDefault(); if (!event.repeat) back(); }
+    else if (code === 9 && panel) { event.preventDefault(); var options = focusables(), n = options.indexOf(document.activeElement); focus(options[(n+(event.shiftKey?options.length-1:1))%options.length]); }
+    // Voice, volume, mute, channel and power keys are left to the TV.
+  });
+  document.addEventListener("click",function (event) {
+    var button = event.target.closest && event.target.closest(".dock-button");
+    if (!button) return;
+    clearTimeout(pulseTimer); if (pulseButton) pulseButton.classList.remove("activated");
+    pulseButton = button; button.classList.add("activated"); pulseTimer = setTimeout(function () { button.classList.remove("activated"); pulseButton = null; },160);
+  });
+  window.addEventListener("pagehide",function () { ++removalGeneration; if (removalPending) { removalInterrupted = true; removalPending = false; busy = false; deleteCandidate = null; } clearTimeout(pulseTimer); if (pulseButton) pulseButton.classList.remove("activated"); pulseButton = null; });
+  window.addEventListener("pageshow",function () { if (removalInterrupted) { removalInterrupted = false; if (panel === "confirm-delete") openPanel("manage"); refresh(); notice("App deletion was interrupted. Check the refreshed app list for its result."); } });
+  document.addEventListener("focusin",function (event) { if (panel && !$("overlay").contains(event.target)) focus($("panel-close")); });
+  window.addEventListener("pagehide",function () { ++browserGeneration; browserChecking = false; service.cancelAll(); });
+  window.addEventListener("pageshow",function () { if (inventoryReady) checkBrowser(); });
+  var weatherBusy = false, weatherGeneration = 0;
+  function weatherIcon(icon) {
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("fill","none"); svg.setAttribute("stroke","currentColor"); svg.setAttribute("stroke-width","1.6"); svg.setAttribute("stroke-linecap","round"); svg.setAttribute("stroke-linejoin","round");
+    var cloud = "M5 16a4 4 0 0 1 0-8 6 6 0 0 1 11-1 4.5 4.5 0 0 1 2 9H5";
+    var paths = {clear:"M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5M17.5 17.5L19 19M5 19l1.5-1.5M17.5 6.5L19 5", "partly-cloudy":cloud,cloudy:cloud,fog:"M4 7h16M2 12h20M5 17h14",rain:cloud+"M7 19l-1 2m6-2-1 2m6-2-1 2",snow:"M12 2v20M3.3 7l17.4 10M3.3 17L20.7 7M9 4l3 3 3-3M9 20l3-3 3 3",storm:"M5 14a4 4 0 0 1 0-8 6 6 0 0 1 11-1 4.5 4.5 0 0 1 2 9M13 11l-4 6h4l-2 6 6-9h-4",wind:"M3 8h13a3 3 0 1 0-3-3M2 12h17a3 3 0 1 1-3 3M4 16h5",unknown:"M8 9a4 4 0 1 1 6 3c-2 1-2 2-2 3M12 19h.01"};
+    if (icon === "clear" || icon === "partly-cloudy") { var circle = document.createElementNS(svg.namespaceURI,"circle"); circle.setAttribute("cx",icon === "clear"?"12":"7");circle.setAttribute("cy",icon === "clear"?"12":"7");circle.setAttribute("r",icon === "clear"?"4":"3");svg.appendChild(circle); }
+    var path = document.createElementNS(svg.namespaceURI,"path");path.setAttribute("d",paths[icon] || paths.unknown);svg.appendChild(path);return svg;
+  }
+  function renderWeather(value) {
+    $("weather-icon").replaceChildren(); $("weather").classList.toggle("weather-stale",value.state === "stale");
+    if (value.state === "unavailable") { $("weather-label").textContent = "Weather unavailable"; $("weather").title = "Weather unavailable"; $("weather").setAttribute("aria-label","Weather unavailable"); return; }
+    $("weather-icon").appendChild(weatherIcon(value.icon));
+    var label = value.temperatureF + "° " + value.condition, description = label + (value.state === "stale" ? " · Stale" : "");
+    $("weather-label").textContent = label; fitLine($("weather-label")); $("weather").setAttribute("aria-label","Weather: " + description); $("weather").title = description;
+  }
+  function refreshWeather() {
+    if (weatherBusy || document.hidden) return;
+    var generation = ++weatherGeneration; weatherBusy = true;
+    service.weather().then(function (value) { if (generation !== weatherGeneration) return; weatherBusy = false; renderWeather(value); });
+  }
+  document.addEventListener("visibilitychange",function () { document.body.classList.toggle("page-hidden",document.hidden); if (!document.hidden) refreshWeather(); });
+  window.addEventListener("pagehide",function () { ++weatherGeneration; weatherBusy = false; document.body.classList.add("page-hidden"); });
+  window.addEventListener("pageshow",function () { document.body.classList.toggle("page-hidden",document.hidden); if (!document.hidden) refreshWeather(); });
+  // Voice is display-only: no focus, no keys, no storage; text is Spark's closed copy via textContent.
+  var VOICE_HINTS = {"netflix":"Open Netflix","com.apple.appletv":"Open Apple TV","com.tubitv.ott.tubi":"Open Tubi","youtube.leanback.v4":"Open the YouTube app","amazon":"Open Prime Video","com.disney.disneyplus-prod":"Open Disney Plus","com.wbd.stream":"Launch Max","hulu":"Open Hulu","com.movenetworks.app.sling-tv-sling-production":"Open Sling TV","com.apple.applemusic":"Launch Apple Music","chromium-browser":"Search YouTube for lo-fi music"};
+  var VOICE_CHIPS = {ready:"Hold the mic button to talk",warming:"Voice warming up · about a minute",starting:"Voice is starting up",unavailable:"Voice unavailable right now",paused:"Voice paused · restart it on Spark",offline:"Voice offline · can’t reach Spark"};
+  var VOICE_BADGES = {confirmed:"Confirmed",sent:"Sent",unconfirmed:"Not confirmed",nothing:"Nothing done",changed:"Nothing changed",failed:"Didn’t work",waiting:"Waiting for you"};
+  var VOICE_RING = "M3 12a9 9 0 1 0 18 0a9 9 0 1 0-18 0", VOICE_GLYPHS = {mic:["M9 6a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0Z","M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"],confirmed:["m4 12.5 5 5L20 6.5"],sent:["M7 17 17 7M9 7h8v8"],unconfirmed:[VOICE_RING,"M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.5v.4M12 17h.01"],nothing:["M6 12h12"],changed:["M6 12h12"],failed:["M7 7l10 10M17 7 7 17"],waiting:[VOICE_RING,"M12 7v5l3 2"]};
+  var voiceFeed = new window.OwnerCore.VoiceFeed(service, onVoice), voiceView = null, voiceAt = 0, voiceSeen = null, voiceChip = null, voiceDwell, voiceLeave;
+  var voiceArt = document.querySelector(".r2-art"), reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+  function voiceNode(tag, className, text) { var el = document.createElement(tag); if (className) el.className = className; if (text) el.textContent = text; return el; }
+  function voiceGlyph(name) {
+    var ns = "http://www.w3.org/2000/svg", svg = document.createElementNS(ns,"svg");
+    svg.setAttribute("viewBox","0 0 24 24"); svg.setAttribute("class","voice-glyph"); svg.setAttribute("aria-hidden","true"); svg.setAttribute("focusable","false");
+    VOICE_GLYPHS[name].forEach(function (d) { var path = document.createElementNS(ns,"path"); path.setAttribute("d",d); svg.appendChild(path); });
+    return svg;
+  }
+  function voiceHint(id) {
+    if (!voiceFeed.available() || !VOICE_HINTS[id]) return;
+    // The glyph is an svg, not a span, so the tag separator never lands inside the hint.
+    var tag = voiceNode("span","voice-hint"); tag.appendChild(voiceGlyph("mic")); tag.appendChild(document.createTextNode("Say “" + VOICE_HINTS[id] + "”")); $("hero-tags").appendChild(tag);
+  }
+  function voiceBadge(el, badge) {
+    el.replaceChildren(); el.hidden = badge === null;
+    if (badge === null) el.removeAttribute("data-badge");
+    else { el.dataset.badge = badge; el.appendChild(voiceGlyph(badge)); el.appendChild(document.createTextNode(VOICE_BADGES[badge])); }
+    return el;
+  }
+  function voiceFit(el, text) {
+    // Spark bounds the copy; step the size down rather than clip a receipt.
+    el.textContent = text; el.hidden = !text; el.classList.remove("voice-fit-1","voice-fit-2");
+    if (text && el.scrollWidth > el.clientWidth) el.classList.add("voice-fit-1");
+    if (text && el.scrollWidth > el.clientWidth) el.classList.replace("voice-fit-1","voice-fit-2");
+    if (text) fitLine(el);
+  }
+  function voiceMeter(view) {
+    var meter = $("voice-meter"), ms = Math.max(1, view.meterMs || 0);
+    meter.replaceChildren(); meter.hidden = view.meter === null;
+    if (view.meter === null) { meter.removeAttribute("data-meter"); return; }
+    // CSS runs the timer from the phase start, so a late render or a re-render stays on time.
+    meter.dataset.meter = view.meter; meter.style.setProperty("--voice-meter-ms", ms + "ms");
+    meter.style.setProperty("--voice-meter-delay", -Math.min(ms, view.ageMs + Math.round(performance.now() - voiceAt)) + "ms");
+    meter.appendChild(document.createElement("i"));
+  }
+  function voiceAnimate(el, entering) { el.classList.remove("voice-enter","voice-swap"); void el.offsetWidth; el.classList.add(entering ? "voice-enter" : "voice-swap"); }
+  function renderVoice() {
+    var view = voiceView, stage = $("voice-stage"), card = $("voice-card"), entering;
+    if (!view) return;
+    if (voiceArt) { if (view.mood === "idle") voiceArt.removeAttribute("data-voice"); else voiceArt.dataset.voice = view.mood; }
+    clearTimeout(voiceLeave);
+    if (panel) {
+      stage.hidden = true; stage.classList.remove("voice-enter","voice-leaving","voice-swap"); document.body.classList.remove("voice-active");
+      entering = card.hidden; card.hidden = false; card.dataset.tone = view.tone; card.classList.toggle("voice-card-two",!!view.detail);
+      voiceFit($("voice-card-headline"),view.headline); voiceFit($("voice-card-detail"),view.detail); voiceBadge($("voice-card-badge"),view.badge); voiceAnimate(card,entering);
+      return;
+    }
+    card.hidden = true; card.classList.remove("voice-enter","voice-swap");
+    entering = stage.hidden || stage.classList.contains("voice-leaving");
+    stage.classList.remove("voice-leaving"); stage.hidden = false; document.body.classList.add("voice-active");
+    stage.dataset.tone = view.tone; stage.dataset.phase = view.phase; $("voice-word").textContent = view.word; $("voice-bullet").hidden = !view.word;
+    voiceFit($("voice-headline"),view.headline); voiceFit($("voice-detail"),view.detail); voiceMeter(view); voiceBadge($("voice-badge"),view.badge); voiceAnimate(stage,entering);
+  }
+  function hideVoice(instant) {
+    var stage = $("voice-stage");
+    function done() { stage.hidden = true; stage.classList.remove("voice-enter","voice-leaving","voice-swap"); document.body.classList.remove("voice-active"); }
+    clearTimeout(voiceDwell); clearTimeout(voiceLeave); voiceView = null; $("voice-card").hidden = true;
+    if (voiceArt) voiceArt.removeAttribute("data-voice");
+    if (stage.hidden || instant || reducedMotion && reducedMotion.matches) { done(); return; }
+    stage.classList.remove("voice-enter","voice-swap"); stage.classList.add("voice-leaving"); voiceLeave = setTimeout(done,180);
+  }
+  function voiceChipState(state) {
+    if (voiceChip === state) return;
+    voiceChip = state; $("voice-chip").dataset.chip = state; $("voice-chip-label").textContent = VOICE_CHIPS[state]; $("voice-chip").hidden = false; fitLine($("voice-chip-label"));
+  }
+  function onVoice(view, failures, replay) {
+    if (!view) {
+      // Once Spark is unreachable the last phase can no longer be vouched for.
+      if (failures >= 2) { voiceChipState("offline"); hideVoice(); }
+      return;
+    }
+    voiceChipState(view.chip);
+    if (view.seq === voiceSeen) return;
+    voiceSeen = view.seq;
+    var dwell = view.dwellMs !== null ? view.dwellMs : view.phase === "result" ? 5000 : null;
+    // A replayed receipt is shown only while it still describes what just happened.
+    if (view.phase === "idle" || replay && view.phase === "result" && view.ageMs >= 6000 || dwell !== null && view.ageMs >= dwell) { hideVoice(); return; }
+    clearTimeout(voiceDwell); voiceView = view; voiceAt = performance.now();
+    if (dwell !== null) voiceDwell = setTimeout(function () { hideVoice(); },dwell - view.ageMs);
+    renderVoice();
+  }
+  function renderVoiceHelp() {
+    var help = voiceNode("div","voice-help"), how = voiceNode("div"), say = voiceNode("div"), steps = voiceNode("ol","voice-steps"), legend = voiceNode("div","voice-legend"), phrases = voiceNode("div","voice-phrases");
+    var first = voiceNode("span",null,"Hold the mic button. Wait until you see "); first.appendChild(voiceNode("strong",null,"Listening..."));
+    [first,voiceNode("span",null,"Say one short command. You have about 9 seconds."),voiceNode("span",null,"Let go. R2D2 shows what it understood and whether it worked.")].forEach(function (text) { var step = voiceNode("li"); step.appendChild(text); steps.appendChild(step); });
+    [["confirmed","R2D2 checked that it happened."],["sent","Sent, but the app doesn’t report back."],["unconfirmed","Check the TV before you try again."],["nothing","R2D2 didn’t change anything."],["failed","The TV or browser refused it."]].forEach(function (row) { legend.appendChild(voiceBadge(voiceNode("span","voice-badge"),row[0])); legend.appendChild(voiceNode("span",null,row[1])); });
+    [["APPS",["Open Netflix","Launch Max","Open the YouTube app"]],["R2D2 BROWSER",["Open YouTube in the browser","Search YouTube for lo-fi music","Search the web for news today","Go back","Close the browser"]],["WATCHING",["Pause","Play","What’s playing?"]],["SOUND",["Turn it up","Turn it down","Mute","Unmute"]],["ANYWHERE",["Go home","Cancel that"]]].forEach(function (group) {
+      var row = voiceNode("div"), list = voiceNode("ul"); row.appendChild(voiceNode("b",null,group[0]));
+      group[1].forEach(function (phrase) { list.appendChild(voiceNode("li",null,"“" + phrase + "”")); }); row.appendChild(list); phrases.appendChild(row);
+    });
+    [voiceNode("h3",null,"How it works"),steps,voiceNode("p","voice-help-note","Speech is handled on Spark at home and isn’t saved."),voiceNode("h3",null,"What the receipts mean"),legend].forEach(function (el) { how.appendChild(el); });
+    [voiceNode("h3",null,"Things you can say"),phrases,voiceNode("p","voice-help-note","Not yet: power, inputs, channels, settings, or typing into pages.")].forEach(function (el) { say.appendChild(el); });
+    help.appendChild(how); help.appendChild(say); $("panel-content").appendChild(help);
+  }
+  // Home polls only while visible, so each since=N it sends doubles as Spark's "shown" ack.
+  function startVoice() { if (!document.hidden) voiceFeed.start(); }
+  function stopVoice() { voiceFeed.stop(); hideVoice(true); }
+  document.addEventListener("visibilitychange",function () { if (document.hidden) stopVoice(); else startVoice(); });
+  window.addEventListener("pagehide",stopVoice);
+  window.addEventListener("pageshow",startVoice);
+  function clock() {
+    var now = new Date(), hour = now.getHours(), small = document.createElement("small");
+    $("date").textContent = now.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
+    $("clock").textContent = String(hour%12 || 12) + ":" + String(now.getMinutes()).padStart(2,"0"); small.textContent = hour >= 12 ? "PM" : "AM"; $("clock").appendChild(small); $("clock").dateTime = now.toISOString(); $("date").dateTime = now.toISOString().slice(0,10);
+  }
+  clock(); setInterval(clock,30000); refresh(); refreshWeather(); setInterval(refreshWeather,600000); startVoice();
+}());

@@ -1,0 +1,116 @@
+"""Inert generated-box/thread tests. No socket, subprocess, codec or media files."""
+import sys,io,time,threading,unittest
+from pathlib import Path
+from unittest.mock import patch
+from email.message import Message
+import media_stream as s
+import media_ring as m
+from test_media_ring import init_bytes,pair
+
+class Feed:
+    def __init__(self):self.data=bytearray();self.cv=threading.Condition();self.eof=False
+    def add(self,b):
+        with self.cv:self.data.extend(b);self.cv.notify_all()
+    def read(self,n):
+        with self.cv:
+            deadline=time.monotonic()+2
+            while not self.data and not self.eof:
+                if time.monotonic()>deadline:raise TimeoutError()
+                self.cv.wait(.02)
+            v=bytes(self.data[:n]);del self.data[:n];return v
+    def close(self):
+        with self.cv:self.eof=True;self.cv.notify_all()
+
+class Tests(unittest.TestCase):
+    def create(self,**kwargs):
+        self.feed=Feed();self.starts=0;self.ends=0;self.seq=0
+        def start():self.starts+=1;return self.feed
+        def finish(e):self.assertIs(e,self.feed);self.ends+=1
+        self.stream=s.MediaStream(start,lambda e,n:e.read(n),finish,lambda:True,epoch='a'*32,**kwargs)
+        self.feed.add(b''.join(init_bytes()));self.add()
+        self.addCleanup(self.cleanup)
+        return self.stream
+    def cleanup(self):self.stream.cancel.set();self.feed.close();self.assertTrue(self.stream.close(2))
+    def add(self,sync=True):
+        self.feed.add(b''.join(pair(self.seq+1,self.seq*32000,self.seq*25600,sync=sync,vs=32,ac=25)));self.seq+=1
+    def open(self):return self.stream.open({'epoch':'a'*32,'generation':self.stream.generation})
+    def ident(self):return {'epoch':'a'*32,'generation':self.stream.generation}
+    def wait(self,n):
+        deadline=time.monotonic()+2
+        while self.stream.fragments<n and time.monotonic()<deadline:time.sleep(.002)
+        self.assertEqual(self.stream.fragments,n)
+    def test_one_source_across_disconnect_reconnect(self):
+        a=self.create();first=self.open();res=a.attach(self.ident());self.assertTrue(a.mark_ready(self.ident()));a.detach(1);self.add();self.wait(2);second=self.open();a.attach(self.ident());self.assertEqual((self.starts,second['generation']),(1,2));self.assertGreater(second['index'],first['index']);self.assertFalse(a.permits_input({'epoch':'a'*32,'generation':1}));self.assertFalse(a.detach(1));self.assertTrue(a.active)
+    def test_stalled_consumer_does_not_stop_or_queue_producer(self):
+        a=self.create(ring=m.MediaRing('a'*32,max_seconds=1));self.open();res=a.attach(self.ident());
+        for _ in range(16):self.add()
+        self.wait(17);self.assertLessEqual(a.ring.snapshot()['groups'],4);self.assertEqual(self.starts,1)
+        with self.assertRaises(m.Lagged):a.next(1,res.cursor)
+        self.assertEqual(a.lagged,1);a.detach(1);latest=self.open();self.assertGreater(latest['index'],0)
+    def test_identity_and_duplicate_attach(self):
+        a=self.create();self.open()
+        for body in ({'epoch':'b'*32,'generation':1},{'epoch':'a'*32,'generation':True},{'epoch':'a'*32,'generation':1,'x':1}):
+            with self.assertRaises(s.StreamError):a.attach(body)
+        a.attach(self.ident())
+        with self.assertRaises(s.StreamError):a.attach(self.ident())
+        with self.assertRaises(s.StreamError):self.open()
+    def test_unattached_reservation_can_be_replaced_explicitly_not_replayed(self):
+        a=self.create();first=self.open()
+        with self.assertRaises(s.StreamError):a.open({'epoch':'a'*32,'generation':0})
+        second=self.open();self.assertEqual(second['generation'],2)
+        with self.assertRaises(s.StreamError):a.attach({'epoch':first['epoch'],'generation':1})
+    def test_generation_cap_not_reset_by_disconnect(self):
+        a=self.create()
+        self.assertEqual(s.MAX_GENERATIONS,32)
+        for _ in range(s.MAX_GENERATIONS):self.open()
+        with self.assertRaises(s.StreamError):self.open()
+        self.assertEqual(self.starts,1)
+    def test_ready_requires_attached_current_generation(self):
+        a=self.create();self.open();self.assertFalse(a.mark_ready(self.ident()));a.attach(self.ident());self.assertFalse(a.permits_input(self.ident()));self.assertTrue(a.mark_ready(self.ident()));self.assertTrue(a.permits_input(self.ident()));a.detach(1);self.assertFalse(a.permits_input(self.ident()))
+    def test_encoder_start_failure_consumed_no_retry(self):
+        a=self.create();a.start_encoder=lambda:(_ for _ in ()).throw(RuntimeError('private content'))
+        with self.assertRaises(s.StreamError):self.open()
+        self.assertEqual(a.error,'SOURCE_INVALID_OR_STOPPED');self.assertNotIn('private',str(a.state()))
+        with self.assertRaises(s.StreamError):self.open()
+    def test_thread_start_failure_does_not_join_unstarted(self):
+        a=self.create()
+        with patch.object(threading.Thread,'start',side_effect=RuntimeError('private')):
+            with self.assertRaises(s.StreamError):self.open()
+        self.assertTrue(a.close());self.assertEqual(a.error,'SOURCE_START_FAILED');self.assertEqual(self.starts,0)
+    def test_bytes_bound_no_unbounded_source(self):
+        a=self.create()
+        with patch.object(s,'MAX_BYTES',32):
+            with self.assertRaises(s.StreamError):self.open()
+        self.assertEqual(a.error,'SOURCE_INVALID_OR_STOPPED');self.assertLessEqual(a.total,32)
+    def test_common_offset_is_earliest_track_nonnegative(self):
+        a=self.create();self.feed.data.clear();self.feed.add(b''.join(init_bytes())+b''.join(pair()));first=self.open();self.assertEqual(first['startNumerator'],0);a.attach(self.ident());a.detach(1);self.feed.add(b''.join(pair(2,16000,12288)));self.wait(2);v=self.open();from fractions import Fraction
+        start=Fraction(v['startNumerator'],v['startDenominator']);self.assertEqual(start,Fraction(12288,48000));self.assertGreaterEqual(Fraction(16000,60000)-start,0)
+    def test_reader_error_does_not_expose_text(self):
+        a=self.create();a.read_encoder=lambda e,n:(_ for _ in ()).throw(RuntimeError('https://private/secret'))
+        with self.assertRaises(s.StreamError):self.open()
+        self.assertEqual(a.error,'SOURCE_INVALID_OR_STOPPED');self.assertNotIn('secret',str(a.snapshot()))
+    def test_finish_reaps_owned_encoder_once(self):
+        a=self.create();self.open();res=a.attach(self.ident());self.feed.close();self.assertTrue(a.close(2));self.assertEqual(self.ends,1);a.close();self.assertEqual(self.ends,1)
+    def test_terminal_trim_remains_invisible_until_true_eof_in_worker(self):
+        from test_terminal import short_pair,trailer
+        a=self.create();self.open();a.attach(self.ident())
+        self.feed.add(b''.join(short_pair(seq=2,vd=32000,ad=25600,vs=32,ac=25,sync=False))+trailer())
+        limit=time.monotonic()+1
+        while not a.ring.pending and time.monotonic()<limit:time.sleep(.002)
+        self.assertIsNotNone(a.ring.pending);self.assertEqual(a.ring.next_index,1);self.assertIsNone(a.ring.read(m.Cursor(a.epoch,1)))
+        self.feed.close();a.thread.join(1);self.assertTrue(a.finished);self.assertIsNone(a.error);self.assertTrue(a.ring.ended);self.assertTrue(a.ring.terminal_audio_trim);self.assertEqual(a.fragments,2)
+    def test_trim_followed_by_new_media_stops_without_publication(self):
+        from test_terminal import short_pair
+        a=self.create();self.open()
+        self.feed.add(b''.join(short_pair(seq=2,vd=32000,ad=25600,vs=32,ac=25,sync=False))+b''.join(pair(seq=3,vd=64000,ad=50432,vs=32,ac=25)))
+        a.thread.join(1);self.assertTrue(a.finished);self.assertEqual(a.error,'SOURCE_INVALID_OR_STOPPED');self.assertEqual(a.ring.next_index,1);self.assertEqual(a.fragments,1)
+    def test_header_strict_and_duplicates(self):
+        h=Message();h['X-R2D2-Media-Epoch']='a'*32;h['X-R2D2-Media-Generation']='1';self.assertEqual(s.header_identity(h),{'epoch':'a'*32,'generation':1});h['X-R2D2-Media-Generation']='1';self.assertIsNone(s.header_identity(h))
+    def test_exact_fragment_retained_bytes_and_no_cursor_skips(self):
+        a=self.create();self.open();res=a.attach(self.ident());f,c=a.next(1,res.cursor);self.assertEqual((f.moof,f.mdat),pair(vs=32,ac=25));self.assertEqual(c.index,1);self.add(False);self.wait(2);f,c=a.next(1,c);self.assertFalse(f.access_point);self.assertEqual(c.index,2)
+    def test_open_timeout_never_respawns(self):
+        a=self.create();self.feed.data.clear()
+        with self.assertRaises(s.StreamError):a.open({'epoch':'a'*32,'generation':0},timeout=.02)
+        self.assertEqual(self.starts,1);self.feed.add(b''.join(init_bytes())+b''.join(pair()));self.open();self.assertEqual(self.starts,1)
+
+if __name__=='__main__':unittest.main()

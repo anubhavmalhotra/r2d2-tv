@@ -1,0 +1,196 @@
+"""Display-only transport seam; importing this module starts no media or I/O.
+
+WebRTC (`webrtc`) is the default display transport in Manager and Trial, while MSE (`mse`) remains explicitly
+selectable via `--display-transport mse` with no silent fallback. The WebRTC path binds the finite browser sender and
+private monitor audio only when a session is opened.
+No passed Boolean can grant backend availability or receiver readiness.
+"""
+import json
+import secrets
+import threading
+from media_stream import MediaStream, StreamError, identity
+
+
+
+def require_backend():
+    from rtc_backend import create as backend
+    return backend
+
+
+def create(trial, mode='mse', rtc_factory=None):
+    if mode == 'mse':
+        return MediaStream(trial.encode, trial.read_media, trial.finish_media, trial.capture_allowed)
+    if mode != 'webrtc':
+        raise StreamError('DISPLAY_TRANSPORT')
+    return RTCDisplay(trial, rtc_factory if rtc_factory is not None else require_backend())
+
+
+class RTCDisplay:
+    """Same session and input epoch; never instantiates an MSE encoder.
+
+    factory(trial) must return the same-owner sender with bounded start/close,
+    provisioning, signed offer and accept_answer contracts. The opt-in binding
+    remains finite and is not an all-day or audible-playback qualification.
+    """
+    def __init__(self, trial, factory):
+        if not callable(factory):
+            raise StreamError('RTC_BACKEND_NOT_BOUND')
+        self.trial, self.factory = trial, factory
+        self.lock = threading.RLock()
+        self.startup_lock = threading.RLock()
+        self.cancel = threading.Event()
+        self.epoch = secrets.token_hex(16)
+        self.generation = 0
+        self.sender = None
+        self.active = self.ready = self.started = self.finished = False
+        self.opening = self.answer_attempted = False
+        self.offer_reads = 0
+        self._error = None
+
+    @property
+    def error(self):
+        return self._error or ("RTC_TRANSPORT_STOPPED" if self.sender is not None and self.sender.error is not None else None)
+
+    @error.setter
+    def error(self, value):
+        self._error = value
+
+    def _alive(self):
+        return not self.cancel.is_set() and self.error is None and self.trial.capture_allowed()
+
+    def state(self):
+        with self.lock:
+            return dict(schema=1, epoch=self.epoch, generation=self.generation,
+                        active=self.active, started=self.started, ended=self.finished,
+                        error=self.error)
+
+    def open(self, body):
+        with self.startup_lock:
+            return self._open(body)
+
+    def _open(self, body):
+        with self.lock:
+            if not identity(body, self.epoch, self.generation) or self.opening or self.started or not self._alive():
+                raise StreamError('OPEN_REFUSED')
+            self.opening = self.started = True
+        try:
+            sender = self.factory(self.trial)
+            # Same object identity, not an ownership claim supplied in JSON.
+            if sender.owner is not self.trial.owner:
+                raise StreamError('RTC_OWNER_CHANGED')
+            with self.lock:
+                self.sender = sender
+            if not self._alive():
+                raise StreamError("RTC_OWNER_LOST")
+            sender.start()
+            provisioning = sender.provisioning()
+            if sender.server is not None:
+                raise StreamError('RTC_SEPARATE_SIGNAL_SERVER_REFUSED')
+            with self.lock:
+                if not self._alive():
+                    raise StreamError('RTC_OWNER_LOST')
+                self.generation = 1
+                self.active = True
+                return dict(schema=1, epoch=self.epoch, generation=self.generation,
+                            transport='webrtc', provisioning=provisioning)
+        except BaseException:
+            self.error = 'RTC_START_UNCONFIRMED'
+            self.close()
+            raise StreamError("RTC_START_UNCONFIRMED") from None
+        finally:
+            with self.lock:
+                self.opening = False
+
+    def offer(self, body):
+        with self.lock:
+            if not identity(body,self.epoch,self.generation) or not self.active or not self._alive() or self.offer_reads:
+                raise StreamError('RTC_OFFER_REFUSED')
+            self.offer_reads += 1
+            raw = json.dumps(self.sender.offer, sort_keys=True, separators=(',',':'), allow_nan=False).encode('ascii')
+            if not 0 < len(raw) <= 70000:
+                raise StreamError('RTC_OFFER_BOUND')
+            return raw
+
+    def answer(self, body, raw):
+        with self.lock:
+            if not identity(body,self.epoch,self.generation) or not self.active or not self._alive() or self.answer_attempted:
+                raise StreamError('RTC_ANSWER_REFUSED')
+            if type(raw) is not bytes or not 0 < len(raw) <= 70000:
+                raise StreamError('RTC_ANSWER_BOUND')
+            self.answer_attempted = True
+            sender = self.sender
+        sender.accept_answer(raw)  # verifies the attempt MAC and exact LAN SDP
+        with self.lock:
+            if not self._alive():
+                raise StreamError('RTC_OWNER_LOST')
+        return True
+
+    def _connected(self):
+        sender = self.sender
+        return bool(sender is not None and sender.answer_taken and sender.connection_ready and
+                    sender.video_count > 0 and not sender.stop.is_set() and
+                    not sender.media_ended.is_set())
+
+    def mark_ready(self, body):
+        # Viewer sends this only after a callback from this connection's video.
+        # This is transport/frame readiness, never proof of physical pixels.
+        with self.lock:
+            if not identity(body,self.epoch,self.generation) or not self.active or not self._alive() or not self._connected():
+                return False
+            self.ready = True
+            return True
+
+    def permits_input(self, body):
+        with self.lock:
+            return bool(identity(body,self.epoch,self.generation) and self.ready and
+                        self.active and self._alive() and self._connected())
+
+    def permits_voice(self, body):
+        # Trial checks owner/deadline/heartbeat before this call. Do not call
+        # _alive/capture_allowed here: it can acquire Trial.lock or initiate
+        # shutdown while the inherited control request has a short deadline.
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            return bool(identity(body,self.epoch,self.generation) and self.ready and
+                        self.active and not self.cancel.is_set() and self.error is None and self._connected())
+        finally:
+            self.lock.release()
+
+    def attach(self, body):
+        raise StreamError('RTC_HAS_NO_MP4_STREAM')
+
+    def request_stop(self):
+        # Signal transport stop before the Trial invalidates its owner lease.
+        # This keeps an intentional Close distinct from an unexpected owner loss.
+        self.cancel.set()
+        with self.lock:
+            sender = self.sender
+        if sender is not None:
+            sender.request_stop()
+
+    def close(self, timeout=1):
+        self.cancel.set()
+        with self.startup_lock:
+            return self._close()
+
+    def _close(self):
+        with self.lock:
+            sender = self.sender
+            self.active = self.ready = False
+        if sender is not None:
+            try:
+                sender.close()
+            except BaseException:
+                self.error = 'RTC_CLEANUP_UNVERIFIED'
+                return False
+        with self.lock:
+            self.finished = True
+        return True
+
+    def snapshot(self):
+        # Preserve the existing receipt keys but distinguish transport; no fake
+        # fMP4 fragments or byte totals are attributed to the WebRTC sender.
+        return dict(transport='webrtc', error=self.error, producedBytes=0,
+                    fragments=0, generations=self.generation, active=self.active,
+                    ready=self.ready, finished=self.finished)

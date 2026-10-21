@@ -1,0 +1,89 @@
+import ctypes as c
+import types
+import unittest
+from layout import *
+from window_fit import fit_fixture
+
+# Reuse the packaged own-window fixture; no external workspace dependency.
+import test_trial as _fixtures
+
+class X(_fixtures.WindowMetadataTests.X):
+    def __init__(self):
+        super().__init__({2:b'BaazPrivateTrial\0'})
+        self.sizes={2:(0,0,3839,2159)};self.next=10;self.events=[];self.foreign=set()
+        F=_fixtures.WindowMetadataTests.Fn
+        self.XBlackPixel=F(lambda *_:0);self.XWhitePixel=F(lambda *_:0xffffff)
+        self.XCreateSimpleWindow=F(self.create);self.XChangeWindowAttributes=F(self.change_attrs)
+        self.XMapRaised=F(lambda h,w:self.events.append(('map',w)))
+        self.XUnmapWindow=F(lambda h,w:self.events.append(('unmap',w)))
+        self.XDestroyWindow=F(self.destroy)
+        self.XCreateGC=F(lambda *_:7);self.XFreeGC=F(lambda *_:None)
+        self.XSetForeground=F(lambda h,g,v:setattr(self,'color',v))
+        self.XFillRectangle=F(lambda h,w,g,x,y,a,b:self.events.append(('paint',w,x,y,a,b,self.color)))
+    def create(self,h,root,x,y,w,hh,border,fg,bg):
+        self.next+=1;self.sizes[self.next]=(x,y,w,hh);self.events.append(('create',self.next));return self.next
+    def change_attrs(self,h,w,mask,attrs):
+        assert mask==1<<9 and attrs._obj.override_redirect==1
+        self.events.append(('override',w))
+    def geometry(self,h,w,r,x,y,width,height,border,depth):
+        r._obj.value=1;x._obj.value,y._obj.value,width._obj.value,height._obj.value=self.sizes.get(w,(0,0,3840,2160));return 1
+    def move(self,h,w,x,y,width,height):
+        self.moves.append((w,x,y,width,height));self.sizes[w]=(x,y,width,height)
+    def destroy(self,h,w):
+        self.events.append(('destroy',w));self.sizes.pop(w,None)
+
+class WindowTests(unittest.TestCase):
+    def display(self):
+        d=types.SimpleNamespace(handle=1,x11=X())
+        fit_fixture(d)
+        return d
+    def test_height_survives_focus_and_second_same_class(self):
+        d=self.display();r=fit_fixture(d,True,height=1880,marker='0123456789abcdef')
+        self.assertTrue(window_matches(r,1880,True));self.assertEqual(r['layoutMarker'],'0123456789abcdef')
+        d.x11.classes[3]=b'BaazPrivateTrial\0';queries=d.x11.queries
+        r=fit_fixture(d,True);self.assertTrue(window_matches(r,1880,True));self.assertEqual(d.x11.queries,queries)
+        self.assertEqual(d.x11.focus,2)
+    def test_pad_covers_only_unused_rows_marker_exact(self):
+        d=self.display();fit_fixture(d,True,height=1880,marker='0123456789abcdef');o=d.layout_overlays
+        self.assertEqual(d.x11.sizes[o.pad],(0,1880,3840,280))
+        self.assertEqual(d.x11.sizes[o.marker],(3264,1864,576,16))
+        events=d.x11.events;paint=[e for e in events if e[0]=='paint'];self.assertEqual(len(paint),72)
+        self.assertLess(events.index(('map',o.marker)),events.index(paint[0]))
+        self.assertEqual([int(e[-1]!=0) for e in paint],list(marker_bits('0123456789abcdef')))
+    def test_repaint_after_focus_raise(self):
+        d=self.display();fit_fixture(d,True,height=1880,marker='0123456789abcdef')
+        d.x11.events.clear();fit_fixture(d,True)
+        self.assertEqual(len([e for e in d.x11.events if e[0]=='paint']),72)
+    def test_fullscreen_unmaps_pad_and_restores_full_height(self):
+        d=self.display();fit_fixture(d,True,height=1880,marker='0123456789abcdef');o=d.layout_overlays
+        o.clear('0123456789abcdef');r=fit_fixture(d,True,height=2160,marker='1234567890abcdef')
+        self.assertTrue(window_matches(r,2160,True));self.assertIn(('unmap',o.pad),d.x11.events)
+    def test_foreign_overlay_is_never_moved_or_destroyed(self):
+        for which in ('pad','marker'):
+            d=self.display();fit_fixture(d,True,height=1880,marker='0123456789abcdef');o=d.layout_overlays
+            w=getattr(o,which);d.x11.properties[w,73]=b'foreign-not-ours!';moves=len(d.x11.moves)
+            if which=='pad':
+                with self.assertRaises(RuntimeError):o.sync(1880)
+                self.assertEqual(len(d.x11.moves),moves)
+            else:
+                with self.assertRaises(RuntimeError):o.clear('0123456789abcdef')
+                self.assertNotIn(('destroy',w),d.x11.events)
+    def test_initial_pin_required_and_reused_id_refused(self):
+        d=types.SimpleNamespace(handle=1,x11=X())
+        with self.assertRaises(RuntimeError):fit_fixture(d,True,height=1880,marker='0123456789abcdef')
+        fit_fixture(d);d.x11.properties[2,73]=b'changed-pin-here!'
+        r=fit_fixture(d,True,height=1880,marker='0123456789abcdef')
+        self.assertFalse(r['pinned']);self.assertFalse(hasattr(d,'layout_overlays'))
+    def test_clear_exact_marker_only(self):
+        d=self.display();fit_fixture(d,True,height=1880,marker='0123456789abcdef');o=d.layout_overlays
+        with self.assertRaises(RuntimeError):o.clear('0000000000000000')
+        self.assertEqual(o.clear('0123456789abcdef'),{'cleared':True,'height':1880})
+        with self.assertRaises(RuntimeError):o.clear('0123456789abcdef')
+    def test_bad_height_or_marker_has_no_effect(self):
+        d=self.display();count=len(d.x11.moves)
+        for h in (True,1498,1501,2162):
+            with self.assertRaises(ValueError):fit_fixture(d,True,height=h,marker='0123456789abcdef')
+        with self.assertRaises(ValueError):fit_fixture(d,True,height=1880,marker='bad')
+        self.assertEqual(len(d.x11.moves),count)
+
+if __name__=='__main__':unittest.main()

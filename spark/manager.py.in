@@ -1,0 +1,633 @@
+"""Ordinary-user, fixed-TV launcher for one owned private Chromium session.
+
+No request URLs, browsing data, keys or request errors are logged. The manager
+never controls an existing desktop. Its HTTP routes accept no destination URL;
+optional voice control reaches only its own Trial child over an inherited socket.
+"""
+import base64
+import fcntl
+import hashlib
+import hmac
+import http.server
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import secrets
+import signal
+import socketserver
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+SPARK = '{{SPARK_IP}}'
+TV = '{{TV_IP}}'
+PORT = 4181
+VOICE_PORT = 4443
+ORIGIN = 'http://%s:%s' % (SPARK, PORT)
+HERE = Path(__file__).resolve().parent
+CONFIG = Path('/home/{{SPARK_USER}}/.local/share/baaz-browser/key')
+VOICE_CONFIG = CONFIG.parent / 'voice.json'
+RUN_BASE = Path('/home/{{SPARK_USER}}/snap/chromium/common/baaz-trial')
+STATES = {'idle', 'starting', 'ready', 'stopping', 'error'}
+
+
+def private_json(path, limit=131072):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, 'rb') as f:
+        s = os.fstat(f.fileno())
+        if not stat.S_ISREG(s.st_mode) or s.st_uid != 1000 or s.st_mode & 0o077 or s.st_size > limit:
+            raise ValueError('PRIVATE_FILE')
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('PRIVATE_FILE')
+    return json.loads(data)
+
+
+def validate_run(raw):
+    if type(raw) is not str or re.fullmatch(str(RUN_BASE) + r'/run-[a-f0-9]{16}', raw) is None:
+        raise ValueError('RUN_PATH')
+    p = Path(raw)
+    s = p.lstat()
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid != 1000 or s.st_mode & 0o077:
+        raise ValueError('RUN_OWNER')
+    return p
+
+
+def route(peer, method, path, headers, key):
+    for name in ('Host', 'Origin', 'Content-Length', 'Content-Type', 'Transfer-Encoding', 'Expect'):
+        if len(headers.get_all(name, [])) > 1:
+            return None
+    if peer != TV or headers.get('Host') != SPARK + ':' + str(PORT):
+        return None
+    if headers.get('Transfer-Encoding') is not None or headers.get('Expect') is not None:
+        return None
+    # The voice feed's position rides in the path: query strings never match.
+    m = re.fullmatch(r'/([a-f0-9]{64})/(status|weather|open|start|claim|lease|stop|voice/(?:0|[1-9][0-9]{0,9}))', path)
+    if not m or not hmac.compare_digest(m[1], key):
+        return None
+    name = m[2].split('/', 1)[0]
+    if method == 'GET' and name in ('status', 'weather', 'open', 'voice'):
+        allowed = ((None, ORIGIN, 'null') if name in ('status', 'weather') else
+                   (None, 'null') if name == 'voice' else (None, ORIGIN))
+        if headers.get('Origin') not in allowed or headers.get('Content-Length') not in (None, '0'):
+            return None
+        return name
+    if method == 'POST' and name in ('start', 'claim', 'lease', 'stop'):
+        if headers.get('Origin') == ORIGIN and headers.get('Content-Type') == 'application/json':
+            return name
+    return None
+
+
+def stale_journal(journal):
+    if not journal:
+        return False
+    if journal.is_symlink():
+        return True
+    if not journal.exists():
+        return False
+    fd = None
+    try:
+        fd = os.open(journal, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077 or info.st_size > 128:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return True
+    except OSError:
+        return journal.exists() or journal.is_symlink()
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _load_controlled_spawn():
+    if (HERE / 'voice_control').is_dir():
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        names = ('voice_control.browser_spawn', 'browser_spawn', 'voice.backend.browser_spawn')
+    else:
+        if (HERE.parent / 'voice/backend').is_dir() and str(HERE.parent) not in sys.path:
+            sys.path.insert(0, str(HERE.parent))
+        names = ('browser_spawn', 'voice.backend.browser_spawn', 'voice_control.browser_spawn')
+    for module_name in names:
+        try:
+            return __import__(module_name, fromlist=['ControlledSpawn']).ControlledSpawn
+        except ImportError:
+            continue
+    raise ImportError('ControlledSpawn unavailable')
+
+
+class Manager:
+    def __init__(self, spawn=subprocess.Popen, journal=None, weather=None, *, voice_control=True, display_transport='webrtc'):
+        self.lock = threading.RLock()
+        self.journal = journal
+        self.state = 'error' if stale_journal(journal) else 'idle'
+        self.session = None
+        self.closed = False
+        self.spawn = spawn
+        self.weather = weather
+        self.control_spawn = None
+        if display_transport not in ('mse', 'webrtc'):
+            raise ValueError('DISPLAY_TRANSPORT_OPTION')
+        self.display_transport = display_transport
+        if type(voice_control) is not bool:
+            raise ValueError('VOICE_CONTROL_OPTION')
+        if voice_control:
+            ControlledSpawn = _load_controlled_spawn()
+            if isinstance(spawn, ControlledSpawn) or (type(spawn).__name__ == 'ControlledSpawn' and hasattr(spawn, 'bind_manager') and hasattr(spawn, 'client')):
+                self.control_spawn = spawn
+            else:
+                self.control_spawn = ControlledSpawn(HERE / 'runtime/trial.py', spawn=spawn)
+            self.control_spawn.bind_manager(self)
+            self.spawn = self.control_spawn
+
+    def status(self):
+        with self.lock:
+            return {'state': self.state}
+
+    def start(self):
+        with self.lock:
+            if self.closed or self.state != 'idle':
+                return 409, {'state': self.state}
+            session = {'id': secrets.token_hex(16), 'lease': time.monotonic(),
+                       'claimed': False, 'process': None, 'run': None,
+                       'url': None, 'stop': threading.Event(), 'worker': None}
+            if self.journal:
+                try:
+                    fd = os.open(self.journal, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, 'w') as f:
+                        f.write(session['id'])
+                        f.flush()
+                        os.fsync(f.fileno())
+                    session['journal_identity'] = self.journal.lstat()
+                    directory_fd = os.open(self.journal.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except FileExistsError:
+                    # A different owner holds the journal. No session or child
+                    # belongs to this idle manager yet. Keep the reservation
+                    # intact and retry O_EXCL only on a later explicit start.
+                    return 503, {'state': 'idle', 'busy': True}
+                except OSError:
+                    self.state = 'error'
+                    return 503, {'state': 'error'}
+            self.session = session
+            self.state = 'starting'
+            try:
+                worker = threading.Thread(target=self.work, args=(session,), daemon=True)
+                session['worker'] = worker
+                worker.start()
+            except RuntimeError:
+                self.session = None
+                self.state = 'idle' if self.clear_pending(session) else 'error'
+                return 503, {'state': self.state}
+            return 202, {'state': 'starting', 'id': session['id']}
+
+    def clear_pending(self, s):
+        if not self.journal:
+            return True
+        try:
+            before, now = s['journal_identity'], self.journal.lstat()
+            if (before.st_dev, before.st_ino, before.st_uid, before.st_mode) != (now.st_dev, now.st_ino, now.st_uid, now.st_mode):
+                return False
+            if self.journal.read_text() != s['id']:
+                return False
+            self.journal.unlink()
+            fd = os.open(self.journal.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            return True
+        except (OSError, KeyError):
+            return False
+
+    def command(self, name, body):
+        if type(body) is not dict or set(body) != {'id'} or type(body['id']) is not str:
+            return 400, {}
+        with self.lock:
+            s = self.session
+            if not s or not hmac.compare_digest(body['id'], s['id']):
+                return 409, {}
+            if name == 'stop':
+                s['stop'].set()
+                self.state = 'stopping'
+                return 200, {'state': self.state}
+            if name == 'lease':
+                if s['claimed']:
+                    return 409, {}
+                s['lease'] = time.monotonic()
+                return 200, {'state': self.state}
+            if self.state == 'ready' and not s['claimed'] and not s['stop'].is_set():
+                s['claimed'] = True
+                return 200, {'state': 'ready', 'url': s['url']}
+            return (202 if self.state == 'starting' else 409), {'state': self.state}
+
+    def work(self, s):
+        proc = None
+        clean = False
+        failed_before_spawn = False
+        try:
+            spawn_fn = self.control_spawn.spawn if self.control_spawn is not None and 'id' not in s else self.spawn
+            proc = spawn_fn(['/usr/bin/python3', str(HERE / 'runtime/trial.py'), '--run', '--display-transport', self.display_transport],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+            with self.lock:
+                s['process'] = proc
+            messages = []
+            reader_done = threading.Event()
+            def read():
+                try:
+                    # Only the child's two scalar lifecycle records; never browser stdout.
+                    for _ in range(2):
+                        line = proc.stdout.readline(4097)
+                        if not line or len(line) > 4096:
+                            break
+                        value = json.loads(line)
+                        with self.lock:
+                            messages.append(value)
+                except Exception:
+                    pass
+                finally:
+                    reader_done.set()
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            start = time.monotonic()
+            ready = False
+            while proc.poll() is None:
+                now = time.monotonic()
+                with self.lock:
+                    if messages and not s['run']:
+                        msg = messages[0]
+                        s['run'] = validate_run(msg.get('run_path'))
+                        if msg.get('ready') is True:
+                            handoff = private_json(s['run'] / 'handoff.json', 2048)
+                            token = handoff.get('token')
+                            if type(token) is not str or not re.fullmatch('[a-f0-9]{48}', token):
+                                raise ValueError('HANDOFF')
+                            url = 'http://{{SPARK_IP}}:4177/' + token + '/viewer'
+                            if handoff.get('url') != url:
+                                raise ValueError('HANDOFF')
+                            proof = private_json(s['run'] / 'ready.json')
+                            if proof.get('ready') is not True:
+                                raise ValueError('NOT_READY')
+                            s['url'] = url
+                            ready = True
+                            if not s['stop'].is_set():
+                                self.state = 'ready'
+                        else:
+                            s['stop'].set()
+                    expired = not ready and now - start > 75
+                    lease_lost = not s['claimed'] and now - s['lease'] > 15
+                    if self.closed or s['stop'].is_set() or expired or lease_lost:
+                        self.state = 'stopping'
+                        break
+                time.sleep(0.1)
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=25)
+            except subprocess.TimeoutExpired:
+                # Do not fall back to guessing/terminating detached browser PIDs.
+                raise RuntimeError('OWNED_CLEANUP_TIMEOUT') from None
+            reader.join(timeout=1)
+            if not s['run'] and messages:
+                s['run'] = validate_run(messages[-1].get('run_path'))
+            if s['run']:
+                result = private_json(s['run'] / 'result.json')
+                privacy = result.get('privacy', {})
+                clean = (result.get('cleanup', {}).get('verified') is True and
+                         privacy.get('owned_profile_cache_config_removed') is True and
+                         all(result.get('audio_cleanup', {}).get(name) is True
+                             for name in ('ownedAbsent', 'defaultsUnchanged', 'privateDaemonsExited')))
+        except Exception:
+            failed_before_spawn = proc is None
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=25)
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            if self.control_spawn is not None and 'id' in s:
+                self.control_spawn.close(s['id'])
+            if proc is not None and proc.poll() is not None and proc.stdout:
+                proc.stdout.close()
+            with self.lock:
+                s['url'] = None
+                self.state = 'idle' if (clean or failed_before_spawn) and self.clear_pending(s) else 'error'
+                self.session = None
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            s = self.session
+            if s:
+                s['stop'].set()
+        if s and s['worker']:
+            s['worker'].join(timeout=55)
+
+
+def open_page():
+    script = (HERE / 'open.js').read_text()
+    digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+    csp = ("default-src 'none'; script-src 'sha256-" + digest + "'; style-src 'unsafe-inline'; "
+           "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'")
+    return ('<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+            '<meta name="referrer" content="no-referrer">'
+            '<meta http-equiv="Content-Security-Policy" content="' + csp + '">'
+            '<title>R2D2 · Private Chromium</title><style>html,body{margin:0;background:#000;color:#eee;'
+            'height:100%;font:32px sans-serif}main{padding:10vh 7vw}h1{font-size:70px}p{max-width:950px;'
+            'line-height:1.5;color:#bbb}</style><main><h1>Private Chromium</h1><p id="status">'
+            'Starting a private browser on Spark...</p><p>Press Home to return to R2D2.</p></main>'
+            '<script>' + script + '</script>').encode()
+
+
+def handler_for(manager, key):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+        def log_message(self, *_):
+            pass
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2)
+        def handle_expect_100(self):
+            self.reply(417)
+            return False
+        def voice_feed(self, since):
+            # Resident voice overrides this: a view dict, or False when the
+            # long-poll client left. None means no voice feed on this Spark.
+            return None
+        def reply(self, code, data=None, html=False, cors=False):
+            raw = data if html else json.dumps(data or {}, separators=(',', ':')).encode()
+            self.close_connection = True
+            self.send_response(code)
+            self.send_header('Content-Length', str(len(raw)))
+            self.send_header('Content-Type', 'text/html; charset=utf-8' if html else 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Connection', 'close')
+            if cors:
+                self.send_header('Access-Control-Allow-Origin', 'null')
+                self.send_header('Vary', 'Origin')
+            self.end_headers()
+            self.wfile.write(raw)
+        def do_GET(self):
+            r = route(self.client_address[0], 'GET', self.path, self.headers, key)
+            if r == 'status':
+                return self.reply(200, manager.status(), cors=self.headers.get('Origin') == 'null')
+            if r == 'weather' and manager.weather is not None:
+                return self.reply(200, manager.weather.snapshot(), cors=self.headers.get('Origin') == 'null')
+            if r == 'open':
+                return self.reply(200, open_page(), html=True)
+            if r == 'voice':
+                value = self.voice_feed(int(self.path.rsplit('/', 1)[1]))
+                if value is False:
+                    self.close_connection = True
+                    return
+                if value is not None:
+                    return self.reply(200, value, cors=self.headers.get('Origin') == 'null')
+            self.reply(404)
+        def do_POST(self):
+            r = route(self.client_address[0], 'POST', self.path, self.headers, key)
+            if not r:
+                return self.reply(404)
+            length = self.headers.get('Content-Length', '')
+            if not re.fullmatch('[0-9]{1,3}', length) or not 0 < int(length) <= 128:
+                return self.reply(413)
+            try:
+                raw = self.rfile.read(int(length))
+                if len(raw) != int(length):
+                    raise ValueError()
+                body = json.loads(raw)
+                if r == 'start':
+                    code, value = manager.start() if body == {} else (400, {})
+                else:
+                    code, value = manager.command(r, body)
+                self.reply(code, value)
+            except (ValueError, OSError):
+                self.reply(400)
+    return Handler
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 4
+    allow_reuse_address = True
+    def __init__(self, address, handler):
+        self.slots = threading.BoundedSemaphore(6)
+        super().__init__(address, handler)
+    def verify_request(self, request, address):
+        return address[0] == TV
+    def process_request(self, request, address):
+        if not self.slots.acquire(False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            self.slots.release()
+            raise
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self.slots.release()
+    def handle_error(self, *_):
+        pass
+
+
+def assemble_voice_owner(manager, key, config=None, *, launch=None, tv_power_reader=None,
+                         power_source=None, power_transport=None, power_read_fn=None,
+                         spawn=None, tls_factory=None, warm=True, timeout_s=120):
+    if config is None:
+        cfg = private_json(VOICE_CONFIG)
+    elif isinstance(config, (str, Path)):
+        cfg = private_json(Path(config))
+    elif type(config) is dict:
+        cfg = dict(config)
+    else:
+        raise ValueError('VOICE_CONFIG')
+    if type(cfg) is not dict:
+        raise ValueError('VOICE_CONFIG')
+    enabled = cfg.get('enabled', False)
+    if type(enabled) is not bool:
+        raise ValueError('VOICE_CONFIG')
+    if not enabled:
+        return None
+    if cfg.get('mode') == 'resident':
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        from voice_control.resident_entry import ResidentEntry
+        owner = ResidentEntry(manager, key, cfg, spark_ip=SPARK, tv_ip=TV,
+                              http_port=PORT, base_handler=handler_for(manager, key), spawn=spawn)
+        try:
+            if warm:
+                owner.warm()
+            return owner
+        except BaseException:
+            owner.close()
+            raise
+    # File settings do not prove a bounded, authenticated TV launch primitive.
+    # The ordinary entry point must refuse until one is explicitly supplied.
+    if not callable(launch):
+        raise ValueError('VOICE_TV_LAUNCH_UNCONFIGURED')
+    if str(HERE) not in sys.path:
+        sys.path.insert(0, str(HERE))
+    mod = sys.modules.get(__name__)
+    if mod is None or getattr(mod, 'Manager', None) is not Manager:
+        import types
+        mod = types.ModuleType('manager')
+        mod.__dict__.update(globals())
+    sys.modules['manager'] = mod
+    from voice_control.ingress import tls_context
+    from voice_control.pool import AuthenticatedTvPowerReader as TVPowerStateReader, ProductionWorkerFactory, WarmModelPool
+    from voice_control.shared_owner import SharedVoiceOwner
+    from voice_control.viewer_handoff import TVViewerHandoff
+    python_bin = cfg.get('python')
+    asr_path = cfg.get('asr_path') or cfg.get('asr_model')
+    intent_path = cfg.get('intent_path') or cfg.get('intent_model')
+    cert_sha = cfg.get('certificate_sha256')
+    raw_dev_key = cfg.get('device_key')
+    if raw_dev_key is None and isinstance(cfg.get('device_key_path'), (str, Path)):
+        fd = os.open(cfg['device_key_path'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 1000 or
+                    info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 65):
+                raise ValueError('VOICE_DEVICE_KEY')
+            with os.fdopen(fd) as stream:
+                fd = None
+                raw_dev_key = stream.read(66).strip()
+        finally:
+            if fd is not None:
+                os.close(fd)
+    if type(raw_dev_key) is bytes and len(raw_dev_key) == 32:
+        device_key = raw_dev_key
+    elif type(raw_dev_key) is str and re.fullmatch(r'[a-f0-9]{64}', raw_dev_key):
+        device_key = bytes.fromhex(raw_dev_key)
+    else:
+        raise ValueError('VOICE_DEVICE_KEY')
+    context = cfg.get('context')
+    if context is None:
+        builder = tls_factory if tls_factory is not None else tls_context
+        context = builder(cfg['certificate'], cfg['private_key'], cfg['client_ca'])
+    factory = ProductionWorkerFactory(
+        python_bin, asr_path, intent_path, qualified=enabled, spawn=spawn,
+        prompt_phase=cfg.get('prompt_phase'), verify_assets=cfg.get('verify_assets', False))
+    if tv_power_reader is None:
+        ssap_key = cfg.get('ssap_key_path') or cfg.get('tv_key_path')
+        ssap_pin = cfg.get('ssap_pin_path') or cfg.get('tv_pin_path')
+        if power_read_fn is not None or (power_transport is not None and ssap_key and ssap_pin):
+            tv_power_reader = TVPowerStateReader(
+                transport=power_transport, key_path=ssap_key, pin_path=ssap_pin,
+                read_fn=power_read_fn)
+    pool = WarmModelPool(factory)
+    viewer = TVViewerHandoff(SPARK, key, launch, qualified=enabled)
+    owner = SharedVoiceOwner(
+        manager, pool, viewer, key, cfg.get('address', SPARK), cfg.get('port', VOICE_PORT),
+        context, cert_sha, device_key, enabled=enabled,
+        agent_mode=cfg.get('agent_mode', False), power_source=power_source,
+        tv_power_reader=tv_power_reader)
+    if warm and enabled:
+        owner.warm(timeout_s=timeout_s)
+    return owner
+
+
+def main():
+    if os.getuid() != 1000 or os.geteuid() != 1000 or platform.node() != '{{SPARK_HOSTNAME}}':
+        raise SystemExit('FIXED_USER_REQUIRED')
+    os.umask(0o077)
+    fd = os.open(CONFIG, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as f:
+        s = os.fstat(f.fileno())
+        key = f.read(65)
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != 1000 or s.st_mode & 0o077 or not re.fullmatch('[a-f0-9]{64}', key):
+        raise SystemExit('PRIVATE_CONFIG_REQUIRED')
+    lock = os.open(CONFIG.parent / 'manager.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    weather = manager = voice = server = None
+    voice_thread = thread = None
+    http_started = voice_started = False
+    closed = threading.Event()
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Signals only latch cancellation; cleanup never takes locks in a handler.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *_: closed.set())
+        from weather import Weather
+        weather = Weather()
+        manager = Manager(journal=CONFIG.parent / 'session-pending', weather=weather)
+        if VOICE_CONFIG.is_file() and not VOICE_CONFIG.is_symlink():
+            # Retain the owner before warmup, including failed/pending cleanup.
+            voice = assemble_voice_owner(manager, key, warm=False)
+        if voice is not None and voice.enabled and not closed.is_set():
+            voice.warm()
+        if closed.is_set():
+            return
+        handler = voice.http_handler if voice is not None else handler_for(manager, key)
+        server = Server((SPARK, PORT), handler)
+        thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .2}, daemon=True)
+        thread.start()
+        http_started = True
+        if voice is not None and voice.enabled:
+            def serve_voice():
+                try:
+                    voice.serve()
+                finally:
+                    # serve() can refuse before entering its own cleanup block.
+                    # This is one finite owner, not an automatic restart loop.
+                    voice.close()
+            voice_thread = threading.Thread(target=serve_voice, daemon=True)
+            voice_thread.start()
+            voice_started = True
+        weather.start()
+        while not closed.wait(.5):
+            pass
+    finally:
+        # A failed close must not skip another owner's cleanup or retain the lock.
+        cleanup_failed = False
+        def finish(operation, *, confirmation=False):
+            nonlocal cleanup_failed
+            try:
+                result = operation()
+                if confirmation and result is not True:
+                    cleanup_failed = True
+            except BaseException:
+                cleanup_failed = True
+        if voice is not None:
+            finish(voice.close, confirmation=True)
+        if voice_started:
+            finish(lambda: voice_thread.join(5))
+            cleanup_failed = voice_thread.is_alive() or cleanup_failed
+        if http_started:
+            finish(server.shutdown)
+            finish(lambda: thread.join(5))
+            cleanup_failed = thread.is_alive() or cleanup_failed
+        if server is not None:
+            finish(server.server_close)
+        if manager is not None:
+            finish(manager.close)
+        if weather is not None:
+            finish(weather.close)
+        finish(lambda: os.close(lock))
+        if cleanup_failed and sys.exc_info()[0] is None:
+            raise RuntimeError('MANAGER_CLEANUP_INCOMPLETE')
+
+
+if __name__ == '__main__':
+    main()

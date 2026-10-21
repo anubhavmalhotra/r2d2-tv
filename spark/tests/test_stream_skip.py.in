@@ -1,0 +1,128 @@
+"""Server-side lag policy and stream socket tuning; generated fragments only.
+
+A consumer that falls behind jumps forward to the newest complete IDR group
+(one counted skip, bounded per generation) instead of drifting until it is
+evicted and closed. The receiver sees one gap in its buffered ranges. No
+encoder, browser or TV is involved; the socket test uses one loopback pair.
+"""
+from email.message import Message
+import socket
+import unittest
+
+import media_ring as m
+import media_stream as s
+import trial
+from test_media_ring import pair, ring
+
+EPOCH = 'a' * 32
+
+
+def filled(fragments=24, idr_every=4):
+    """About 0.27 s per fragment, an IDR group every `idr_every` fragments."""
+    r = ring()
+    audio = 0
+    for j in range(fragments):
+        count = 12 + j % 2
+        r.append(*pair(j + 1, j * 16000, audio, sync=j % idr_every == 0, ac=count))
+        audio += count * 1024
+    return r
+
+
+def stream(r):
+    ms = s.MediaStream(None, None, None, lambda: True, epoch=EPOCH, ring=r)
+    ms.generation, ms.active = 1, True
+    return ms
+
+
+class Skip(unittest.TestCase):
+    def setUp(self):
+        self.ring = filled()
+        self.ms = stream(self.ring)
+        self.groups = [g[0].index for g in self.ring.groups]
+
+    def test_skip_moves_only_forward_to_the_newest_group(self):
+        self.assertGreaterEqual(len(self.groups), 3)
+        first = m.Cursor(EPOCH, self.groups[0])
+        jumped = self.ms.skip_to_latest(1, first)
+        self.assertEqual(jumped.index, self.groups[-1])
+        self.assertTrue(self.ring.read(jumped)[0].access_point)
+        self.assertIsNone(self.ms.skip_to_latest(1, jumped))
+        self.assertIsNone(self.ms.skip_to_latest(1, m.Cursor(EPOCH, self.groups[-1] + 1)))
+        self.assertEqual(self.ms.snapshot()['skips'], 1)
+
+    def test_skip_refuses_another_or_closed_generation(self):
+        first = m.Cursor(EPOCH, self.groups[0])
+        with self.assertRaises(s.StreamError):
+            self.ms.skip_to_latest(2, first)
+        self.ms.active = False
+        with self.assertRaises(s.StreamError):
+            self.ms.skip_to_latest(1, first)
+
+    def test_skip_budget_is_per_generation(self):
+        first = m.Cursor(EPOCH, self.groups[0])
+        for _ in range(s.MAX_SKIPS_PER_GENERATION):
+            self.assertIsNotNone(self.ms.skip_to_latest(1, first))
+        self.assertIsNone(self.ms.skip_to_latest(1, first))
+        self.assertEqual(self.ms.snapshot()['skips'], s.MAX_SKIPS_PER_GENERATION)
+
+    def test_behind_measures_media_seconds_to_the_newest_fragment(self):
+        fragments = [f for g in self.ring.groups for f in g]
+        self.assertEqual(self.ms.behind(fragments[-1]), 0.0)
+        expected = float(fragments[-1].end - fragments[0].end)
+        self.assertAlmostEqual(self.ms.behind(fragments[0]), expected)
+        self.assertGreater(expected, trial.STREAM_MAX_BEHIND)
+
+    def test_newest_end_is_absent_for_an_empty_or_failed_ring(self):
+        self.assertIsNone(ring().newest_end())
+        r = filled(4)
+        self.assertEqual(r.newest_end(), r.groups[-1][-1].end)
+        r.failed = 'SYNTHETIC'
+        self.assertIsNone(r.newest_end())
+
+
+class Generations(unittest.TestCase):
+    def identity(self, generation):
+        h = Message()
+        h['X-R2D2-Media-Epoch'] = EPOCH
+        h['X-R2D2-Media-Generation'] = generation
+        return s.header_identity(h)
+
+    def test_automatic_reconnects_have_a_larger_finite_cap(self):
+        self.assertEqual(s.MAX_GENERATIONS, 32)
+        for generation in ('1', '9', '10', '29', '32'):
+            self.assertEqual(self.identity(generation), {'epoch': EPOCH, 'generation': int(generation)})
+        for generation in ('0', '33', '09', '100', '-1', '3 ', ''):
+            self.assertIsNone(self.identity(generation), generation)
+
+
+class Socket(unittest.TestCase):
+    def test_loopback_stream_socket_tuning(self):
+        server = socket.create_server(('127.0.0.1', 0))
+        self.addCleanup(server.close)
+        client = socket.create_connection(server.getsockname(), timeout=2)
+        self.addCleanup(client.close)
+        accepted, _ = server.accept()
+        self.addCleanup(accepted.close)
+        trial.tune_stream_socket(accepted)
+        self.assertEqual(accepted.gettimeout(), trial.STREAM_SOCKET_TIMEOUT)
+        self.assertNotEqual(accepted.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
+        self.assertEqual(accepted.getsockopt(socket.IPPROTO_IP, socket.IP_TOS) & 0xfc, 0x88)
+        if hasattr(socket, 'TCP_NOTSENT_LOWAT'):
+            self.assertEqual(accepted.getsockopt(socket.IPPROTO_TCP, socket.TCP_NOTSENT_LOWAT), 131072)
+
+    def test_tuning_is_best_effort(self):
+        class Refusing:
+            timeout = None
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def setsockopt(self, *option):
+                raise OSError('unsupported')
+        sock = Refusing()
+        trial.tune_stream_socket(sock)
+        self.assertEqual(sock.timeout, trial.STREAM_SOCKET_TIMEOUT)
+
+
+if __name__ == '__main__':
+    unittest.main()

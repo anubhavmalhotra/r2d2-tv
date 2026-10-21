@@ -1,0 +1,21 @@
+/* Closed compact measurement vectors preserve the existing 2048-byte metric cap.
+ * Window: elapsedMs,decoded,dropped,received,decodeUs,jitterUs,jitterEmitted.
+ * Presentation: callbacks,presentedDelta,firstMs,spanMs,minGapUs,maxGapUs,total,dropped.
+ * Presentation window: elapsedMs,callbacks,presentedDelta,startAgeMs,endAgeMs,
+ * gapCount,boundaryCount,minGapUs,maxGapUs,total,dropped.
+ * Layout: viewportWidth,viewportHeight,dpr,left,top,width,height,intrinsicWidth,height.
+ */
+(function(root){'use strict';
+var M=typeof module==='object'&&module.exports?require('./rtc_measurement'):root.R2D2VideoMeasurement;
+function scaled(v,n){return v===null?null:Math.round(v*n);}
+function win(v){return v===null?null:[v.elapsedMs,v.framesDecoded,v.framesDropped,v.framesReceived,scaled(v.totalDecodeTime,1000000),scaled(v.jitterBufferDelay,1000000),v.jitterBufferEmittedCount];}
+function pw(v){return v===null?null:[v.elapsedMs,v.callbacks,v.presentedFramesDelta,v.startObservationAgeMs,v.endObservationAgeMs,v.callbackGapCount,v.boundaryGapCount,scaled(v.minCallbackGapMs,1000),scaled(v.maxCallbackGapMs,1000),v.qualityTotalFramesDelta,v.qualityDroppedFramesDelta];}
+function pack(v,error){
+ if(error!==null&&error!=='RTC_STATS_UNCONFIRMED')throw Error('RTC_MEASUREMENT_SCOPE');
+ if(v===null)return{schema:1,error:error,samples:0,elapsedMs:0,dimensionsStable:null,layout:null,startup:null,steady:null,presentation:null,startupPresentation:null,steadyPresentation:null};
+ if(!M.valid(v))throw Error('RTC_MEASUREMENT_SCOPE');
+ var p=v.presentation,l=v.layout;
+ return{schema:1,error:error,samples:v.samples,elapsedMs:v.elapsedMs,dimensionsStable:v.dimensionsStable,layout:l===null?null:['viewportWidth','viewportHeight','devicePixelRatio','left','top','width','height','intrinsicWidth','intrinsicHeight'].map(function(k){return l[k];}),startup:win(v.startup),steady:win(v.steady),presentation:[p.callbacks,p.presentedFramesDelta,p.firstCallbackMs,p.callbackSpanMs,scaled(p.minCallbackGapMs,1000),scaled(p.maxCallbackGapMs,1000),p.qualityTotalFramesDelta,p.qualityDroppedFramesDelta],startupPresentation:pw(v.presentationWindows.startup),steadyPresentation:pw(v.presentationWindows.steady)};
+}
+var api={pack:pack};if(typeof module==='object'&&module.exports)module.exports=api;else root.R2D2MeasurementPack=api;
+})(typeof window==='object'?window:globalThis);

@@ -1,0 +1,95 @@
+"""AirPlay page-mode/CSP and disconnect framing with an owned local pipe child."""
+import base64
+import hashlib
+import io
+import subprocess
+import sys
+import time
+import types
+import unittest
+
+import airplay as ap
+import media_ring as mr
+from test_airplay import init_bytes_level
+from test_media_ring import pair
+
+
+class AirPlayPipelineTests(unittest.TestCase):
+    def test_fullscreen_script_keeps_exact_csp_and_origin_for_both_bindings(self):
+        for address, port in ((None, None), ('127.0.0.1', 49123)):
+            html = ap._build_airplay_viewer_html(
+                'a' * 48, codec='hvc1.1.6.L153.B0', bind_address=address, viewer_port=port
+            ).decode()
+            script = html.split('<script>', 1)[1].rsplit('</script>', 1)[0]
+            digest = base64.b64encode(hashlib.sha256(script.encode()).digest()).decode()
+            self.assertIn(f"script-src 'sha256-{digest}'", html)
+            self.assertIn('<body class="page-mode">', html)
+            self.assertIn('\n  pageFocus();\n', script)
+            self.assertNotIn('\n  toolbarFocus(address);\n', script)
+            origin = f'http://{address or ap.SPARK}:{port or ap.PORT}'
+            self.assertIn(f"location.origin!=='{origin}'", script)
+            script_policy = html.split('script-src ', 1)[1].split(';', 1)[0]
+            self.assertEqual(script_policy, f"'sha256-{digest}'")
+
+    def run_sender_exit(self, *, truncated=False):
+        data = b''.join(init_bytes_level(153)) + b''.join(pair())
+        if truncated:
+            data += b'\x00\x00\x00\x20'  # Half of the next box header, never clean EOF.
+        session = ap.AirPlayRelaySession('a' * 32)
+        children = []
+        events = []
+        session._tv_open_callback = lambda **kw: events.append('open')
+        session._tv_teardown_callback = lambda **kw: events.append('close')
+        def spawn(argv, **kwargs):
+            if argv == ['uxplay', '-v']:
+                return types.SimpleNamespace(stdout=io.BytesIO(b'UxPlay 1.73.7'), stderr=None, poll=lambda: 0)
+            if argv[0] == 'ffmpeg':
+                # Writes public synthetic fMP4, then holds stdout open just as
+                # the RTP receiver does after UxPlay has disconnected.
+                code = f'import sys,time;sys.stdin.buffer.read();sys.stdout.buffer.write({data!r});sys.stdout.buffer.flush();time.sleep(10)'
+                p = subprocess.Popen([sys.executable, '-B', '-c', code], **kwargs)
+                children.append(p)
+                return p
+            return types.SimpleNamespace(poll=lambda: 0 if session.ring.bootstrap_seen else None)
+        original_read = session._read_ffmpeg_stdout
+        def read(proc, count, *, timeout_s=None):
+            # Keep this portable framing control brief even on a broken path.
+            return original_read(proc, count, timeout_s=min(timeout_s or 0.3, 0.3))
+        session._read_ffmpeg_stdout = read
+        try:
+            started = time.monotonic()
+            if truncated:
+                with self.assertRaises(mr.MediaError):
+                    session.run_relay(spawn)
+                self.assertEqual(session.snapshot()['closeReason'], 'error')
+            else:
+                try:
+                    result = session.run_relay(spawn)
+                except Exception as exc:
+                    self.fail(f'complete sender exit was not closed cleanly: {type(exc).__name__}: {exc}')
+                self.assertEqual(result['closeReason'], 'sender-disconnected')
+                self.assertTrue(result['closed'])
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(events, ['open', 'close'])
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertTrue(children[0].stdout.closed)
+        finally:
+            session.close()
+            for p in children:
+                if p.poll() is None:
+                    p.kill()
+                p.wait(timeout=2)
+                for pipe in (p.stdin, p.stdout, p.stderr):
+                    if pipe is not None:
+                        pipe.close()
+
+    def test_sender_exit_at_complete_pair_closes_without_waiting_for_rtp_timeout(self):
+        self.run_sender_exit()
+
+    def test_sender_exit_mid_header_cannot_fabricate_clean_eof(self):
+        self.run_sender_exit(truncated=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

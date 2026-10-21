@@ -1,0 +1,727 @@
+import copy
+import email.message
+import http.client
+import io
+import json
+import os
+from pathlib import Path
+import signal
+import struct
+import tempfile
+import threading
+import unittest
+from unittest.mock import patch, Mock
+import protocol as p
+import process_owner as po
+import trial as t
+import private_profile as pp
+from test_voice_card import card
+
+TOKEN = 'a' * 48
+def headers(**values):
+    h = email.message.Message()
+    h['Host'] = '{{SPARK_IP}}:4177'
+    for k, v in values.items():
+        h[k.replace('_', '-')] = v
+    return h
+
+def metrics():
+    return dict(schema=1, token=TOKEN, final=False, state='receiving', error=None, failureStage=None, mediaErrorCode=None,
+        elapsedMs=1000, codec=p.CODEC, support={'hevc': True, 'h264': True},
+        videoWidth=3840, videoHeight=2160, readyState=4, totalFrames=30, droppedFrames=0,
+        frameCallbackAvailable=True, frameCallbacks=30, frameWidth=3840, frameHeight=2160,
+        receivedBytes=100000,currentTimeMs=900,bufferEndMs=1000,bufferAheadMs=100,
+        inputActionsSent=1,inputMovesSent=2,inputRejected=0,paused=False,seeking=False,
+        playRequests=1,playResolved=1,playRejected=0,playingEvents=1,waitingEvents=0,
+        seekingEvents=0,seekedEvents=0,playbackSamples=1,playableSamples=1,nonseekingProgressMs=900,
+        minAheadMs=820,cushionMs=800,stallEvents=0,gapSkips=0,liveJumps=0,autoReconnects=0)
+
+def box(kind, data=b'test'):
+    return struct.pack('>I4s', len(data) + 8, kind) + data
+
+class ProtocolTests(unittest.TestCase):
+    def test_routes_and_peer_boundaries(self):
+        for route in ['viewer', 'stream.mp4', 'metrics', 'input', 'fixture', 'fixture-metrics']:
+            peer = p.SPARK if route.startswith('fixture') else p.TV
+            method = 'GET' if route in ['viewer', 'stream.mp4', 'fixture'] else 'POST'
+            self.assertEqual(p.route_request(peer, method, '/' + TOKEN + '/' + route, headers(), TOKEN), route)
+            for wrong in ['127.0.0.1', '203.0.113.251', p.TV if peer == p.SPARK else p.SPARK]:
+                self.assertIsNone(p.route_request(wrong, method, '/' + TOKEN + '/' + route, headers(), TOKEN))
+            self.assertIsNone(p.route_request(peer, 'DELETE', '/' + TOKEN + '/' + route, headers(), TOKEN))
+
+    def test_token_path_and_host_canonical(self):
+        for path in ['/' + TOKEN + '/viewer?x=1', '/' + TOKEN + '/viewer/', '//'+TOKEN+'/viewer',
+                     '/'+'b'*48+'/viewer', '/%61'+TOKEN[1:]+'/viewer', '/'+TOKEN+'/../viewer']:
+            self.assertIsNone(p.route_request(p.TV, 'GET', path, headers(), TOKEN))
+        for host in ['spark:4177', '{{SPARK_IP}}', 'evil.test:4177', '{{SPARK_IP}}:4177,evil']:
+            h = headers(); h.replace_header('Host', host)
+            self.assertIsNone(p.route_request(p.TV, 'GET', '/'+TOKEN+'/viewer', h, TOKEN))
+
+    def test_duplicates_origin_and_framing(self):
+        for name in ['Host', 'Origin', 'Content-Type', 'Content-Length', 'Transfer-Encoding', 'Expect']:
+            h = headers(); h[name] = 'a'; h[name] = 'a'
+            self.assertIsNone(p.route_request(p.TV, 'POST', '/'+TOKEN+'/input', h, TOKEN))
+        for kwargs in [dict(Origin='https://evil.test'), dict(Transfer_Encoding='chunked'), dict(Expect='100-continue')]:
+            self.assertIsNone(p.route_request(p.TV, 'POST', '/'+TOKEN+'/input', headers(**kwargs), TOKEN))
+        self.assertIsNone(p.route_request(p.TV, 'GET', '/'+TOKEN+'/viewer', headers(Content_Length='1'), TOKEN))
+
+    def test_json_duplicates_nonfinite_and_bounds(self):
+        for raw in [b'{"x":1,"x":2}', b'{"support":{"hevc":true,"hevc":false}}', b'{"x":NaN}', b'{"x":Infinity}', b'x'*2049, b'']:
+            with self.assertRaises(ValueError): p.parse_json(raw)
+
+    def test_input_exact_shapes(self):
+        self.assertTrue(p.valid_input({'kind':'key','key':'Enter'}))
+        self.assertTrue(p.valid_input({'kind':'point','x':0,'y':1,'click':False}))
+        bad = [None, [], {'kind':'key','key':'Home'}, {'kind':'key','key':'Back'},
+            {'kind':'key','key':'Enter','extra':0}, {'kind':'point','x':True,'y':0,'click':False},
+            {'kind':'point','x':float('nan'),'y':0,'click':False},
+            {'kind':'point','x':0,'y':1.01,'click':False}, {'kind':'point','x':0,'y':1,'click':1}]
+        for body in bad: self.assertFalse(p.valid_input(body), repr(body))
+
+    def test_failure_diagnostics_are_fixed_enums_without_free_text(self):
+        body=metrics();body.update(final=True,error='STREAM_ERROR')
+        for stage in ('open','fetch','read','remove','append','video',None):
+            for code in (None,1,2,3,4):
+                body.update(failureStage=stage,mediaErrorCode=code)
+                self.assertTrue(p.valid_metrics(body,TOKEN),(stage,code))
+        for key,bad in [('failureStage','https://private.test/'),('failureStage',{}),('mediaErrorCode',True),('mediaErrorCode',0),('mediaErrorCode',5),('mediaErrorCode','3')]:
+            b=dict(body);b[key]=bad;self.assertFalse(p.valid_metrics(b,TOKEN))
+        b=metrics();b['failureStage']='read';self.assertFalse(p.valid_metrics(b,TOKEN))
+
+    def test_metrics_exact_schema_nested_support(self):
+        body=metrics(); self.assertTrue(p.valid_metrics(body,TOKEN))
+        for key in ['videoWidth','totalFrames','frameHeight','elapsedMs']:
+            b=metrics();b[key]=None;self.assertTrue(p.valid_metrics(b,TOKEN))
+        for key, value in [('token','b'*48),('schema',True),('receivedBytes',p.MAX_BYTES+1),('videoWidth',-1),('readyState',5),('elapsedMs',1800001),('error','secret'),('codec','avc1.640033'),('support',{'hevc':1,'h264':True}),('frameCallbacks',None)]:
+            b=metrics();b[key]=value;self.assertFalse(p.valid_metrics(b,TOKEN),(key,value))
+        b=metrics();b['secret']='no';self.assertFalse(p.valid_metrics(b,TOKEN))
+        b=metrics();del b['support'];self.assertFalse(p.valid_metrics(b,TOKEN))
+
+    def test_fixture_exact_dimensions_and_bounds(self):
+        b=dict(width=1920,height=1080,dpr=2,inputCount=0,keyCount=0,clickCount=0,moveCount=0,selection=0)
+        self.assertTrue(p.fixture_ready(b)); b['width']=3840;self.assertFalse(p.fixture_ready(b))
+        b['selection']=3;self.assertFalse(p.valid_fixture(b))
+        b['selection']=0;b['inputCount']=True;self.assertFalse(p.valid_fixture(b))
+
+    def test_rate_and_total_budget(self):
+        b=p.Budget(2,3)
+        self.assertTrue(b.take(0));self.assertTrue(b.take(.1));self.assertFalse(b.take(.9))
+        self.assertTrue(b.take(1));self.assertFalse(b.take(2))
+
+    def test_rate_is_atomic(self):
+        b=p.Budget(20,600);results=[]
+        threads=[threading.Thread(target=lambda:results.append(b.take(10))) for _ in range(60)]
+        for x in threads:x.start()
+        for x in threads:x.join()
+        self.assertEqual(sum(results),20)
+
+    def test_mp4_short_reads_and_box_boundaries(self):
+        raw=b''.join(box(k) for k in (b'ftyp',b'moov',b'free',b'moof',b'mdat',b'moof',b'mdat',b'mfra'))
+        f=io.BytesIO(raw);reader=p.MP4Reader(lambda n:f.read(min(n,3)))
+        out=[]
+        while True:
+            v=reader.next_box()
+            if v is None:break
+            out.append(v)
+        self.assertEqual(b''.join(out),raw);self.assertEqual(reader.fragments,2)
+
+    def test_mp4_rejects_order_truncation_limits(self):
+        for raw in [b'x',box(b'mdat'),box(b'ftyp')+box(b'moov'),
+                    box(b'ftyp')+box(b'moov')+box(b'moof'),
+                    struct.pack('>I4s',1,b'ftyp'),struct.pack('>I4s',p.MAX_BOX+1,b'ftyp'),
+                    box(b'ftyp')[:-1],box(b'ftyp')+box(b'xxxx')]:
+            r=p.MP4Reader(io.BytesIO(raw).read)
+            with self.assertRaises(ValueError):
+                while r.next_box() is not None:pass
+        r=p.MP4Reader(io.BytesIO(box(b'ftyp')).read);r.total=p.MAX_BYTES
+        with self.assertRaises(ValueError):r.next_box()
+
+class HTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.trial=t.Trial(Path('/unused'),TOKEN,Mock(),'mse')
+        parent=t.handler_for(self.trial)
+        class Handler(parent):
+            def setup(this):
+                super().setup();this.client_address=(p.TV,1234)
+        class Server(t.BoundedServer):
+            def verify_request(this,request,address):return address[0]=='127.0.0.1'
+        self.server=Server(('127.0.0.1',0),Handler)
+        self.thread=threading.Thread(target=self.server.serve_forever,kwargs={'poll_interval':.02})
+        self.thread.start()
+
+    def tearDown(self):
+        self.trial.stop.set();self.server.close_connections();self.server.shutdown();self.server.server_close();self.thread.join(2)
+
+    def request(self, route, body=None, extra=None):
+        conn=http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=2)
+        h={'Host':'{{SPARK_IP}}:4177'}
+        if body is not None:h['Content-Type']='application/json'
+        h.update(extra or {})
+        conn.request('POST' if body is not None else 'GET','/'+TOKEN+'/'+route,body=body,headers=h)
+        r=conn.getresponse();data=r.read();code=r.status;conn.close();return code,data
+
+    def test_default_trial_uses_webrtc_display_transport(self):
+        default_trial=t.Trial(Path('/unused'),TOKEN,Mock())
+        self.assertEqual(default_trial.display_transport,'webrtc')
+        self.assertIn(b'"transport":"webrtc"',default_trial.viewer)
+        self.assertIn(b'"codec":"VP9"',default_trial.viewer)
+
+    def test_real_http_metrics_project_token(self):
+        self.assertEqual(self.request('metrics',json.dumps(metrics()))[0],200)
+        self.assertNotIn('token',self.trial.metrics[0]);self.assertEqual(len(self.trial.metrics),1)
+
+    def test_real_http_bad_metric_and_body(self):
+        self.assertEqual(self.request('metrics','{"x":1}')[0],400)
+        self.assertEqual(self.request('metrics','x'*2049)[0],413)
+        self.assertEqual(self.request('metrics',json.dumps(metrics()),{'Origin':'https://evil.test'})[0],404)
+
+    def test_real_http_viewer_and_no_stream_before_proof(self):
+        status, html=self.request('viewer');self.assertEqual(status,200)
+        self.assertIn(b"script-src 'sha256-",html);self.assertNotIn(b'__TRIAL_TOKEN__',html)
+        self.assertEqual(self.request('stream.mp4')[0],409);self.assertFalse(self.trial.stream_started)
+        self.assertEqual(self.request('fixture')[0],404)
+
+    def test_real_http_finite_deadline(self):
+        self.trial.deadline=0
+        self.assertEqual(self.request('viewer')[0],404)
+
+    def test_real_http_input_does_not_block_behind_input_io_lock(self):
+        self.trial.input=Mock();self.trial.input.poll.return_value=None
+        self.trial.input_preflight={'qualified':True};self.trial.page_ready=True
+        self.trial.owner_verified_at=self.trial.ready_at=t.time.monotonic()
+        self.trial.media_stream=Mock();self.trial.media_stream.permits_input.return_value=True
+        held,release=threading.Event(),threading.Event()
+        def hold():
+            with self.trial.input_io_lock:
+                held.set();release.wait(2)
+        holder=threading.Thread(target=hold);holder.start();held.wait(1)
+        try:
+            code,data=self.request('input',json.dumps({'kind':'point','x':0.5,'y':0.5,'click':False,'layoutRevision':0}))
+            self.assertEqual((code,data),(200,b'{"ok":true}'))
+            self.assertEqual(self.trial.input_motion,{'kind':'point','x':0.5,'y':0.5,'click':False})
+        finally:
+            release.set();holder.join(2)
+
+    def delivered(self):
+        # The handler marks delivery just after its write returns.
+        deadline=t.time.monotonic()+1
+        while self.trial.voice_card.delivered is None and t.time.monotonic()<deadline:t.time.sleep(.005)
+        return self.trial.voice_card_exchange({'card':card()})
+
+    def test_real_http_metrics_reply_carries_voice_card_and_counts_delivery(self):
+        self.assertEqual(self.request('metrics',json.dumps(metrics())),(200,b'{"ok":true,"voice":null}'))
+        self.assertEqual(self.trial.voice_card_exchange({'card':card()}),{'delivered':None})
+        code,data=self.request('metrics',json.dumps(metrics()))
+        reply=json.loads(data);self.assertEqual((code,set(reply)),(200,{'ok','voice'}))
+        self.assertLessEqual(len(data),1024);self.assertGreaterEqual(reply['voice']['ageMs'],200)
+        self.assertEqual(dict(reply['voice'],ageMs=200),card())
+        self.assertEqual(self.delivered(),{'delivered':7})
+        self.assertEqual(self.trial.voice_card_exchange({'card':card()}),{'delivered':None})
+        # The echo reaches only the reply bytes, never the persisted metrics.
+        self.assertNotIn('lo-fi',json.dumps(self.trial.metrics))
+        for body in (None,{},{'card':card(),'extra':1},{'status':card()}):
+            self.assertIsNone(self.trial.voice_card_exchange(body))
+
+    def test_real_http_stale_or_refused_voice_card_is_null_and_not_delivered(self):
+        self.trial.voice_card_exchange({'card':card()});self.trial.voice_card.at-=3
+        self.assertEqual(self.request('metrics',json.dumps(metrics())),(200,b'{"ok":true,"voice":null}'))
+        self.trial.voice_card_exchange({'card':card(echo='a\u202eb')})
+        self.assertEqual(self.request('metrics',json.dumps(metrics())),(200,b'{"ok":true,"voice":null}'))
+        self.assertIsNone(self.trial.voice_card.delivered)
+
+    def test_real_http_close_takes_precedence_and_is_not_delivery(self):
+        self.trial.page_ready=True;self.assertTrue(self.trial.queue_end())
+        self.trial.voice_card_exchange({'card':card()})
+        code,data=self.request('metrics',json.dumps(metrics()))
+        reply=json.loads(data);self.assertEqual((code,reply['close'],reply['voice']['seq']),(200,True,7))
+        self.assertEqual(self.delivered(),{'delivered':None})
+
+    def test_real_http_final_metrics_clears_voice_card(self):
+        self.trial.voice_card_exchange({'card':card()})
+        body=metrics();body.update(final=True)
+        self.assertEqual(self.request('metrics',json.dumps(body)),(200,b'{"ok":true,"voice":null}'))
+        self.assertTrue(self.trial.stop.is_set());self.assertEqual(self.trial.close_reason,'viewer-ended')
+        self.assertEqual(self.trial.voice_card_exchange({'card':card()}),{'delivered':None})
+        self.assertIsNone(self.trial.voice_card.card)
+
+    def test_real_http_metrics_do_not_block_behind_input_io_lock(self):
+        # The main loop holds input_io_lock across CDP navigation, exactly when
+        # "Opening ..." must reach the viewer.
+        self.trial.voice_card_exchange({'card':card()})
+        held,release=threading.Event(),threading.Event()
+        def hold():
+            with self.trial.input_io_lock:
+                held.set();release.wait(2)
+        holder=threading.Thread(target=hold);holder.start();held.wait(1)
+        try:
+            started=t.time.monotonic();code,data=self.request('metrics',json.dumps(metrics()))
+            self.assertLess(t.time.monotonic()-started,1)
+            self.assertEqual((code,json.loads(data)['voice']['seq']),(200,7))
+            self.assertIsNotNone(self.trial.last_viewer_heartbeat)
+        finally:
+            release.set();holder.join(2)
+
+class RuntimeUnitTests(unittest.TestCase):
+    def test_pipe_deadline_stop_and_partial_handshake(self):
+        read,write=os.pipe();stop=threading.Event()
+        try:
+            os.write(write,b'123\n');self.assertEqual(t.line_read(read,__import__('time').monotonic()+1,stop),b'123')
+            stop.set()
+            with self.assertRaises(TimeoutError):t.pipe_read(read,1,__import__('time').monotonic()+1,stop)
+        finally:os.close(read);os.close(write)
+
+    def test_authority_record_preserves_preexisting_cookie(self):
+        cookie=b'1'*16
+        for display in [32767,42]:
+            raw=t.authority_record(display,cookie);self.assertEqual(struct.unpack('>H',raw[:2])[0],256)
+            fields=[];offset=2
+            while offset<len(raw):
+                n=struct.unpack('>H',raw[offset:offset+2])[0];offset+=2;fields.append(raw[offset:offset+n]);offset+=n
+            self.assertEqual(fields[1:], [str(display).encode(),b'MIT-MAGIC-COOKIE-1',cookie])
+
+    def test_input_nonblocking_queue_no_shell(self):
+        tr=t.Trial(Path('/unused'),TOKEN,Mock());tr.input=Mock();tr.input.poll.return_value=None;tr.input.stdin.fileno.return_value=9
+        body={'kind':'key','key':'Enter'}
+        self.assertFalse(tr.queue_input(body))
+        tr.input_preflight={'qualified':True};tr.page_ready=True;tr.owner_verified_at=tr.ready_at=t.time.monotonic()
+        with patch.object(os,'write') as write:
+            self.assertTrue(tr.queue_input(body));write.assert_not_called()
+        self.assertEqual(list(tr.input_actions),[body])
+        body['key']='Home';self.assertEqual(tr.input_actions[0]['key'],'Enter')
+
+    def owner(self):
+        o=po.ProcessOwner.__new__(po.ProcessOwner);o.root=100;o.handles={200:(55,2)};o.retired=[];o.process_refs={};o.lock=threading.RLock();o.disposed=False
+        return o
+
+    def test_parent_reuse_cannot_adopt_unrelated_child(self):
+        o=self.owner()
+        with patch.object(o,'_parent_live',side_effect=[True,False]),patch.object(po,'status',return_value={'ppid':200,'start':4}),patch.object(os,'pidfd_open',return_value=77,create=True),patch.object(os,'close') as close:
+            o._track(300,200)
+        self.assertNotIn(300,o.handles);close.assert_called_once_with(77)
+
+    def test_stale_parent_not_traversed(self):
+        o=self.owner()
+        with patch.object(o,'_parent_live',side_effect=lambda pid:pid==100),patch.object(po,'children',side_effect=lambda pid:{200} if pid==100 else self.fail('stale PID traversed')),patch.object(o,'_track'),patch.object(o,'live',return_value=True):
+            o.discover()
+
+    def test_cleanup_signal_uses_stable_pidfd_not_pid(self):
+        o=self.owner()
+        with patch.object(signal,'pidfd_send_signal',create=True) as send:
+            o.send(200,signal.SIGTERM);send.assert_called_once_with(55,signal.SIGTERM,None,0)
+            o.disposed=True;o.send(200,signal.SIGKILL);self.assertEqual(send.call_count,1)
+
+    def test_source_no_security_bypasses_or_broad_kills(self):
+        source=Path(t.__file__).read_text()+Path(po.__file__).read_text()
+        for forbidden in ['--no-sandbox','--disable-seccomp','--ignore-certificate-errors','--remote-debugging','killpg(', 'os.kill(', 'pkill', 'pgrep']:
+            self.assertNotIn(forbidden,source)
+        self.assertIn('pidfd_send_signal',source);self.assertIn('PR_SET_CHILD_SUBREAPER',source)
+
+    def test_renderer_role_nul_and_packed_proctitle(self):
+        self.assertEqual(po.classify_role(b'chrome\0--type=renderer\0--flag\0'),(True,'nul_renderer'))
+        self.assertEqual(po.classify_role(b'chrome --type=renderer --flag\0'),(True,'packed_renderer'))
+        for raw in [b'chrome --type=rendererX ',b'chrome --url=https://x/--type=renderer ',b'chrome --type=gpu-process',b'x'*65537]:
+            self.assertFalse(po.classify_role(raw)[0])
+
+    def test_private_fit_command_not_accepted_from_network(self):
+        for body in ({'kind':'fit-fixture'},{'kind':'focus-fixture'},
+                     {'kind':'layout-fixture','height':1800,'marker':'a'*16},
+                     {'kind':'layout-seen','marker':'a'*16}):
+            self.assertFalse(p.valid_input(body))
+        # Exercise the actual extracted OwnedDisplay method, not its old file
+        # placement. Network callers cannot choose/pin/resize an X window.
+        display=t.OwnedDisplay.__new__(t.OwnedDisplay);display.handle=1
+        display.x11=WindowMetadataTests.X({2:b'BaazPrivateTrial\0',3:b'BaazPrivateTrial\0'})
+        result=display.fit_fixture()
+        self.assertEqual(result['matched'],2);self.assertFalse(result['pinned'])
+        self.assertFalse(display.x11.moves)
+        with self.assertRaisesRegex(RuntimeError,'LAYOUT_REQUIRES_EXISTING_PIN'):
+            display.fit_fixture(height=1800,marker='a'*16)
+
+    def test_hidden_cmdline_keeps_identity_for_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);process=root/'200';process.mkdir()
+            (process/'stat').write_text('200 (chrome) '+' '.join(['S','100']+['0']*17+['123']))
+            (process/'status').write_text('Seccomp: 2\nNoNewPrivs: 1\nNSpid: 200 2\nUid: 1000 1000 1000 1000\n')
+            with patch.object(po,'Path',return_value=root),patch('builtins.open',side_effect=PermissionError(13,'denied')):
+                info=po.status(200)
+            self.assertEqual(info['start'],123);self.assertEqual(info['ppid'],100)
+            self.assertFalse(info['renderer']);self.assertEqual(info['errno'],13)
+            self.assertEqual(info['role_shape'],'cmdline_unreadable')
+
+    def test_packed_renderer_still_requires_every_kernel_gate(self):
+        good=dict(pid=200,start=2,ppid=100,state='S',renderer=True,role_shape='packed_renderer',read_error=None,errno=None,seccomp='2',no_new_privs='1',namespace_pid_depth=2,uid=['1000']*4,snap_apparmor_enforced=True)
+        o=self.owner()
+        with patch.object(o,'discover'),patch.object(o,'live',return_value=True),patch.object(po,'status',return_value=good):
+            self.assertTrue(o.sandbox()['passed'])
+        for key,value in [('seccomp','0'),('no_new_privs','0'),('namespace_pid_depth',1),('uid',['0']*4),('renderer',False),('snap_apparmor_enforced',False)]:
+            bad=dict(good);bad[key]=value
+            with patch.object(o,'discover'),patch.object(o,'live',return_value=True),patch.object(po,'status',return_value=bad):
+                self.assertFalse(o.sandbox()['passed'])
+
+class PrivacyTests(unittest.TestCase):
+    def test_tmpfs_most_specific_mount_required(self):
+        mounts='1 0 8:1 / / rw - ext4 /dev/disk rw\n2 1 0:2 / /run/user/1000 rw - tmpfs tmpfs rw,size=12g\n'
+        self.assertEqual(pp.mount_facts(pp.RUNTIME,mounts),{'fstype':'tmpfs','noswap':False})
+        mounts+='3 2 8:1 / /run/user/1000/snap.chromium rw - ext4 /dev/disk rw\n'
+        self.assertEqual(pp.mount_facts(pp.RUNTIME,mounts)['fstype'],'ext4')
+        with self.assertRaises(RuntimeError):pp.mount_facts(pp.RUNTIME,'')
+
+    def test_incognito_uses_confined_shell_then_stock_browser(self):
+        profile=pp.PrivateProfile.__new__(pp.PrivateProfile);profile.path=pp.RUNTIME/'baaz-private-0123456789abcdef'
+        args=profile.launch(['--kiosk','http://{{SPARK_IP}}:4177/test'])
+        self.assertEqual(args[:4],['/usr/bin/snap','run','--shell','chromium'])
+        self.assertIn('--noprofile',args);self.assertIn('--norc',args)
+        self.assertIn('exec "$SNAP/usr/lib/chromium-browser/chrome" --incognito',pp.BOOTSTRAP)
+        self.assertNotIn('chromium.launcher',pp.BOOTSTRAP)
+        self.assertNotIn('--no-sandbox',pp.BOOTSTRAP)
+        self.assertIn('--remote-debugging-pipe',pp.BOOTSTRAP)
+        self.assertNotIn('--remote-debugging-port',pp.BOOTSTRAP)
+
+    def test_crash_config_cache_temp_all_owned(self):
+        for key in ['CHROME_CONFIG_HOME','XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_DATA_HOME','TMPDIR']:
+            self.assertRegex(pp.BOOTSTRAP,'export '+key+'="\\$baaz_private/')
+        self.assertIn('export CHROME_LOG_FILE=/dev/null',pp.BOOTSTRAP)
+        self.assertIn('ulimit -c 0',pp.BOOTSTRAP)
+        self.assertIn('unset HISTFILE BASH_ENV ENV CHROMIUM_FLAGS',pp.BOOTSTRAP)
+        self.assertEqual(pp.fresh_preferences(Path("/owned"))["download"], {"default_directory":"/owned/downloads", "prompt_for_download":False})
+        self.assertEqual(pp.fresh_preferences(Path("/owned"))["savefile"], {"default_directory":"/owned/downloads"})
+
+    def test_fixed_shell_parses_without_execution(self):
+        import subprocess
+        result=subprocess.run(['/bin/bash','-n'],input=pp.BOOTSTRAP.encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_active_swap_not_claimed_ram_only(self):
+        profile=pp.PrivateProfile.__new__(pp.PrivateProfile);profile.mount={'fstype':'tmpfs','noswap':False};profile.swap_entries=1;profile.removed=False
+        self.assertFalse(profile.evidence()['disk_swap_exclusion_proved'])
+        self.assertFalse(profile.evidence()['owned_profile_cache_config_removed'])
+        profile.removed=True
+        self.assertTrue(profile.evidence()['owned_profile_cache_config_removed'])
+
+    def test_profile_not_removed_until_owned_children_gone(self):
+        profile=pp.PrivateProfile.__new__(pp.PrivateProfile);profile.basefd=123;profile.removed=False
+        with patch.object(pp.os,'close') as close,patch.object(pp.shutil,'rmtree') as remove:
+            self.assertFalse(profile.cleanup(False));remove.assert_not_called();close.assert_called_once_with(123)
+
+    def test_strict_doh_is_local_state_and_no_policy_override(self):
+        self.assertEqual(pp.DNS_LOCAL_STATE,{'dns_over_https':{'mode':'secure','templates':'https://dns.quad9.net/dns-query'}})
+        source=Path(pp.__file__).read_text()
+        self.assertIn("'profile/Local State'",source)
+        self.assertIn("raise RuntimeError('BROWSER_POLICY_REQUIRES_REVIEW')",source)
+
+    def test_owned_tree_deleted_without_following_child_symlink(self):
+        if not pp.shutil.rmtree.avoids_symlink_attacks:self.skipTest('fd-based deletion unavailable')
+        with tempfile.TemporaryDirectory() as tmp:
+            base=Path(tmp);owned=base/'baaz-private-0123456789abcdef';owned.mkdir()
+            outside=base/'preserved';outside.mkdir();(outside/'value').write_text('preserve')
+            (owned/'linked').symlink_to(outside,target_is_directory=True)
+            (owned/'profile').mkdir();(owned/'profile/History').write_text('synthetic')
+            profile=pp.PrivateProfile.__new__(pp.PrivateProfile);profile.name=owned.name;profile.path=owned;profile.basefd=os.open(base,os.O_RDONLY);profile.removed=False
+            actual_stat=os.stat
+            def owner_stat(path,*args,**kwargs):
+                s=actual_stat(path,*args,**kwargs)
+                if path==profile.name and kwargs.get('dir_fd')==profile.basefd:
+                    fields=list(s);fields[4]=1000;return os.stat_result(fields)
+                return s
+            profile.identity=owner_stat(profile.name,dir_fd=profile.basefd,follow_symlinks=False)
+            with patch.object(pp.os,'stat',side_effect=owner_stat):self.assertTrue(profile.cleanup(True))
+            self.assertFalse(owned.exists());self.assertEqual((outside/'value').read_text(),'preserve')
+
+class WindowMetadataTests(unittest.TestCase):
+    class Fn:
+        def __init__(self,fn):self.fn=fn
+        def __call__(self,*args):return self.fn(*args)
+
+    class X:
+        def __init__(self,classes):
+            import ctypes as c
+            self.c=c;self.classes=classes;self.refs=[];self.moves=[];self.size=(3839,2159)
+            self.properties={};self.map_state=2;self.queries=0
+            F=WindowMetadataTests.Fn
+            self.XDefaultRootWindow=F(lambda *_:1)
+            self.XInternAtom=F(lambda _,name,__ : 31 if name==b'STRING' else 67 if name==b'WM_CLASS' else 73)
+            self.XGetWindowProperty=F(self.property)
+            self.XQueryTree=F(self.tree);self.XFree=F(lambda *_:None)
+            self.XGetGeometry=F(self.geometry);self.XMoveResizeWindow=F(self.move);self.XSync=F(lambda *_:None)
+            self.focus=0
+            self.XRaiseWindow=F(lambda *_:None)
+            self.XSetInputFocus=F(self.set_focus);self.XGetInputFocus=F(self.get_focus)
+            self.XGetWindowAttributes=F(self.attributes);self.XChangeProperty=F(self.change)
+        def attributes(self,h,w,out):
+            out._obj.root=1;out._obj.map_state=self.map_state;out._obj.window_class=1;return 1
+        def change(self,h,w,atom,typ,fmt,mode,data,count):
+            self.properties[w,atom]=self.c.string_at(data,count);return 1
+        def set_focus(self,h,w,r,when):self.focus=w
+        def get_focus(self,h,out,revert):out._obj.value=self.focus;return 1
+        def property(self,h,w,atom,offset,length,delete,requested,actual,fmt,count,after,out):
+            raw=self.classes.get(w,b'') if atom==67 else self.properties.get((w,atom),b'')
+            buf=self.c.create_string_buffer(raw);self.refs.append(buf)
+            actual._obj.value=31;fmt._obj.value=8;count._obj.value=len(raw);after._obj.value=0
+            out._obj.value=self.c.addressof(buf);return 0
+        def tree(self,h,w,root,parent,out,n):
+            self.queries+=1
+            ids=list(self.classes) if w==1 else [];a=(self.c.c_ulong*len(ids))(*ids);self.refs.append(a)
+            self.c.cast(out,self.c.POINTER(self.c.POINTER(self.c.c_ulong)))[0]=a;n._obj.value=len(ids);return 1
+        def geometry(self,h,w,r,x,y,width,height,border,depth):
+            width._obj.value,height._obj.value=self.size;return 1
+        def move(self,h,w,x,y,width,height):
+            self.moves.append((w,x,y,width,height));self.size=(width,height)
+
+    def run_fit(self,classes):
+        d=t.OwnedDisplay.__new__(t.OwnedDisplay);d.handle=1;d.x11=self.X(classes)
+        return d,d.fit_fixture()
+
+    def test_unique_marked_window_resizes_without_reading_title(self):
+        d,r=self.run_fit({2:b'chromium\0BaazPrivateTrial\0'})
+        self.assertTrue(r['resized']);self.assertEqual(d.x11.moves,[(2,0,0,3840,2160)])
+        self.assertEqual(r['before']['width'],3839);self.assertEqual(r['after']['width'],3840)
+
+    def test_ambiguous_or_unrelated_class_not_resized(self):
+        for classes,n in [({2:b'chromium\0Chromium\0'},0),({2:b'BaazPrivateTrial\0',3:b'BaazPrivateTrial\0'},2),({2:b'BaazPrivateTrialOther\0'},0)]:
+            d,r=self.run_fit(classes);self.assertEqual(r['matched'],n);self.assertFalse(r['resized']);self.assertFalse(d.x11.moves)
+
+    def test_oversized_property_is_rejected(self):
+        d,r=self.run_fit({2:b'BaazPrivateTrial\0'+b'x'*256})
+        self.assertEqual(r['matched'],0);self.assertFalse(d.x11.moves)
+
+    def test_window_diagnostics_do_not_emit_raw_class_or_title(self):
+        _,r=self.run_fit({2:b'nonprivatevalue\0'})
+        raw=json.dumps(r);self.assertNotIn('nonprivatevalue',raw);self.assertNotIn('title',raw)
+
+    def test_effective_dns_required_and_pipe_closed_after_children(self):
+        source=Path(t.__file__).read_text()
+        self.assertIn("if not trial.effective_dns['qualified']:",source)
+        self.assertIn("raise RuntimeError('EFFECTIVE_DNS_NOT_PROVED')",source)
+        self.assertLess(source.index('cleanup = owner.cleanup()'),source.index('dns_proof.close()'))
+        self.assertLess(source.index('trial.window_fit.append('),source.index('trial.effective_dns = dns_proof.prove()'))
+
+    def test_focus_only_unique_owned_window_and_verified(self):
+        d=t.OwnedDisplay.__new__(t.OwnedDisplay);d.handle=1;d.x11=self.X({2:b'BaazPrivateTrial\0'})
+        self.assertFalse(d.fit_fixture(focus=True)['pinned'])
+        d.fit_fixture()
+        r=d.fit_fixture(focus=True);self.assertTrue(r['focused']);self.assertEqual(d.x11.focus,2)
+        d=t.OwnedDisplay.__new__(t.OwnedDisplay);d.handle=1;d.x11=self.X({2:b'BaazPrivateTrial\0',3:b'BaazPrivateTrial\0'})
+        r=d.fit_fixture(focus=True);self.assertNotIn('focused',r);self.assertEqual(d.x11.focus,0)
+
+    def test_pinned_fixture_survives_second_marked_window_without_reselection(self):
+        d,r=self.run_fit({2:b'BaazPrivateTrial\0'})
+        self.assertTrue(r['pinned']);self.assertEqual(len(d.fixture_nonce),16)
+        queries=d.x11.queries;d.x11.classes[3]=b'BaazPrivateTrial\0'
+        r=d.fit_fixture(focus=True)
+        self.assertTrue(r['focused']);self.assertEqual(d.x11.focus,2)
+        self.assertEqual(d.x11.queries,queries);self.assertEqual(r['selection'],'pinned')
+        self.assertNotIn(d.fixture_nonce.hex(),json.dumps(r))
+
+    def test_reused_or_unviewable_pin_has_no_fallback(self):
+        for change in ('lost_nonce','wrong_nonce','wrong_class','unviewable'):
+            d,_=self.run_fit({2:b'BaazPrivateTrial\0'});d.x11.classes[3]=b'BaazPrivateTrial\0'
+            if change=='lost_nonce':d.x11.properties.clear()
+            elif change=='wrong_nonce':d.x11.properties[2,73]=b'x'*16
+            elif change=='wrong_class':d.x11.classes[2]=b'Other\0'
+            else:d.x11.map_state=0
+            r=d.fit_fixture(focus=True)
+            self.assertFalse(r['pinned']);self.assertFalse(r['pin_valid']);self.assertEqual(d.x11.focus,0)
+
+    def test_already_exact_viewport_still_gets_initial_pin_before_dns(self):
+        d=t.OwnedDisplay.__new__(t.OwnedDisplay);d.handle=1;d.x11=self.X({2:b'BaazPrivateTrial\0'});d.x11.size=(3840,2160)
+        self.assertTrue(d.fit_fixture()['pinned'])
+        source=Path(t.__file__).read_text()
+        self.assertIn('(not trial.window_fit or',source)
+        self.assertIn("trial.window_fit[-1].get('pinned') is True",source)
+
+class InputProofTests(unittest.TestCase):
+    def trial(self):
+        tr=t.Trial(Path('/unused'),TOKEN,Mock());tr.input=Mock();tr.input.poll.return_value=None
+        tr.input_preflight={'qualified':True};tr.page_ready=True;tr.owner_verified_at=tr.ready_at=t.time.monotonic()
+        tr.fixture=dict(width=1920,height=1080,dpr=2,inputCount=0,keyCount=0,clickCount=0,moveCount=0,selection=0)
+        return tr
+
+    def test_motion_coalesces_without_consuming_actions(self):
+        tr=self.trial()
+        for i in range(90):self.assertTrue(tr.queue_input({'kind':'point','x':i/90,'y':0,'click':False}))
+        self.assertFalse(tr.queue_input({'kind':'point','x':1,'y':0,'click':False}))
+        self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertTrue(tr.queue_input({'kind':'point','x':0,'y':0,'click':True}))
+        self.assertEqual(tr.input_stats['movesCoalesced'],89);self.assertEqual(len(tr.input_actions),2)
+        self.assertIsNone(tr.input_motion);self.assertEqual(tr.input_stats['movesDiscardedForAction'],1)
+
+    def test_frame_paced_motion_and_scroll_allow_bunching_but_stay_bounded(self):
+        tr=self.trial();start=t.time.monotonic()
+        move={'kind':'point','x':.5,'y':.5,'click':False}
+        wheel={'kind':'wheel','x':.5,'y':.5,'deltaY':3}
+        with patch.object(t.time,'monotonic',return_value=start) as clock:
+            # 60/30 Hz, followed by a half-second burst arriving in this same
+            # sliding window. Simulate the existing serial pump consuming FIFO.
+            for i in range(60):
+                clock.return_value=start+i/60
+                self.assertTrue(tr.queue_input(move),i)
+                if i%2==0:
+                    self.assertTrue(tr.queue_input(wheel),i)
+                    tr.input_actions.popleft()
+            for _ in range(30):self.assertTrue(tr.queue_input(move))
+            for _ in range(15):
+                self.assertTrue(tr.queue_input(wheel));tr.input_actions.popleft()
+            self.assertFalse(tr.queue_input(move))
+            self.assertFalse(tr.queue_input(wheel))
+            # Motion/scroll exhaustion cannot consume the keyboard budget.
+            for _ in range(12):
+                self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}));tr.input_actions.popleft()
+            self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+            clock.return_value=start+1
+            self.assertTrue(tr.queue_input(move))
+            self.assertTrue(tr.queue_input(wheel))
+
+    def test_scroll_fifo_remains_bounded_at_the_higher_rate(self):
+        tr=self.trial()
+        # Different target coordinates cannot merge, but scroll still cannot
+        # occupy the explicit-action reserve or reorder earlier wheel events.
+        for i in range(7):self.assertTrue(tr.queue_input({'kind':'wheel','x':i/8,'y':.5,'deltaY':3}))
+        self.assertFalse(tr.queue_input({'kind':'wheel','x':1,'y':.5,'deltaY':3}))
+        click={'kind':'point','x':.5,'y':.5,'click':True}
+        self.assertTrue(tr.queue_input(click))
+        self.assertEqual(list(tr.input_actions),[{'kind':'wheel','x':i/8,'y':.5,'deltaY':3} for i in range(7)]+[click])
+
+    def test_slow_worker_scroll_backlog_coalesces_and_preserves_click(self):
+        tr=self.trial();entered=threading.Event();release=threading.Event();applied=threading.Event();seen=[]
+        wheel={'kind':'wheel','x':.5,'y':.5,'deltaY':3}
+        click={'kind':'point','x':.5,'y':.5,'click':True}
+        def apply(body, expected_epoch=None):
+            self.assertEqual(expected_epoch,tr.input_epoch)
+            seen.append(dict(body))
+            if len(seen)==1:
+                entered.set();self.assertTrue(release.wait(1),'test worker must be released')
+            if body==click:applied.set()
+            return 'wheel' if body['kind']=='wheel' else 'click'
+        self.assertTrue(tr.queue_input(wheel))
+        with patch.object(tr,'apply_input',side_effect=apply):
+            tr.start_input_pump()
+            try:
+                self.assertTrue(entered.wait(1))
+                for _ in range(30):self.assertTrue(tr.queue_input(wheel))
+                self.assertEqual(list(tr.input_actions),[dict(wheel,deltaY=90)])
+                self.assertTrue(tr.queue_input(click),'scroll cannot consume the click capacity')
+                release.set();self.assertTrue(applied.wait(1),'click must reach the same serial worker')
+            finally:
+                release.set();tr.stop.set();tr.input_thread.join(1)
+        self.assertFalse(tr.input_thread.is_alive())
+        self.assertEqual(seen,[wheel,dict(wheel,deltaY=90),click])
+
+    def test_scroll_coalescing_is_bounded_and_does_not_cross_explicit_actions(self):
+        tr=self.trial();wheel={'kind':'wheel','x':.5,'y':.5,'deltaY':800}
+        self.assertTrue(tr.queue_input(wheel));self.assertTrue(tr.queue_input(wheel))
+        self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertTrue(tr.queue_input(dict(wheel,deltaY=-800)));self.assertTrue(tr.queue_input(dict(wheel,deltaY=-800)))
+        self.assertEqual(list(tr.input_actions),[dict(wheel,deltaY=1200),{'kind':'key','key':'Enter'},dict(wheel,deltaY=-1200)])
+        self.assertTrue(all(p.valid_input(body) for body in tr.input_actions))
+        tr=self.trial();self.assertTrue(tr.queue_input(wheel));self.assertTrue(tr.queue_input(dict(wheel,deltaY=-800)))
+        self.assertFalse(tr.input_actions,'opposite unsent wheel deltas cancel without a zero native event')
+
+    def test_action_queue_bound_and_overall_limit(self):
+        tr=self.trial()
+        for _ in range(8):self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertTrue(tr.queue_input({'kind':'point','x':0,'y':0,'click':False}))
+        tr.inputs=10**9;self.assertFalse(tr.queue_input({'kind':'point','x':0,'y':0,'click':False}))
+
+    def test_helper_ack_must_match_event_kind(self):
+        tr=self.trial()
+        pin={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}}
+        with patch.object(tr,'worker_command',side_effect=[pin,{'applied':'move'}]):
+            with self.assertRaises(RuntimeError):tr.apply_input({'kind':'key','key':'Enter'})
+        with patch.object(tr,'worker_command',side_effect=[pin,{'applied':'key'}]):
+            self.assertEqual(tr.apply_input({'kind':'key','key':'Enter'}),'key')
+
+    def test_x_test_failure_is_not_acknowledged(self):
+        d=t.OwnedDisplay.__new__(t.OwnedDisplay);d.handle=1;d.lock=threading.Lock()
+        d.x11=Mock();d.xtst=Mock();d.x11.XKeysymToKeycode.return_value=9
+        d.xtst.XTestFakeKeyEvent.side_effect=[1,0]
+        with self.assertRaises(RuntimeError):d.send({'kind':'key','key':'Enter'})
+        self.assertEqual(d.xtst.XTestFakeKeyEvent.call_count,2)
+
+    def test_preflight_requires_actual_dom_key_and_click(self):
+        tr=self.trial();tr.input_preflight={'qualified':False}
+        def apply(body):
+            tr.fixture['keyCount' if body['kind']=='key' else 'clickCount']+=1
+            tr.fixture['inputCount']+=1
+        with patch.object(tr,'worker_command',return_value={'matched':1,'focused':True}),patch.object(tr,'apply_input',side_effect=apply):
+            tr.prove_input()
+        self.assertEqual(tr.input_preflight,{'qualified':True,'keyDelta':1,'clickDelta':1})
+        tr=self.trial();tr.input_preflight={'qualified':False};tr.deadline=t.time.monotonic()+.01
+        with patch.object(tr,'worker_command',return_value={'matched':1,'focused':True}),patch.object(tr,'apply_input',return_value='key'):
+            with self.assertRaisesRegex(RuntimeError,'PRIVATE_DOM_INPUT_NOT_PROVED'):tr.prove_input()
+        self.assertFalse(tr.input_preflight['qualified'])
+
+    def test_input_pump_actions_first_and_ack_counts(self):
+        tr=self.trial();tr.queue_input({'kind':'point','x':1,'y':1,'click':False});tr.queue_input({'kind':'key','key':'Enter'})
+        self.assertIsNone(tr.input_motion)
+        tr.queue_input({'kind':'point','x':0,'y':0,'click':False})
+        seen=[]
+        def apply(body, expected_epoch=None):
+            self.assertEqual(expected_epoch,tr.input_epoch)
+            seen.append(body['kind']);return 'key' if body['kind']=='key' else 'move'
+        with patch.object(tr,'apply_input',side_effect=apply):
+            tr.start_input_pump()
+            end=t.time.monotonic()+1
+            while len(seen)<2 and t.time.monotonic()<end:t.time.sleep(.01)
+            tr.stop.set();tr.input_thread.join(1)
+        self.assertEqual(seen,['key','point']);self.assertEqual(tr.input_stats['keyApplied'],1);self.assertEqual(tr.input_stats['moveApplied'],1)
+
+    def test_black_fixture_hidden_captured_cursor_and_metrics_bounds(self):
+        self.assertIn('background:#000',t.FIXTURE);self.assertNotIn('#080d18',t.FIXTURE)
+        self.assertNotIn('repeating-linear-gradient',t.FIXTURE)
+        tr=self.trial();tr.display=':1';tr.env={}
+        tr.audio=Mock(server='unix:/owned/private-pulse',monitor='owned.monitor');tr.audio_graph=Mock(spec=['assert_alive']);tr.audio_preflight={'passed':True}
+        with patch.object(tr,'spawn') as spawn:tr.encode()
+        args=spawn.call_args[0][0];self.assertEqual(args[args.index('-draw_mouse')+1],'0')
+        for key,value in [('inputActionsSent',2401),('inputMovesSent',6001),('inputRejected',30001),('bufferAheadMs',1800001),('currentTimeMs',True)]:
+            b=metrics();b[key]=value;self.assertFalse(p.valid_metrics(b,TOKEN))
+        b=metrics();b['bufferAheadMs']=None;self.assertTrue(p.valid_metrics(b,TOKEN))
+
+    def test_jitter_buffer_counters_exact_types_and_bounds(self):
+        bounds={'minAheadMs':1800000,'cushionMs':10000,'stallEvents':100000,'gapSkips':100000,
+            'liveJumps':100000,'autoReconnects':100000}
+        for key,maximum in bounds.items():
+            for value in (0,maximum):
+                b=metrics();b[key]=value;self.assertTrue(p.valid_metrics(b,TOKEN),(key,value))
+            for value in (-1,maximum+1,True,1.0,'1'):
+                b=metrics();b[key]=value;self.assertFalse(p.valid_metrics(b,TOKEN),(key,value))
+            b=metrics();del b[key];self.assertFalse(p.valid_metrics(b,TOKEN))
+        # minAheadMs is null when no unpaused buffered sample was taken this second.
+        b=metrics();b['minAheadMs']=None;self.assertTrue(p.valid_metrics(b,TOKEN))
+        for key in ('cushionMs','stallEvents','gapSkips','liveJumps','autoReconnects'):
+            b=metrics();b[key]=None;self.assertFalse(p.valid_metrics(b,TOKEN),key)
+
+    def test_playback_diagnostic_metrics_exact_types_bounds_and_body_budget(self):
+        bounds={'playRequests':1000,'playResolved':1000,'playRejected':1000,
+            'playingEvents':10000,'waitingEvents':10000,'seekingEvents':10000,'seekedEvents':10000,
+            'playbackSamples':1801,'playableSamples':1801,'nonseekingProgressMs':1800000}
+        self.assertTrue(p.valid_metrics(metrics(),TOKEN))
+        for key,maximum in bounds.items():
+            for value in (0,maximum):
+                b=metrics();b[key]=value;self.assertTrue(p.valid_metrics(b,TOKEN),(key,value))
+            for value in (-1,maximum+1,True,False,None,1.0,'1'):
+                b=metrics();b[key]=value;self.assertFalse(p.valid_metrics(b,TOKEN),(key,value))
+            b=metrics();del b[key];self.assertFalse(p.valid_metrics(b,TOKEN))
+        for key in ('paused','seeking'):
+            for value in (True,False):
+                b=metrics();b[key]=value;self.assertTrue(p.valid_metrics(b,TOKEN))
+            for value in (0,1,None,'false'):
+                b=metrics();b[key]=value;self.assertFalse(p.valid_metrics(b,TOKEN))
+            b=metrics();del b[key];self.assertFalse(p.valid_metrics(b,TOKEN))
+        b=metrics();b.update(bounds);b.update(totalFrames=10**9,droppedFrames=10**9,
+            frameCallbacks=10**9,receivedBytes=p.MAX_BYTES,elapsedMs=180000,currentTimeMs=180000,
+            bufferEndMs=180000,bufferAheadMs=180000,videoWidth=8192,videoHeight=8192,
+            frameWidth=8192,frameHeight=8192,inputActionsSent=160,inputMovesSent=400,inputRejected=2000,
+            minAheadMs=1800000,cushionMs=10000,stallEvents=100000,gapSkips=100000,liveJumps=100000,autoReconnects=100000)
+        raw=json.dumps(b,separators=(',',':')).encode()
+        self.assertLessEqual(len(raw),2048);self.assertEqual(p.parse_json(raw),b)
+        self.assertTrue(p.valid_metrics(b,TOKEN));b['unexpectedPlaybackData']='private'
+        self.assertFalse(p.valid_metrics(b,TOKEN))
+
+    def test_input_thread_start_failure_leaves_no_unstarted_join(self):
+        tr=self.trial()
+        with patch.object(threading.Thread,'start',side_effect=RuntimeError('synthetic')):
+            with self.assertRaisesRegex(RuntimeError,'PRIVATE_INPUT_THREAD_START'):tr.start_input_pump()
+        self.assertIsNone(tr.input_thread)
+
+if __name__=='__main__':unittest.main(verbosity=2)

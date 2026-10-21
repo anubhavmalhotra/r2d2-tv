@@ -1,0 +1,432 @@
+"""RAM-only direct native-IME bridge for the owned incognito Chromium target.
+
+Only the focused ordinary input/textarea is exposed to the fixed TV peer. No
+field values, selections, request bodies or capability IDs enter diagnostics.
+"""
+import contextlib
+import hashlib
+import json
+import math
+import os
+import re
+import secrets
+import select
+import time
+from protocol import Budget
+from layout_runtime import busy as layout_busy
+from session_page import TabSession, ProofError, _id
+
+MAX_EDITS = 8192
+OPAQUE = re.compile(r'[a-f0-9]{16}\Z')
+KINDS = ('text', 'search', 'email', 'url', 'tel')
+
+
+def empty(state='none', kind=None):
+    return dict(state=state, kind=kind, multiline=False if kind == 'password' else None,
+                focusId=None, fieldId=None, value=None, selectionStart=None,
+                selectionEnd=None, selectionDirection=None, rect=None, maxLength=None)
+
+
+def text_valid(value):
+    if type(value) is not str or len(value) > 1024:
+        return False
+    try:
+        return len(value.encode('utf-8')) <= 4096 and all(ord(c) >= 32 or c in '\n\t' for c in value) and '\x7f' not in value
+    except UnicodeEncodeError:
+        return False
+
+
+def selection_valid(value, start, end, direction):
+    if start is None or end is None or direction is None:
+        return start is end is direction is None
+    size = len(value.encode('utf-16-le')) // 2
+    if not (type(start) is int and type(end) is int and 0 <= start <= end <= size and direction in ('forward', 'backward', 'none')):
+        return False
+    # Do not split a surrogate pair when restoring the native selection.
+    encoded = value.encode('utf-16-le')
+    return all(pos == 0 or pos == size or not (0xD800 <= int.from_bytes(encoded[2*(pos-1):2*pos], 'little') <= 0xDBFF and
+        0xDC00 <= int.from_bytes(encoded[2*pos:2*(pos+1)], 'little') <= 0xDFFF) for pos in (start, end))
+
+
+def valid_edit(body):
+    return (type(body) is dict and set(body) == {'action', 'id', 'seq', 'focusId', 'fieldId', 'value', 'selectionStart', 'selectionEnd', 'selectionDirection'} and
+            body['action'] in ('replace', 'replace-enter') and
+            all(type(body[k]) is str and OPAQUE.fullmatch(body[k]) for k in ('id', 'focusId', 'fieldId')) and
+            type(body['seq']) is int and 1 <= body['seq'] <= MAX_EDITS and text_valid(body['value']) and
+            selection_valid(body['value'], body['selectionStart'], body['selectionEnd'], body['selectionDirection']))
+
+
+def valid_snapshot(v):
+    if type(v) is not dict or set(v) != set(empty()):
+        return False
+    if v['state'] != 'editable':
+        return v in (empty(), empty('unavailable'), empty('unavailable', 'password'))
+    r = v['rect']
+    return (v['kind'] in KINDS and type(v['multiline']) is bool and type(v['maxLength']) is int and 0 <= v['maxLength'] <= 2048 and
+            all(type(v[k]) is str and OPAQUE.fullmatch(v[k]) for k in ('focusId', 'fieldId')) and text_valid(v['value']) and
+            selection_valid(v['value'], v['selectionStart'], v['selectionEnd'], v['selectionDirection']) and
+            type(r) is dict and set(r) == {'x', 'y', 'width', 'height'} and
+            all(type(n) in (int, float) and math.isfinite(n) and 0 <= n <= 1 for n in r.values()) and
+            r['width'] > 0 and r['height'] > 0 and r['x'] + r['width'] <= 1.000001 and r['y'] + r['height'] <= 1.000001)
+
+
+# Intentionally excludes iframe/contenteditable/number: their geometry or value
+# semantics need separate qualification. Never read a password value.
+LOCATE = r"""function locate(){let e=document.activeElement,n=0;
+if(!document.hasFocus())return {e:null};
+while(e&&e.shadowRoot&&e.shadowRoot.activeElement&&n++<16)e=e.shadowRoot.activeElement;
+if(!e||!e.isConnected||n>=16)return {e:null};
+if(e.tagName==='IFRAME'||e.tagName==='FRAME'||e.isContentEditable)return {e:null,unavailable:true};
+let kind=e.tagName==='TEXTAREA'?'text':e.tagName==='INPUT'?e.type:null;
+if(kind==='password')return {e:null,password:true};
+if(!['text','search','email','url','tel'].includes(kind)||e.disabled||e.readOnly)return {e:null};
+return {e:e,kind:kind,multiline:e.tagName==='TEXTAREA'};}
+function same(b,r){return !!(b&&r.e&&b.e===r.e&&b.doc===document&&r.e.ownerDocument===document&&b.kind===r.kind&&b.multiline===r.multiline)}
+"""
+
+
+def probe_expression(field, focus, fresh=False):
+    return '(()=>{' + LOCATE + 'const none=' + json.dumps(empty()) + r""";
+const r=locate();if(!r.e){globalThis.__r2d2Direct=null;if(r.password){none.state='unavailable';none.kind='password';none.multiline=false}else if(r.unavailable)none.state='unavailable';return none}
+let b=globalThis.__r2d2Direct;
+if(!same(b,r)){b={e:r.e,doc:document,kind:r.kind,multiline:r.multiline,fieldId:FIELD,focusId:FOCUS,used:false};globalThis.__r2d2Direct=b}
+if(FRESH||b.used||!b.focusId){b.focusId=FOCUS;b.used=false}
+const value=r.e.value;
+if(typeof value!=='string'||Array.from(value).length>1024||new TextEncoder().encode(value).length>4096||/[\u0000-\u0008\u000b-\u001f\u007f\ud800-\udfff]/u.test(value)){globalThis.__r2d2Direct=null;none.state='unavailable';return none}
+const a=r.e.getBoundingClientRect(),w=innerWidth,h=innerHeight;
+const x=Math.max(0,a.left),y=Math.max(0,a.top),right=Math.min(w,a.right),bottom=Math.min(h,a.bottom);
+if(!(w>0&&h>0&&right>x&&bottom>y)){globalThis.__r2d2Direct=null;none.state='unavailable';return none}
+return {state:'editable',kind:r.kind,multiline:r.multiline,maxLength:Number.isInteger(r.e.maxLength)&&r.e.maxLength>=0?Math.min(2048,r.e.maxLength):2048,focusId:b.focusId,fieldId:b.fieldId,value:value,
+selectionStart:r.e.selectionStart,selectionEnd:r.e.selectionEnd,selectionDirection:r.e.selectionDirection,
+rect:{x:x/w,y:y/h,width:(right-x)/w,height:(bottom-y)/h}};
+})()""".replace('FIELD', json.dumps(field)).replace('FOCUS', json.dumps(focus)).replace('FRESH', json.dumps(bool(fresh)))
+
+
+def edit_expression(binding, body):
+    # All validation, cancelable event, revalidation and the write run in one JS
+    # task in an isolated world. There is no focus/select/write scheduling gap.
+    return '(()=>{' + LOCATE + 'const c=' + json.dumps(body, ensure_ascii=True) + r""",b=globalThis.__r2d2Direct;
+function valid(){const r=locate();return same(b,r)&&b.fieldId===c.fieldId&&b.focusId===c.focusId}
+if(!valid()||b.used)return 'rejected';b.used=true;
+if(!b.multiline&&/[\n\t]/.test(c.value))return 'rejected';
+if(Number.isInteger(b.e.maxLength)&&b.e.maxLength>=0&&c.value.length>b.e.maxLength)return 'rejected';
+const e=b.e,changed=e.value!==c.value;
+if(changed){
+const event=new InputEvent('beforeinput',{bubbles:true,composed:true,cancelable:true,inputType:'insertReplacementText',data:c.value});
+if(!e.dispatchEvent(event)||!valid())return 'rejected';
+if(Number.isInteger(e.maxLength)&&e.maxLength>=0&&c.value.length>e.maxLength)return 'rejected';
+const proto=b.multiline?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+const setter=Object.getOwnPropertyDescriptor(proto,'value').set;
+setter.call(e,c.value);
+if(c.selectionStart!==null)e.setSelectionRange(c.selectionStart,c.selectionEnd,c.selectionDirection);
+e.dispatchEvent(new InputEvent('input',{bubbles:true,composed:true,inputType:'insertReplacementText',data:c.value}));
+}else if(c.selectionStart!==null){e.setSelectionRange(c.selectionStart,c.selectionEnd,c.selectionDirection)}
+if(c.action==='replace-enter'){
+if(!valid())return 'unknown';
+e.dispatchEvent(new Event('change',{bubbles:true}));
+if(!valid())return 'unknown';
+return 'enter';}
+return 'applied';})()"""
+
+
+class DirectSession(TabSession):
+    def _send(self, value):
+        # DNS verification retains its 4KiB request limit; only the transferred
+        # private-session owner admits bounded Unicode editor expressions.
+        raw = json.dumps(value, separators=(',', ':'), allow_nan=False).encode() + b'\0'
+        if len(raw) > 32768:
+            raise ProofError('CDP_REQUEST_SIZE')
+        while raw:
+            if not select.select([], [self.write_fd], [], self._remaining())[1]:
+                raise ProofError('CDP_TIMEOUT')
+            try:
+                n = os.write(self.write_fd, raw)
+            except BlockingIOError:
+                continue
+            if n <= 0:
+                raise ProofError('CDP_PIPE_CLOSED')
+            raw = raw[n:]
+
+    def start(self):
+        super().start()
+        self.direct_editor = None
+        self.direct_probes = self.direct_edits = 0
+
+    def invalidate_editor(self):
+        super().invalidate_editor()
+        self.direct_editor = None
+
+    def direct_probe(self, force=False):
+        if self.direct_probes >= 16000:
+            self.direct_editor = None
+            return empty('unavailable')
+        self.direct_probes += 1
+        self.assert_alive()
+        self.deadline = time.monotonic() + 3
+        tree = self._call('Page.getFrameTree', {}, True).get('frameTree')
+        frame = tree.get('frame') if type(tree) is dict else None
+        if type(frame) is not dict or not _id(frame.get('id')) or frame.get('parentId'):
+            raise ProofError('DIRECT_ROOT_FRAME')
+        world = self._call('Page.createIsolatedWorld', {'frameId': frame['id'], 'worldName': 'r2d2-direct-editor', 'grantUniveralAccess': False}, True).get('executionContextId')
+        if type(world) is not int or world <= 0:
+            raise ProofError('DIRECT_WORLD')
+        old = self.direct_editor
+        fresh = force or old is not None and (old['target'], old['session'], old['world']) != (self.target, self.session, world)
+        reply = self._call('Runtime.evaluate', {'expression': probe_expression(secrets.token_hex(8), secrets.token_hex(8), fresh), 'contextId': world, 'returnByValue': True, 'timeout': 1500}, True)
+        value = reply.get('result', {}).get('value')
+        if 'exceptionDetails' in reply or not valid_snapshot(value):
+            self.direct_editor = None
+            raise ProofError('DIRECT_PROJECTION')
+        self.direct_editor = dict(target=self.target, session=self.session, world=world, focusId=value['focusId'], fieldId=value['fieldId']) if value['state'] == 'editable' else None
+        return value
+
+    def direct_apply(self, body):
+        binding, self.direct_editor = self.direct_editor, None
+        if (not valid_edit(body) or self.direct_edits >= MAX_EDITS or not binding or
+            (body['focusId'], body['fieldId'], self.target, self.session) != (binding['focusId'], binding['fieldId'], binding['target'], binding['session'])):
+            return 'rejected'
+        self.direct_edits += 1
+        try:
+            self.assert_alive()
+            self.deadline = time.monotonic() + 3
+            result = self._call('Runtime.evaluate', {'expression': edit_expression(binding, body), 'contextId': binding['world'], 'returnByValue': True, 'timeout': 1500}, True)
+            status = result.get('result', {}).get('value')
+            if 'exceptionDetails' in result or status not in ('rejected', 'unknown', 'applied', 'enter'):
+                return 'unknown'
+            if status != 'enter':
+                return status
+            # The same owned target is still selected. Both native key replies
+            # count as delivered even if submission removes the field/navigates.
+            down = dict(type='keyDown', key='Enter', code='Enter', windowsVirtualKeyCode=13, nativeVirtualKeyCode=13, text='\r', unmodifiedText='\r')
+            try:
+                self._call('Input.dispatchKeyEvent', down, True)
+            finally:
+                self._call('Input.dispatchKeyEvent', dict(type='keyUp', key='Enter', code='Enter', windowsVirtualKeyCode=13, nativeVirtualKeyCode=13), True)
+            return 'applied'
+        except ProofError:
+            return 'unknown'
+
+    def presentation(self, exit_fullscreen=False):
+        self.assert_alive()
+        self.deadline = time.monotonic() + 3
+        expression = '(async()=>{if(document.fullscreenElement)await document.exitFullscreen();return !!document.fullscreenElement})()' if exit_fullscreen else '!!document.fullscreenElement'
+        reply = self._call('Runtime.evaluate', dict(expression=expression, returnByValue=True, awaitPromise=True, timeout=1500), True)
+        value = reply.get('result', {}).get('value')
+        if 'exceptionDetails' in reply or type(value) is not bool:
+            raise ProofError('PRESENTATION_PROJECTION')
+        return value
+
+    def direct_preflight(self):
+        """Only synthetic fields on our own fixed start page; export booleans."""
+        flags = dict(qualified=False, replacement=False, caret=False, clear=False,
+                     password=False, canceled=False, submit=False, cleared=False)
+        local = 'location.href===' + json.dumps(self.start_url)
+        self.deadline = time.monotonic() + 3
+        if self._evaluate(local) is not True:
+            raise ProofError('DIRECT_PREFLIGHT_ORIGIN')
+        create = '(()=>{if(!(' + local + r"""))return false;
+document.getElementById('r2d2-direct-proof')?.remove();const h=document.createElement('form');h.id='r2d2-direct-proof';
+h.style.cssText='position:fixed;left:20px;top:20px;width:300px;height:90px;z-index:99999';
+const e=document.createElement('input'),b=document.createElement('button');b.type='submit';h.append(e,b);document.body.append(h);
+h.addEventListener('submit',event=>{event.preventDefault();h.dataset.submits=String(Number(h.dataset.submits||0)+1);h.dataset.exact=String(e.value==='R2 submit');e.remove();b.focus()});e.focus();return true})()"""
+        query = "document.querySelector('#r2d2-direct-proof input')"
+        def check(expression):
+            self.deadline = time.monotonic() + 3
+            if self._evaluate(expression) is not True:
+                raise ProofError('DIRECT_PREFLIGHT_READBACK')
+        def replace(value, selection, action='replace'):
+            focus = self.direct_probe(force=True)
+            if focus['state'] != 'editable':
+                raise ProofError('DIRECT_PREFLIGHT_FOCUS')
+            return self.direct_apply(dict(action=action, id=secrets.token_hex(8), seq=1,
+                fieldId=focus['fieldId'], focusId=focus['focusId'], value=value,
+                selectionStart=selection, selectionEnd=selection, selectionDirection='none'))
+        try:
+            check(create)
+            if replace('a😀水b', 4) != 'applied':
+                raise ProofError('DIRECT_PREFLIGHT_REPLACE')
+            check(query + '.value===' + json.dumps('a😀水b'))
+            flags['replacement'] = True
+            check(query + '.selectionStart===4&&' + query + '.selectionEnd===4')
+            flags['caret'] = True
+            if replace('', 0) != 'applied':
+                raise ProofError('DIRECT_PREFLIGHT_CLEAR')
+            check(query + '.value===""')
+            flags['clear'] = True
+            check('(()=>{' + query + '.type="password";return true})()')
+            if self.direct_probe(force=True) != empty('unavailable', 'password'):
+                raise ProofError('DIRECT_PREFLIGHT_PASSWORD')
+            flags['password'] = True
+            check('(()=>{const e=' + query + ';e.type="text";e.focus();e.addEventListener("beforeinput",event=>event.preventDefault(),{once:true});return true})()')
+            if replace('do not write', 0) != 'rejected':
+                raise ProofError('DIRECT_PREFLIGHT_CANCEL')
+            check(query + '.value===""')
+            flags['canceled'] = True
+            if replace('R2 submit', 9, 'replace-enter') != 'applied':
+                raise ProofError('DIRECT_PREFLIGHT_ENTER')
+            check('(()=>{const h=document.getElementById("r2d2-direct-proof");return h.dataset.submits==="1"&&h.dataset.exact==="true"&&!h.querySelector("input")})()')
+            flags['submit'] = True
+        finally:
+            self.direct_editor = None
+            self.deadline = time.monotonic() + 3
+            flags['cleared'] = self._evaluate('(()=>{if(!(' + local + '))return false;document.getElementById("r2d2-direct-proof")?.remove();return document.getElementById("r2d2-direct-proof")===null})()') is True
+        flags['qualified'] = all(v for k, v in flags.items() if k != 'qualified')
+        if not flags['qualified']:
+            raise ProofError('DIRECT_PREFLIGHT_FAILED')
+        return flags
+
+    def fullscreen_preflight(self):
+        local = 'location.href===' + json.dumps(self.start_url)
+        self.deadline = time.monotonic()+3
+        expression = '(async()=>{if(!('+local+'))return false;const e=document.createElement("div");e.id="r2d2-fullscreen-proof";document.body.append(e);await e.requestFullscreen();return document.fullscreenElement===e})()'
+        flags = dict(qualified=False, entered=False, exited=False, cleared=False)
+        try:
+            reply = self._call('Runtime.evaluate',dict(expression=expression,userGesture=True,awaitPromise=True,returnByValue=True,timeout=1500),True)
+            if 'exceptionDetails' in reply or reply.get('result',{}).get('value') is not True or self.presentation() is not True:
+                raise ProofError('FULLSCREEN_ENTER_NOT_OBSERVED')
+            flags['entered'] = True
+            if self.presentation(True) is not False or self.presentation() is not False:
+                raise ProofError('FULLSCREEN_EXIT_NOT_OBSERVED')
+            flags['exited'] = True
+        finally:
+            self.deadline = time.monotonic()+2
+            flags['cleared'] = self._evaluate('(()=>{if(!('+local+'))return false;document.getElementById("r2d2-fullscreen-proof")?.remove();return !document.getElementById("r2d2-fullscreen-proof")})()') is True
+        flags['qualified'] = all(flags[k] for k in ('entered','exited','cleared'))
+        return flags
+
+    def close(self):
+        self.direct_editor = None
+        super().close()
+
+
+def init_direct(trial):
+    trial.focus_revision = getattr(trial, 'focus_revision', 0)
+    trial.direct_probe_token = object()
+    trial.direct_state = empty('pending')
+    trial.direct_revision = 0
+    trial.direct_next_seq = 1
+    trial.direct_records = {}  # seq -> digest/id/status only; never values
+    trial.direct_ids = set()
+    trial.direct_result = None
+    trial.direct_pending = None
+    trial.direct_active = False
+    trial.direct_probe_requested = True
+    trial.direct_probe_at = 0
+    trial.direct_budget = Budget(6, MAX_EDITS)
+    trial.direct_get_budget = Budget(8, 16000)
+    trial.presentation_get_budget = Budget(4, 8000)
+    trial.presentation_budget = Budget(2, 256)
+    trial.presentation_pending = False
+    trial.presentation_state = dict(fullscreen=False, revision=0)
+    trial.presentation_at = 0
+
+
+def invalidate_direct(trial):
+    trial.focus_revision = getattr(trial, 'focus_revision', 0) + 1
+    trial.direct_probe_token = object()
+    trial.direct_state = empty('pending')
+    trial.direct_probe_requested = True
+
+
+def direct_snapshot(trial):
+    with trial.lock:
+        if not trial.page_ready or trial.stop.is_set() or not trial.capture_allowed():
+            state = empty('unavailable')
+        else:
+            if time.monotonic() - trial.direct_probe_at >= .35 and not trial.direct_pending and not trial.direct_active:
+                trial.direct_probe_requested = True
+            state = dict(trial.direct_state)
+        state.update(revision=trial.direct_revision, nextSeq=trial.direct_next_seq, edit=dict(trial.direct_result) if trial.direct_result else None)
+        return state
+
+
+def queue_direct(trial, body):
+    if not valid_edit(body):
+        return False
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+    with trial.input_wake:
+        record = trial.direct_records.get(body['seq'])
+        if record:
+            # No mutation is replayed, including when the caller lost its ACK.
+            return record['digest'] == digest and record['id'] == body['id'] and record['status'] in ('pending', 'applied')
+        state = trial.direct_state
+        if (not trial.page_ready or trial.stop.is_set() or not trial.capture_allowed() or trial.navigation_pending or trial.navigation_active or
+            trial.editor_pending or trial.editor_active or layout_busy(trial) or trial.direct_pending or trial.direct_active or body['seq'] != trial.direct_next_seq or
+            body['id'] in trial.direct_ids or state.get('state') != 'editable' or state['kind'] not in KINDS or
+            state['fieldId'] != body['fieldId'] or state['focusId'] != body['focusId'] or
+            (not state['multiline'] and any(c in body['value'] for c in '\n\t')) or not trial.direct_budget.take()):
+            return False
+        trial.direct_records[body['seq']] = dict(digest=digest, id=body['id'], status='pending')
+        trial.direct_ids.add(body['id'])
+        trial.direct_next_seq += 1
+        trial.direct_pending = dict(body)
+        trial.direct_result = dict(id=body['id'], seq=body['seq'], status='pending')
+        trial.input_epoch += 1
+        trial.input_stats['rejected'] += len(trial.input_actions) + (trial.input_motion is not None)
+        trial.input_actions.clear()
+        trial.input_motion = None
+        trial.direct_state = empty('pending')
+        trial.input_wake.notify_all()
+        return True
+
+
+def queue_presentation(trial, body):
+    if body != {'action': 'exit-fullscreen'}:
+        return False
+    with trial.lock:
+        if not trial.page_ready or trial.stop.is_set() or not trial.capture_allowed() or layout_busy(trial) or not trial.presentation_budget.take():
+            return False
+        trial.presentation_pending = True
+        return True
+
+
+def service_direct(trial, page, prove):
+    body = None
+    with trial.lock:
+        if not trial.page_ready or trial.stop.is_set() or trial.navigation_pending is not None or trial.navigation_active or trial.editor_active or layout_busy(trial):
+            return
+        if trial.direct_pending:
+            body, trial.direct_pending = trial.direct_pending, None
+            trial.direct_active = True
+        probe = trial.direct_probe_requested and (body is not None or (not trial.input_actions and trial.input_motion is None))
+        probe_rev = getattr(trial, 'focus_revision', 0)
+        probe_token = getattr(trial, 'direct_probe_token', None)
+        presentation = trial.presentation_pending or time.monotonic() - trial.presentation_at >= .5
+        exit_fullscreen, trial.presentation_pending = trial.presentation_pending, False
+        if not body and not presentation and not probe:
+            return
+    with (trial.input_io_lock if body or probe or exit_fullscreen else contextlib.nullcontext()):
+        try:
+            if body:
+                prove()
+                status = page.direct_apply(body)
+                prove()
+                with trial.lock:
+                    if body['seq'] in trial.direct_records:
+                        trial.direct_records[body['seq']]['status'] = status
+                        trial.direct_result = dict(id=body['id'], seq=body['seq'], status=status)
+            if body or probe:
+                try:
+                    value = page.direct_probe(force=body is not None)
+                except ProofError:
+                    value = empty('unavailable')
+                with trial.lock:
+                    if (body is not None or (getattr(trial, 'direct_probe_token', None) is probe_token and getattr(trial, 'focus_revision', 0) == probe_rev)) and trial.page_ready and not trial.stop.is_set():
+                        if value != trial.direct_state:
+                            trial.direct_revision += 1
+                        trial.direct_state = value
+                        trial.direct_probe_at = time.monotonic()
+                        trial.direct_probe_requested = False
+            if presentation:
+                try:
+                    full = page.presentation(exit_fullscreen)
+                except ProofError:
+                    full = None  # A failed query is not evidence of an exit.
+                with trial.lock:
+                    if full is not None and full != trial.presentation_state['fullscreen']:
+                        trial.presentation_state = dict(fullscreen=full, revision=trial.presentation_state['revision'] + 1)
+                    trial.presentation_at = time.monotonic()
+        finally:
+            body = None
+            with trial.lock:
+                trial.direct_active = False

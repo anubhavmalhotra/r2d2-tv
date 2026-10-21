@@ -1,0 +1,196 @@
+"""Finite pre-encoded public 4K60 VP9/Opus receiver proof. Imports are inert.
+
+No encoder while streaming and no browser, desktop, microphone or device capture.
+Existing authenticated negotiation/LAN-only ICE/owned cleanup remain authoritative.
+"""
+import threading,time
+from .sender import Sender,SignalServer
+from .signal_protocol import need
+from .vp9_public import PublicClip4K
+from .vp9_rtp import DescriptorProof
+from .rtp_pacing import PacketPacer,make_element,native_selftest
+from .au_recovery import make_gate
+
+def load_gst():
+    import gi
+    gi.require_version('Gst','1.0');gi.require_version('GstWebRTC','1.0');gi.require_version('GstSdp','1.0')
+    from gi.repository import Gst,GstWebRTC,GstSdp,GLib
+    Gst.init(None)
+    for name in ('appsrc','queue','capsfilter','rtpvp9pay','webrtcbin','opusenc','rtpopuspay','nicesrc','nicesink','fakesink'):
+        need(Gst.ElementFactory.find(name),'MISSING_GST_FACTORY')
+    return Gst,GstWebRTC,GstSdp,GLib
+
+VIDEO_CAPS='application/x-rtp,media=video,encoding-name=VP9,clock-rate=90000,payload=96,profile-id=(string)0,rtcp-fb-nack-pli=(boolean)true'
+AUDIO_CAPS='application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,encoding-params=(string)2,payload=111'
+
+class MediaStop:
+    """Existing global stop plus the one-shot transport end, bounded waits."""
+    def __init__(self,global_stop,media_end):self.global_stop=global_stop;self.media_end=media_end
+    def is_set(self):return self.global_stop.is_set()or self.media_end.is_set()
+    def wait(self,seconds):
+        if self.is_set():return True
+        self.media_end.wait(min(seconds,.005));return self.is_set()
+
+class PublicMedia(Sender):
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.signal_lifetime_seconds=60;self.media_ended=threading.Event();self.codec_preferences_verified=False;self.zero_media_offer=False;self.connected_seen=False
+        self.preconnection_push_attempts=0;self.video_started_connected=False;self.audio_started_connected=False;self.first_video_keyframe=False
+    def _set_codec_preferences(self):
+        need(len(self.rtp_pads)==2,'MEDIA_GATE_CODECS')
+        for pad,text in zip(self.rtp_pads,(VIDEO_CAPS,AUDIO_CAPS)):
+            trans=pad.get_property('transceiver');need(trans is not None and trans.find_property('codec-preferences')is not None,'MEDIA_GATE_CODECS')
+            caps=self.Gst.Caps.from_string(text);need(caps is not None and caps.is_fixed(),'MEDIA_GATE_CODECS')
+            trans.set_property('codec-preferences',caps);seen=trans.get_property('codec-preferences')
+            need(seen is not None and seen.is_equal(caps)and trans.get_property('direction')==self.WebRTC.WebRTCRTPTransceiverDirection.SENDONLY,'MEDIA_GATE_CODECS')
+        self.codec_preferences_verified=True
+    def _maybe_offer(self):
+        with self.lock:
+            if self.negotiating or self.stop.is_set():return
+            need(self.codec_preferences_verified and self.video_count==self.audio_count==0,'MEDIA_GATE_CODECS')
+            # Codec preferences, not a sacrificial access unit, supply the exact
+            # offer contract. No source buffer is allowed before connected.
+            self.zero_media_offer=True;self.negotiating=True;self.GLib.idle_add(self._create_offer)
+    def _connection(self,peer,spec):
+        with self.lock:
+            super()._connection(peer,spec)
+            if self.connection_ready:self.connected_seen=True
+            elif self.connected_seen:self.media_ended.set() # stop feeds; keep the signed-result channel's existing grace period
+    def _wait_connected(self):
+        while not self.stop.is_set()and not self.media_ended.is_set():
+            need(self.guard()is True,'OWNER_GUARD')
+            if self.answer_taken and self.connection_ready:return True
+            self.stop.wait(.005)
+        return False
+    def _push(self,element,stamp,data,duration,keyframe=False):
+        if self.stop.is_set()or self.media_ended.is_set():return False
+        if not(self.answer_taken and self.connection_ready):
+            if self.connected_seen:return False
+            self.preconnection_push_attempts+=1;need(False,'MEDIA_GATE_NOT_CONNECTED')
+        super()._push(element,stamp,data,duration,keyframe)
+        if element is self.video:
+            if not self.video_started_connected:self.first_video_keyframe=keyframe is True
+            self.video_started_connected=True
+        else:self.audio_started_connected=True
+        return True
+    def push_video(self,stamp,data,keyframe):
+        if not self._push(self.video,stamp,data,self.Gst.SECOND//60,keyframe):return False
+        self.video_count+=1;self._maybe_offer();return True
+    def _admit_source(self):
+        need(self.codec=='VP9'and type(self.source)is PublicClip4K and self.source.frames is not None,'VP9_4K_REQUIRED')
+    def _setup(self):
+        self._admit_source()
+        self.Gst,self.WebRTC,self.Sdp,self.GLib=load_gst();Gst=self.Gst
+        self.pacer_selftest=native_selftest(Gst)
+        self.pipeline=Gst.Pipeline.new('owned-public-4k60-vp9')
+        self.webrtc=self._element('webrtcbin','peer',bundle_policy=self.WebRTC.WebRTCBundlePolicy.MAX_BUNDLE,latency=0)
+        self._configure_ice()
+        self.video=self._element('appsrc','video',is_live=True,format=Gst.Format.TIME,block=True,max_buffers=8,max_bytes=16777216,
+            caps=Gst.Caps.from_string('video/x-vp9,width=3840,height=2160,framerate=60/1,profile=(string)0'))
+        queue=self._element('queue','vqueue',max_size_buffers=8,max_size_bytes=16777216,max_size_time=0)
+        pay=self._element('rtpvp9pay','vpay',pt=96,picture_id_mode=2)
+        self.rtp_proof=DescriptorProof();self.rtp_proof.confirm_mode(int(pay.get_property('picture-id-mode')))
+        pay.get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER|Gst.PadProbeType.BUFFER_LIST,self._rtp_descriptor)
+        recovery=getattr(self,'au_recovery',None)
+        self.packet_pacer=PacketPacer(MediaStop(self.stop,self.media_ended),self.guard,recover_age=recovery is not None)
+        paced=make_element(Gst,self.packet_pacer,self.fail,timestamp_origin=lambda b:self.zero+int(b.pts),au_recovery=recovery);self.pipeline.add(paced);need(paced.get_parent()==self.pipeline,'RTP_PACER_CALLBACK')
+        caps=self._element('capsfilter','vcaps',caps=Gst.Caps.from_string(VIDEO_CAPS))
+        if recovery is None:middle_link=queue.link(pay)
+        else:
+            gate=make_gate(Gst,recovery,lambda b:self.zero+int(b.pts),self.fail)
+            self.pipeline.add(gate);need(gate.get_parent()==self.pipeline,'AU_RECOVERY_PROTOCOL')
+            middle_link=queue.link(gate)and gate.link(pay)
+        need(self.video.link(queue)and middle_link and pay.link(paced)and paced.link(caps),'VIDEO_LINK');self._link_rtp(caps)
+        pay.get_static_pad('src').add_probe(Gst.PadProbeType.EVENT_UPSTREAM,self._feedback)
+        self._build_audio()
+        self._set_codec_preferences()
+        self.webrtc.connect('notify::ice-gathering-state',self._gathered);self.webrtc.connect('notify::connection-state',self._connection)
+        bus=self.pipeline.get_bus();bus.add_signal_watch();bus.connect('message',self._bus)
+        self.loop=self.GLib.MainLoop();self.pipeline.set_state(Gst.State.PLAYING)
+        state,current,pending=self.pipeline.get_state(2*Gst.SECOND)
+        if hasattr(self,"_record_pipeline_state"):self._record_pipeline_state(state,current,pending)
+        need(state!=Gst.StateChangeReturn.FAILURE and current==Gst.State.PLAYING,'PIPELINE_START')
+        self.zero=time.monotonic_ns()-(self.pipeline.get_clock().get_time()-self.pipeline.get_base_time())
+    def _build_audio(self):
+        self.audio=self._element('appsrc','audio',is_live=True,format=Gst.Format.TIME,block=True,max_buffers=2,max_bytes=7680,
+            caps=Gst.Caps.from_string('audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2'))
+        aq=self._element('queue','aqueue',max_size_buffers=2,max_size_bytes=7680,max_size_time=0,leaky=2)
+        opus=self._element('opusenc','opus',bitrate=128000,frame_size=20,audio_type=2049);apay=self._element('rtpopuspay','apay',pt=111)
+        need(self.audio.link(aq)and aq.link(opus)and opus.link(apay),'AUDIO_LINK');self._link_rtp(apay)
+    def _rtp_descriptor(self,pad,info):
+        try:
+            buffer=info.get_buffer()if info.type&self.Gst.PadProbeType.BUFFER else None
+            if buffer is not None:buffers=(buffer,)
+            else:
+                group=info.get_buffer_list();need(group is not None and 1<=group.length()<=2048,'VP9_RTP_BOUND')
+                buffers=(group.get(i)for i in range(group.length()))
+            for item in buffers:
+                need(item is not None,'VP9_RTP_DESCRIPTOR');size=item.get_size()
+                self.rtp_proof.packet(bytes(item.extract_dup(0,min(size,256))),size)
+            return self.Gst.PadProbeReturn.OK
+        except BaseException:
+            self.fail('VP9_RTP_DESCRIPTOR');return self.Gst.PadProbeReturn.DROP
+    def counters(self):
+        result=super().counters();proof=getattr(self,'rtp_proof',None);result['vp9Rtp']=proof.snapshot()if proof is not None else None
+        pacer=getattr(self,'packet_pacer',None);result['rtpPacing']=pacer.snapshot()if pacer is not None else None;result['rtpPacerSelftest']=getattr(self,'pacer_selftest',False)
+        result['mediaGate']={'codecPreferencesVerified':self.codec_preferences_verified,'zeroMediaOffer':self.zero_media_offer,'connectedObserved':self.connected_seen,'preconnectionPushAttempts':self.preconnection_push_attempts,'videoStartedConnected':self.video_started_connected,'audioStartedConnected':self.audio_started_connected,'firstVideoKeyframe':self.first_video_keyframe,'mediaEndedAfterConnection':self.media_ended.is_set()};return result
+    def _feedback(self,pad,info):
+        event=info.get_event();value=event.get_structure()if event else None
+        if value and value.get_name()=='GstForceKeyUnit':
+            with self.lock:self.pli_count+=1;self.pending_keyframe_request=True
+        return self.Gst.PadProbeReturn.OK
+    def _video_feed(self):
+        frames=self.source.frames;index=0;sent=0
+        if not self._wait_connected():return
+        need(frames[0][1]is True,'MEDIA_GATE_INITIAL_KEYFRAME');due=time.monotonic_ns()
+        while not self.stop.is_set():
+            need(self.guard()is True,'OWNER_GUARD')
+            if not self.connection_ready or self.media_ended.is_set():return
+            with self.lock:
+                fresh=self.pending_keyframe_request and self.connection_ready
+                if fresh:self.pending_keyframe_request=False
+            if fresh:
+                while not frames[index][1]:index=(index+1)%len(frames)
+            left=due-time.monotonic_ns()
+            if left>0:
+                if self.stop.wait(left/1e9):return
+            else:
+                # Admit at most 500ms of scheduling lateness. This can send
+                # overdue frames in a bounded catch-up burst; it is not a
+                # zero-jitter claim. Beyond that bound refuse rather than
+                # discard arbitrary predictive frames or rebase the timeline.
+                need(left>=-500_000_000,'VP9_PACING_STALE')
+            data,key=frames[index]
+            if not self.push_video(due,data,key):return
+            sent+=1;index=(index+1)%len(frames);due+=1_000_000_000//60
+            need(sent<=2700,'VP9_MEDIA_FRAME_BOUND')
+    def _audio_feed(self):
+        sent=0
+        if not self._wait_connected():return
+        due=time.monotonic_ns()
+        while not self.stop.is_set():
+            need(self.guard()is True,'OWNER_GUARD')
+            if not self.connection_ready or self.media_ended.is_set():return
+            left=due-time.monotonic_ns()
+            if left>0:
+                if self.stop.wait(left/1e9):return
+            else:need(left>=-500_000_000,'VP9_PACING_STALE')
+            if not self._push(self.audio,due,b'\0'*3840,self.Gst.SECOND//50):return
+            self.audio_count+=1;sent+=1;self._maybe_offer();due+=20_000_000
+            need(sent<=2250,'VP9_MEDIA_FRAME_BOUND')
+    def start(self):
+        need(not self.started and self.guard()is True and type(self.source)is PublicClip4K,'START_REPLAY');self.started=True
+        self.deadline=time.monotonic()+self.duration
+        try:
+            self.source.prepare(self.owner,self.guard)
+            self.handshake_deadline=time.monotonic()+60;self.created_unix_ms=int(time.time()*1000)
+            self._setup();self._worker(self.loop.run);self._worker(self._video_feed);self._worker(self._audio_feed)
+            def watch():
+                while not self.stop.wait(.05):
+                    self._maybe_offer()
+                    if self.result_ready.is_set():self._request_stop();return
+                    if self.peer_stopped_at is not None and time.monotonic()>=min(self.handshake_deadline,self.peer_stopped_at+2):self.fail('PEER_STOPPED_RESULT_TIMEOUT');return
+                    if time.monotonic()>=self.deadline or self.guard()is not True:self.fail('DEADLINE_OR_OWNER_LOST');return
+                    if not self.answer_taken and time.monotonic()>=self.handshake_deadline:self.fail('HANDSHAKE_TIMEOUT');return
+            self._worker(watch);self.provisioning();self.server=SignalServer(self);self.server.start();return self
+        except BaseException:self.close();raise

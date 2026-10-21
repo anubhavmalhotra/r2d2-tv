@@ -1,0 +1,4277 @@
+"""Bounded Spark AirPlay 4K60/4K120 relay session, viewer host, and production service."""
+import argparse
+import base64
+from email.message import Message
+import fcntl
+import hashlib
+import hmac
+import http.server
+import inspect
+import io
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import re
+import secrets
+import select
+import shutil
+import signal
+import socket
+import socketserver
+import ssl
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+import types
+from urllib.parse import urlsplit
+from build_viewer import build as build_viewer_html
+import media_ring as mr
+from media_profile import PROFILE_4K60_HEVC, inspect_init_profile, profile_for_name
+from media_stream import MediaStream, StreamError, header_identity
+from protocol import (
+    ORIGIN,
+    PORT,
+    SPARK,
+    TV,
+    Budget,
+    parse_json,
+    route_request,
+    valid_metrics,
+)
+from airplay_ingress import (
+    DEFAULT_AIRPLAY_PORT,
+    DEFAULT_AUDIO_RTP_PORT,
+    DEFAULT_RECEIVER_NAME,
+    DEFAULT_SDP_TIMEOUT_S,
+    DEFAULT_VIDEO_RTP_PORT,
+    build_loopback_sdp,
+    build_reencode_command,
+    build_remux_command,
+    build_uxplay_command,
+    require_uxplay_version,
+)
+
+DEFAULT_AIRPLAY_CONFIG_PATH = Path('/home/{{SPARK_USER}}/.local/share/baaz-browser/airplay.json')
+DEFAULT_JOURNAL_PATH = DEFAULT_AIRPLAY_CONFIG_PATH.parent / 'session-pending'
+DEFAULT_SSAP_KEY_PATH = Path('/home/{{SPARK_USER}}/.local/share/baaz-browser/tv-ssap-key.json')
+DEFAULT_SSAP_PIN_PATH = Path('/home/{{SPARK_USER}}/.local/share/baaz-browser/tv-ssap-pin.json')
+DEFAULT_UXPLAY_USER_BIN = Path('/home/{{SPARK_USER}}/.local/bin/uxplay')
+TV_BROWSER_APP_ID = 'com.webos.app.tinybrowser'
+TV_HOME_APP_ID = 'local.owner.applibrary'
+SSAP_LAUNCH_URI = 'ssap://system.launcher/launch'
+SSAP_CLIENT_KEY_FIELD = 'client' + '-key'
+
+TCP_NOTSENT_LOWAT = getattr(socket, 'TCP_NOTSENT_LOWAT', 25)
+STREAM_NOTSENT_LOWAT = 131072
+STREAM_TOS = 0x88
+STREAM_MAX_BEHIND = 3.0
+STREAM_SOCKET_TIMEOUT = 4.0
+
+AIRPLAY_CONFIG_KEYS = frozenset({
+    'enabled',
+    'pin',
+    'password',
+    'receiver_name',
+    'requested_profile',
+    'relay_mode',
+    'short_fragment',
+    'video_rtp_port',
+    'audio_rtp_port',
+    'airplay_port',
+    'viewer_port',
+    'device_id',
+    'fps_data',
+    'listen_timeout_s',
+    'uxplay_bin',
+})
+
+
+def _default_relay_env():
+    """Build a clean subprocess environment that includes user-space ~/.local/bin and ~/.local/lib."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    home = Path.home()
+    local_bin = home / '.local/bin'
+    if local_bin.is_dir():
+        path_parts = [p for p in env.get('PATH', '').split(os.pathsep) if p]
+        if str(local_bin) not in path_parts:
+            env['PATH'] = os.pathsep.join([str(local_bin)] + path_parts)
+    local_lib = home / '.local/lib'
+    if local_lib.is_dir():
+        lib_parts = [p for p in env.get('LD_LIBRARY_PATH', '').split(os.pathsep) if p]
+        if str(local_lib) not in lib_parts:
+            env['LD_LIBRARY_PATH'] = os.pathsep.join([str(local_lib)] + lib_parts)
+    return env
+
+
+def resolve_uxplay_bin(configured=None):
+    """Resolve the UxPlay binary from explicit config, ~/.local/bin/uxplay, or PATH."""
+    if configured is not None:
+        if type(configured) is not str or not 1 <= len(configured) <= 256 or '\x00' in configured:
+            raise ValueError('UXPLAY_BINARY')
+        return configured
+    for candidate in (DEFAULT_UXPLAY_USER_BIN, Path.home() / '.local/bin/uxplay'):
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            pass
+    return shutil.which('uxplay') or 'uxplay'
+
+
+def _is_process_owner_spawn(spawn):
+    if getattr(spawn, '_is_process_owner_spawn', False):
+        return True
+    owner = getattr(spawn, '__self__', None)
+    return (
+        owner is not None
+        and hasattr(owner, 'handles')
+        and hasattr(owner, 'drainers')
+        and callable(getattr(owner, 'terminate', None))
+    )
+
+
+def _process_has_exited(proc):
+    if proc is None:
+        return False
+    rc = getattr(proc, 'returncode', None)
+    if isinstance(rc, int) and not isinstance(rc, bool):
+        return True
+    poll_fn = getattr(proc, 'poll', None)
+    if callable(poll_fn):
+        try:
+            res = poll_fn()
+            if res is not None and not hasattr(res, '_mock_name'):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+class _SubreaperOwner:
+    """Supervises an isolated subreaper ProcessOwner and reaps all descendants including pre-discovery exits."""
+
+    def __init__(self, owner):
+        self._owner = owner
+        orig_discover = getattr(owner, 'discover', None)
+        self._discover_globals = getattr(orig_discover, '__globals__', None)
+        self._parent_of = {}
+
+    @property
+    def root(self):
+        return self._owner.root
+
+    @property
+    def handles(self):
+        return self._owner.handles
+
+    @property
+    def processes(self):
+        return self._owner.processes
+
+    @property
+    def drainers(self):
+        return self._owner.drainers
+
+    @property
+    def retired(self):
+        return self._owner.retired
+
+    @property
+    def process_refs(self):
+        return self._owner.process_refs
+
+    @property
+    def lock(self):
+        return self._owner.lock
+
+    @property
+    def stderr_bytes(self):
+        return self._owner.stderr_bytes
+
+    @property
+    def closed(self):
+        return self._owner.closed
+
+    @closed.setter
+    def closed(self, value):
+        self._owner.closed = value
+
+    @property
+    def disposed(self):
+        return self._owner.disposed
+
+    @disposed.setter
+    def disposed(self, value):
+        self._owner.disposed = value
+
+    def discover(self):
+        owner = self._owner
+        if not isinstance(self._discover_globals, dict) or not callable(self._discover_globals.get('children')):
+            return owner.discover()
+        children_fn = self._discover_globals['children']
+        status_fn = self._discover_globals.get('status')
+        with owner.lock:
+            if owner.disposed:
+                return
+            pending = [owner.root] + [pid for pid in list(owner.handles) if owner.live(pid)]
+            seen = set()
+            while pending:
+                pid = pending.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if len(seen) > 257:
+                    raise RuntimeError('PROCESS_LIMIT')
+                if not owner._parent_live(pid):
+                    continue
+                for child in children_fn(pid):
+                    self._parent_of.setdefault(child, pid)
+                    c_info = None
+                    if callable(status_fn):
+                        try:
+                            c_info = status_fn(child)
+                        except Exception:
+                            c_info = None
+                    if isinstance(c_info, dict) and c_info.get('state') == 'Z':
+                        continue
+                    owner._track(child, pid)
+                    if child in owner.handles and owner.live(child):
+                        pending.append(child)
+
+    def spawn(self, args, **kwargs):
+        call_kwargs = dict(kwargs)
+        if _is_process_owner_spawn(self._owner.spawn):
+            call_kwargs.pop('stderr', None)
+        proc = self._owner.spawn(args, **call_kwargs)
+        pid = getattr(proc, 'pid', None)
+        if isinstance(pid, int):
+            self._parent_of[pid] = self._owner.root
+        for method_name in ('poll', 'wait'):
+            orig_method = getattr(proc, method_name, None)
+            if callable(orig_method) and not getattr(orig_method, '_subreaper_discover_wrapped', False):
+                def _wrap_proc_method(fn):
+                    def _wrapped(*m_args, **m_kwargs):
+                        try:
+                            self.discover()
+                        except Exception:
+                            pass
+                        res = fn(*m_args, **m_kwargs)
+                        if res is not None:
+                            try:
+                                self.discover()
+                            except Exception:
+                                pass
+                        return res
+
+                    _wrapped._subreaper_discover_wrapped = True
+                    return _wrapped
+
+                try:
+                    setattr(proc, method_name, _wrap_proc_method(orig_method))
+                except Exception:
+                    pass
+        return proc
+
+    def _has_ancestor(self, pid, ancestor_pid):
+        cur = pid
+        visited = set()
+        while isinstance(cur, int) and cur not in visited:
+            if cur == ancestor_pid:
+                return True
+            visited.add(cur)
+            cur = self._parent_of.get(cur)
+        return False
+
+    def terminate(self, process):
+        try:
+            self.discover()
+        except Exception:
+            pass
+        owner = self._owner
+        proc_refs = getattr(owner, 'process_refs', None)
+        if isinstance(self._discover_globals, dict) and isinstance(proc_refs, dict) and id(process) in proc_refs:
+            with owner.lock:
+                entry = proc_refs.get(id(process))
+                if entry and not owner.disposed:
+                    try:
+                        signal.pidfd_send_signal(entry[0], signal.SIGTERM, None, 0)
+                    except ProcessLookupError:
+                        pass
+                    end = time.monotonic() + 0.03
+                    while not owner.disposed and not select.select([entry[0]], [], [], 0)[0] and time.monotonic() < end:
+                        time.sleep(0.005)
+                    if not owner.disposed and not select.select([entry[0]], [], [], 0)[0]:
+                        try:
+                            signal.pidfd_send_signal(entry[0], signal.SIGKILL, None, 0)
+                        except ProcessLookupError:
+                            pass
+        else:
+            owner.terminate(process)
+        try:
+            self.discover()
+            proc_pid = getattr(process, 'pid', None)
+            other_live_top = any(
+                p is not process and not _process_has_exited(p)
+                for p in getattr(owner, 'processes', ())
+            )
+            status_fn = (
+                self._discover_globals.get('status')
+                if isinstance(self._discover_globals, dict)
+                else None
+            )
+            descendant_pids = [
+                pid
+                for pid in list(owner.handles)
+                if pid != proc_pid
+                and owner.live(pid)
+                and (not other_live_top or (isinstance(proc_pid, int) and self._has_ancestor(pid, proc_pid)))
+            ]
+            for pid in descendant_pids:
+                info = status_fn(pid) if callable(status_fn) else None
+                if isinstance(info, dict) and info.get('state') == 'Z':
+                    continue
+                owner.send(pid, signal.SIGTERM)
+            if descendant_pids:
+                end = time.monotonic() + 0.02
+                while time.monotonic() < end and any(owner.live(pid) for pid in descendant_pids):
+                    time.sleep(0.005)
+                for pid in descendant_pids:
+                    if owner.live(pid):
+                        owner.send(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        owner = self._owner
+        if not isinstance(self._discover_globals, dict) or not callable(self._discover_globals.get('children')):
+            return owner.cleanup()
+        children_fn = self._discover_globals['children']
+        status_fn = self._discover_globals.get('status')
+        os_mod = self._discover_globals.get('os', os)
+        wnohang = getattr(os_mod, 'WNOHANG', 1)
+        owner.closed = True
+        error = None
+        started = time.monotonic()
+        while time.monotonic() - started < 7:
+            try:
+                self.discover()
+                active = []
+                for pid in list(owner.handles):
+                    if not owner.live(pid):
+                        continue
+                    info = status_fn(pid) if callable(status_fn) else None
+                    if isinstance(info, dict) and info.get('state') == 'Z':
+                        continue
+                    active.append(pid)
+                sig = signal.SIGTERM if time.monotonic() - started < 0.02 else signal.SIGKILL
+                for pid in active:
+                    owner.send(pid, sig)
+                for p in owner.processes:
+                    p.poll()
+                for pid in sorted(set(owner.handles) | set(children_fn(owner.root))):
+                    try:
+                        os_mod.waitpid(pid, wnohang)
+                    except (ChildProcessError, OSError):
+                        pass
+                while True:
+                    try:
+                        waited_pid, _ = os_mod.waitpid(-1, wnohang)
+                        if waited_pid == 0:
+                            break
+                    except (ChildProcessError, OSError):
+                        break
+                if not active and not children_fn(owner.root):
+                    break
+            except (OSError, RuntimeError) as exc:
+                error = type(exc).__name__
+            time.sleep(0.01)
+        try:
+            self.discover()
+            remaining = []
+            for pid in list(owner.handles):
+                if not owner.live(pid):
+                    continue
+                info = status_fn(pid) if callable(status_fn) else None
+                if isinstance(info, dict) and info.get('state') == 'Z':
+                    continue
+                remaining.append(pid)
+            verified = not remaining and not children_fn(owner.root) and error is None
+        except (OSError, RuntimeError):
+            remaining, verified = [], False
+        # Process exit can precede the stderr reader's final EOF/drain. Give
+        # those readers one shared grace within the existing cleanup deadline,
+        # and never publish verified cleanup while a reader still owns its pipe.
+        drain_end = min(started + 7.0, time.monotonic() + 0.2)
+        for t in owner.drainers:
+            t.join(timeout=max(0.0, drain_end - time.monotonic()))
+        if any(t.is_alive() for t in owner.drainers):
+            verified = False
+            if error is None:
+                error = 'STDERR_DRAINER_ALIVE'
+        with owner.lock:
+            owner.disposed = True
+            for fd in [v[0] for v in owner.handles.values()] + owner.retired:
+                if isinstance(fd, int) and fd >= 0:
+                    try:
+                        os_mod.close(fd)
+                    except OSError:
+                        pass
+        return {
+            'verified': verified,
+            'remaining_owned_count': len(remaining),
+            'error': error,
+            'tracked_count': len(owner.handles),
+            'stderr_discarded_bytes': owner.stderr_bytes,
+        }
+
+    def interrupt(self):
+        self.closed = True
+        fn = getattr(self._owner, 'interrupt', None)
+        if callable(fn):
+            fn()
+
+    cancel = interrupt
+
+    def request_stop(self):
+        fn = getattr(self._owner, 'request_stop', None)
+        if callable(fn):
+            fn()
+
+    def cap_deadline(self, timeout_s):
+        fn = getattr(self._owner, 'cap_deadline', None)
+        if callable(fn):
+            fn(timeout_s)
+
+    def reap(self):
+        return bool(self.cleanup().get('verified'))
+
+    def close(self):
+        return self.cleanup()
+
+    def __getattr__(self, name):
+        return getattr(self._owner, name)
+
+
+def _wait_subreaper_sock(sock, *, writable=False, deadline=None, cancel_check=None):
+    if deadline is None and cancel_check is None:
+        return
+    try:
+        fd = sock.fileno()
+    except Exception as exc:
+        raise EOFError('SUBREAPER_EOF') from exc
+    if not isinstance(fd, int) or fd < 0:
+        raise EOFError('SUBREAPER_EOF')
+    poller = select.poll()
+    mask = (
+        (select.POLLOUT if writable else (select.POLLIN | select.POLLPRI))
+        | select.POLLHUP
+        | select.POLLERR
+        | getattr(select, 'POLLNVAL', 0)
+    )
+    poller.register(fd, mask)
+    while True:
+        if callable(cancel_check) and cancel_check():
+            raise TimeoutError('SUBREAPER_INTERRUPTED')
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('SUBREAPER_RPC_TIMEOUT')
+            step_s = min(0.02, remaining)
+        else:
+            step_s = 0.02
+        timeout_ms = max(1, int(math.ceil(step_s * 1000)))
+        try:
+            events = poller.poll(timeout_ms)
+        except InterruptedError:
+            continue
+        except Exception as exc:
+            raise EOFError('SUBREAPER_EOF') from exc
+        if callable(cancel_check) and cancel_check():
+            raise TimeoutError('SUBREAPER_INTERRUPTED')
+        if events:
+            for _fd, revents in events:
+                if revents & getattr(select, 'POLLNVAL', 0):
+                    raise EOFError('SUBREAPER_EOF')
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError('SUBREAPER_RPC_TIMEOUT')
+
+
+def _apply_subreaper_sock_timeout(sock, deadline):
+    if deadline is None or not hasattr(sock, 'settimeout'):
+        return
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        raise TimeoutError('SUBREAPER_RPC_TIMEOUT')
+    sock.settimeout(max(0.005, rem))
+
+
+def _send_subreaper_msg(sock, obj, fds=(), *, deadline=None, cancel_check=None):
+    raw = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+    hdr = struct.pack('>I', len(raw))
+    _wait_subreaper_sock(sock, writable=True, deadline=deadline, cancel_check=cancel_check)
+    _apply_subreaper_sock_timeout(sock, deadline)
+    try:
+        if fds:
+            socket.send_fds(sock, [hdr], list(fds))
+        else:
+            sock.sendall(hdr)
+        _wait_subreaper_sock(sock, writable=True, deadline=deadline, cancel_check=cancel_check)
+        _apply_subreaper_sock_timeout(sock, deadline)
+        sock.sendall(raw)
+    except socket.timeout as exc:
+        raise TimeoutError('SUBREAPER_RPC_TIMEOUT') from exc
+
+
+def _recv_subreaper_msg(sock, max_fds=0, *, deadline=None, cancel_check=None):
+    fds = []
+    try:
+        if max_fds > 0:
+            while True:
+                _wait_subreaper_sock(sock, deadline=deadline, cancel_check=cancel_check)
+                _apply_subreaper_sock_timeout(sock, deadline)
+                try:
+                    msg, recv_fds, _flags, _addr = socket.recv_fds(sock, 4, max_fds)
+                    break
+                except BlockingIOError:
+                    continue
+                except socket.timeout as exc:
+                    raise TimeoutError('SUBREAPER_RPC_TIMEOUT') from exc
+            fds = list(recv_fds)
+            if not msg:
+                raise EOFError('SUBREAPER_EOF')
+            hdr = bytearray(msg)
+        else:
+            hdr = bytearray()
+        while len(hdr) < 4:
+            _wait_subreaper_sock(sock, deadline=deadline, cancel_check=cancel_check)
+            _apply_subreaper_sock_timeout(sock, deadline)
+            try:
+                chunk = sock.recv(4 - len(hdr))
+            except BlockingIOError:
+                continue
+            except socket.timeout as exc:
+                raise TimeoutError('SUBREAPER_RPC_TIMEOUT') from exc
+            if not chunk:
+                raise EOFError('SUBREAPER_EOF')
+            hdr.extend(chunk)
+        length = struct.unpack('>I', bytes(hdr))[0]
+        if length > 262144:
+            raise ValueError('SUBREAPER_FRAME_TOO_LARGE')
+        buf = bytearray()
+        while len(buf) < length:
+            _wait_subreaper_sock(sock, deadline=deadline, cancel_check=cancel_check)
+            _apply_subreaper_sock_timeout(sock, deadline)
+            try:
+                chunk = sock.recv(length - len(buf))
+            except BlockingIOError:
+                continue
+            except socket.timeout as exc:
+                raise TimeoutError('SUBREAPER_RPC_TIMEOUT') from exc
+            if not chunk:
+                raise EOFError('SUBREAPER_EOF')
+            buf.extend(chunk)
+        return json.loads(buf.decode('utf-8')), fds
+    except Exception:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
+
+
+def _run_subreaper_worker(sock, *, owner_factory=None):
+    """Run an isolated ProcessOwner inside a dedicated subreaper worker over a private UNIX socket."""
+    try:
+        if owner_factory is None:
+            from process_owner import ProcessOwner as _ProcessOwner
+            raw_owner = _ProcessOwner()
+        else:
+            raw_owner = owner_factory()
+        owner = (
+            raw_owner
+            if isinstance(raw_owner, _SubreaperOwner)
+            else _SubreaperOwner(raw_owner)
+        )
+        _send_subreaper_msg(
+            sock,
+            {
+                'ok': True,
+                'root': getattr(owner, 'root', os.getpid()),
+                'handles_count': len(getattr(owner, 'handles', ())),
+                'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+            },
+        )
+    except Exception as exc:
+        try:
+            _send_subreaper_msg(sock, {'ok': False, 'error': type(exc).__name__, 'msg': str(exc)})
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        return 1
+
+    proc_map = {}
+    next_id = 1
+    cleaned_up = False
+    owner_is_po = _is_process_owner_spawn(getattr(raw_owner, 'spawn', None))
+    try:
+        while True:
+            try:
+                req, _ = _recv_subreaper_msg(sock)
+            except EOFError:
+                break
+            op = req.get('op')
+            if op == 'spawn':
+                try:
+                    stdin_mode = req.get('stdin')
+                    stdout_mode = req.get('stdout')
+                    stderr_mode = req.get('stderr')
+                    stdin_arg = (
+                        subprocess.DEVNULL
+                        if stdin_mode == 'devnull'
+                        else (subprocess.PIPE if stdin_mode == 'pipe' else None)
+                    )
+                    stdout_arg = (
+                        subprocess.DEVNULL
+                        if stdout_mode == 'devnull'
+                        else (subprocess.PIPE if stdout_mode == 'pipe' else None)
+                    )
+                    stderr_arg = (
+                        subprocess.DEVNULL
+                        if stderr_mode == 'devnull'
+                        else (subprocess.PIPE if stderr_mode == 'pipe' else None)
+                    )
+                    spawn_kwargs = {'stdin': stdin_arg, 'stdout': stdout_arg}
+                    if req.get('env') is not None:
+                        spawn_kwargs['env'] = req['env']
+                    if stderr_arg is not None and not owner_is_po:
+                        spawn_kwargs['stderr'] = stderr_arg
+                    p = owner.spawn(list(req['args']), **spawn_kwargs)
+                    proc_id = next_id
+                    next_id += 1
+                    proc_map[proc_id] = p
+                    fds_to_send = []
+                    fd_order = []
+                    if stdin_mode == 'pipe' and getattr(p, 'stdin', None) is not None:
+                        fds_to_send.append(p.stdin.fileno())
+                        fd_order.append('stdin')
+                    if stdout_mode == 'pipe' and getattr(p, 'stdout', None) is not None:
+                        fds_to_send.append(p.stdout.fileno())
+                        fd_order.append('stdout')
+                    if stderr_mode == 'pipe' and getattr(p, 'stderr', None) is not None and not owner_is_po:
+                        fds_to_send.append(p.stderr.fileno())
+                        fd_order.append('stderr')
+                    _send_subreaper_msg(
+                        sock,
+                        {
+                            'ok': True,
+                            'proc_id': proc_id,
+                            'pid': getattr(p, 'pid', None),
+                            'fd_order': fd_order,
+                            'handles_count': len(getattr(owner, 'handles', ())),
+                            'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+                        },
+                        fds=fds_to_send,
+                    )
+                    for name in fd_order:
+                        s = getattr(p, name, None)
+                        if s is not None and hasattr(s, 'close'):
+                            try:
+                                s.close()
+                            except Exception:
+                                pass
+                        try:
+                            setattr(p, name, None)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    _send_subreaper_msg(sock, {'ok': False, 'error': type(exc).__name__, 'msg': str(exc)})
+            elif op == 'poll':
+                p = proc_map.get(req.get('proc_id'))
+                rc = None if p is None else p.poll()
+                _send_subreaper_msg(
+                    sock,
+                    {
+                        'ok': True,
+                        'returncode': rc,
+                        'handles_count': len(getattr(owner, 'handles', ())),
+                        'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+                    },
+                )
+            elif op == 'wait':
+                p = proc_map.get(req.get('proc_id'))
+                timeout = req.get('timeout')
+                if p is None:
+                    _send_subreaper_msg(sock, {'ok': True, 'returncode': 0})
+                else:
+                    try:
+                        rc = p.wait(timeout=timeout)
+                        _send_subreaper_msg(sock, {'ok': True, 'returncode': rc})
+                    except subprocess.TimeoutExpired:
+                        _send_subreaper_msg(sock, {'ok': False, 'error': 'TimeoutExpired'})
+                    except Exception as exc:
+                        _send_subreaper_msg(sock, {'ok': False, 'error': type(exc).__name__, 'msg': str(exc)})
+            elif op == 'terminate':
+                p = proc_map.get(req.get('proc_id'))
+                rc = 0 if p is None else None
+                if p is not None:
+                    try:
+                        owner.terminate(p)
+                    except Exception:
+                        pass
+                    try:
+                        rc = p.poll()
+                    except Exception:
+                        rc = None
+                _send_subreaper_msg(
+                    sock,
+                    {
+                        'ok': True,
+                        'returncode': rc,
+                        'handles_count': len(getattr(owner, 'handles', ())),
+                        'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+                    },
+                )
+            elif op == 'kill':
+                p = proc_map.get(req.get('proc_id'))
+                if p is not None:
+                    try:
+                        if isinstance(getattr(p, 'pid', None), int) and p.pid in getattr(owner, 'handles', {}):
+                            owner.send(p.pid, signal.SIGKILL)
+                        elif hasattr(p, 'kill'):
+                            p.kill()
+                    except Exception:
+                        pass
+                _send_subreaper_msg(sock, {'ok': True})
+            elif op == 'discover':
+                try:
+                    owner.discover()
+                    _send_subreaper_msg(
+                        sock,
+                        {
+                            'ok': True,
+                            'handles_count': len(getattr(owner, 'handles', ())),
+                            'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+                        },
+                    )
+                except Exception as exc:
+                    _send_subreaper_msg(sock, {'ok': False, 'error': type(exc).__name__, 'msg': str(exc)})
+            elif op == 'cleanup':
+                cleaned_up = True
+                res = owner.cleanup()
+                _send_subreaper_msg(
+                    sock,
+                    {
+                        'ok': True,
+                        'cleanup': res,
+                        'handles_count': len(getattr(owner, 'handles', ())),
+                        'stderr_bytes': getattr(owner, 'stderr_bytes', 0),
+                    },
+                )
+                break
+            else:
+                _send_subreaper_msg(sock, {'ok': False, 'error': 'UNKNOWN_OP'})
+    except Exception:
+        pass
+    finally:
+        if not cleaned_up:
+            try:
+                owner.cleanup()
+            except Exception:
+                pass
+        for p in proc_map.values():
+            for stream_name in ('stdin', 'stdout', 'stderr'):
+                s = getattr(p, stream_name, None)
+                if s is not None and hasattr(s, 'close'):
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return 0
+
+
+class _SubreaperProcess:
+    """Parent-side proxy for a child process spawned inside an IsolatedProcessOwner subreaper."""
+
+    def __init__(self, owner_proxy, proc_id, pid, *, stdin=None, stdout=None, stderr=None):
+        self._owner_proxy = owner_proxy
+        self._proc_id = proc_id
+        self.pid = pid
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            resp, _ = self._owner_proxy._rpc({'op': 'poll', 'proc_id': self._proc_id})
+            if resp.get('ok'):
+                self.returncode = resp.get('returncode')
+        except Exception:
+            pass
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is not None:
+            return self.returncode
+        deadline = None if timeout is None else (time.monotonic() + max(0.0, float(timeout)))
+        while True:
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    rc = self.poll()
+                    if rc is not None:
+                        return rc
+                    raise subprocess.TimeoutExpired(cmd=f'pid-{self.pid}', timeout=timeout)
+                step = min(0.05, rem)
+            else:
+                step = 0.05
+            rpc_budget = max(self._owner_proxy.rpc_timeout_s, step + 0.5)
+            resp, _ = self._owner_proxy._rpc(
+                {'op': 'wait', 'proc_id': self._proc_id, 'timeout': step},
+                timeout_s=rpc_budget,
+            )
+            if resp.get('ok'):
+                self.returncode = resp.get('returncode')
+                return self.returncode
+            if resp.get('error') == 'TimeoutExpired':
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(cmd=f'pid-{self.pid}', timeout=timeout)
+                time.sleep(0.01)
+                continue
+            raise RuntimeError(resp.get('msg') or resp.get('error') or 'WAIT_FAILED')
+
+    def terminate(self):
+        return self._owner_proxy.terminate(self)
+
+    def kill(self):
+        try:
+            self._owner_proxy._rpc({'op': 'kill', 'proc_id': self._proc_id})
+        except Exception:
+            pass
+
+
+class IsolatedProcessOwner:
+    """Runs ProcessOwner inside a dedicated child subreaper process so owner.root is isolated from the caller."""
+
+    def __init__(
+        self,
+        *,
+        owner_factory=None,
+        fork_worker=False,
+        subreaper_env=None,
+        rpc_timeout_s=2.0,
+        cleanup_timeout_s=8.0,
+        cancel_check=None,
+    ):
+        self.lock = threading.RLock()
+        self._rpc_lock = threading.Lock()
+        self.handles = {}
+        self.processes = []
+        self.drainers = []
+        self.retired = []
+        self.process_refs = {}
+        self.stderr_bytes = 0
+        self.closed = False
+        self.disposed = False
+        self._last_cleanup = None
+        self._subreaper_proc = None
+        self._worker_pid = None
+        self._worker_thread = None
+        self._sock = None
+        self.rpc_timeout_s = max(0.02, float(rpc_timeout_s))
+        self.cleanup_timeout_s = max(self.rpc_timeout_s, float(cleanup_timeout_s))
+        self._interrupted = False
+        self._stop_requested = False
+        self._broken = False
+        self._broken_error = None
+        self._rpc_in_flight = 0
+        self._rpc_budget_cap = None
+        self._active_rpc_deadline = None
+        self._active_rpc_teardown = False
+        parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            os.set_inheritable(parent_sock.fileno(), False)
+            if owner_factory is None and not fork_worker:
+                env = dict(
+                    os.environ if subreaper_env is None else subreaper_env,
+                    PYTHONDONTWRITEBYTECODE='1',
+                )
+                self._subreaper_proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        '-B',
+                        str(Path(__file__).resolve()),
+                        '--subreaper-fd',
+                        str(child_sock.fileno()),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    pass_fds=(child_sock.fileno(),),
+                    close_fds=True,
+                    start_new_session=True,
+                    env=env,
+                )
+                child_sock.close()
+                child_sock = None
+            elif fork_worker:
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        parent_sock.close()
+                        rc = _run_subreaper_worker(child_sock, owner_factory=owner_factory)
+                        os._exit(rc)
+                    except BaseException:
+                        os._exit(1)
+                child_sock.close()
+                child_sock = None
+                self._worker_pid = pid
+            else:
+                self._worker_thread = threading.Thread(
+                    target=_run_subreaper_worker,
+                    args=(child_sock,),
+                    kwargs={'owner_factory': owner_factory},
+                    name='airplay-subreaper-worker',
+                    daemon=True,
+                )
+                self._worker_thread.start()
+                child_sock = None
+            self._sock = parent_sock
+            parent_sock = None
+            init_deadline = self._effective_rpc_deadline(self.rpc_timeout_s)
+            self._active_rpc_deadline = init_deadline
+            try:
+                init_resp, _ = _recv_subreaper_msg(
+                    self._sock,
+                    deadline=init_deadline,
+                    cancel_check=lambda: self._abort_check() or (callable(cancel_check) and bool(cancel_check())),
+                )
+            finally:
+                self._active_rpc_deadline = None
+            if not init_resp.get('ok'):
+                raise RuntimeError(init_resp.get('msg') or init_resp.get('error') or 'SUBREAPER_INIT_FAILED')
+            self.root = init_resp.get('root')
+            self.stderr_bytes = init_resp.get('stderr_bytes', 0)
+        except Exception as exc:
+            self._broken = True
+            if self._broken_error is None:
+                self._broken_error = type(exc).__name__
+            if child_sock is not None:
+                try:
+                    child_sock.close()
+                except Exception:
+                    pass
+            if parent_sock is not None:
+                try:
+                    parent_sock.close()
+                except Exception:
+                    pass
+            self._close_channel()
+            self._reap_worker(force=True)
+            raise
+
+    @property
+    def _parent_sock(self):
+        return self._sock
+
+    @property
+    def _worker_proc(self):
+        return self._subreaper_proc
+
+    @property
+    def cleanup_verified(self):
+        if self._last_cleanup is None:
+            return None
+        return bool(self._last_cleanup.get('verified'))
+
+    def _abort_check(self):
+        if self._interrupted or self._broken or self._sock is None:
+            return True
+        active = self._active_rpc_deadline
+        if active is not None and time.monotonic() >= active:
+            return True
+        return False
+
+    def _effective_rpc_deadline(self, timeout_s=None, *, teardown=False):
+        op_budget = self.rpc_timeout_s if timeout_s is None else max(0.02, float(timeout_s))
+        if teardown:
+            return time.monotonic() + min(op_budget, self.cleanup_timeout_s)
+        if self._stop_requested:
+            op_budget = min(op_budget, 0.15)
+        cap = self._rpc_budget_cap
+        if cap is not None and cap < op_budget:
+            op_budget = cap
+        return time.monotonic() + op_budget
+
+    def cap_deadline(self, timeout_s):
+        try:
+            budget = max(0.02, float(timeout_s))
+        except Exception:
+            budget = 0.1
+        cur_cap = self._rpc_budget_cap
+        if cur_cap is None or budget < cur_cap:
+            self._rpc_budget_cap = budget
+        target = time.monotonic() + budget
+        active = self._active_rpc_deadline
+        if not self._active_rpc_teardown and (active is None or target < active):
+            self._active_rpc_deadline = target
+
+    def interrupt(self):
+        """Signal-safe, lock-free interruption of in-flight or pending subreaper RPCs."""
+        self._interrupted = True
+        self._broken = True
+        if self._broken_error is None:
+            self._broken_error = 'SUBREAPER_INTERRUPTED'
+        self.closed = True
+        sock = self._sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    cancel = interrupt
+
+    def request_stop(self):
+        """Signal-safe stop notification from AirPlayRelaySession/AirPlayService."""
+        if self._stop_requested:
+            return
+        self._stop_requested = True
+        self.cap_deadline(min(self.rpc_timeout_s, 0.12))
+
+    def _close_channel(self):
+        sock = self._sock
+        self._sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _fail_channel(self, error_name):
+        self._broken = True
+        if self._broken_error is None:
+            self._broken_error = error_name
+        self._close_channel()
+
+    def _reap_worker(self, *, force=False):
+        clean = not (force or self._broken or self._interrupted)
+        wait_budget = min(0.02, self.rpc_timeout_s) if not clean else min(2.0, self.rpc_timeout_s)
+        if self._subreaper_proc is not None:
+            try:
+                self._subreaper_proc.wait(timeout=wait_budget)
+            except Exception:
+                clean = False
+                try:
+                    self._subreaper_proc.kill()
+                except Exception:
+                    pass
+                try:
+                    self._subreaper_proc.wait(timeout=min(1.0, max(0.05, self.rpc_timeout_s)))
+                except Exception:
+                    pass
+        if self._worker_pid is not None:
+            deadline = time.monotonic() + wait_budget
+            while time.monotonic() < deadline:
+                try:
+                    wpid, _ = os.waitpid(self._worker_pid, os.WNOHANG)
+                    if wpid == self._worker_pid:
+                        self._worker_pid = None
+                        break
+                except ChildProcessError:
+                    self._worker_pid = None
+                    break
+                time.sleep(0.005)
+            if self._worker_pid is not None:
+                clean = False
+                try:
+                    os.kill(self._worker_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                kill_deadline = time.monotonic() + min(1.0, max(0.05, self.rpc_timeout_s))
+                while time.monotonic() < kill_deadline and self._worker_pid is not None:
+                    try:
+                        wpid, _ = os.waitpid(self._worker_pid, os.WNOHANG)
+                        if wpid == self._worker_pid:
+                            self._worker_pid = None
+                            break
+                    except (ChildProcessError, OSError):
+                        self._worker_pid = None
+                        break
+                    time.sleep(0.005)
+        if self._worker_thread is not None:
+            join_budget = min(0.05, self.rpc_timeout_s) if not clean else min(2.0, self.rpc_timeout_s)
+            self._worker_thread.join(timeout=join_budget)
+            if self._worker_thread.is_alive():
+                clean = False
+        return clean
+
+    def _rpc(self, payload, max_fds=0, *, timeout_s=None):
+        if self._interrupted or self._broken or self._sock is None:
+            raise RuntimeError(self._broken_error or 'SUBREAPER_CLOSED')
+        teardown = payload.get('op') in ('cleanup', 'terminate')
+        # Operational cancellation must not erase teardown acknowledgements.
+        # Owned terminate/cleanup keep their existing 2s/8s budgets, shared
+        # by lock acquisition and reply; explicit interrupt still fails closed.
+        deadline = self._effective_rpc_deadline(timeout_s, teardown=teardown)
+        self._rpc_in_flight += 1
+        try:
+            lock_wait = max(0.01, deadline - time.monotonic())
+            if not self._rpc_lock.acquire(timeout=lock_wait):
+                self._fail_channel('SUBREAPER_RPC_TIMEOUT')
+                self._reap_worker(force=True)
+                raise TimeoutError('SUBREAPER_RPC_TIMEOUT')
+            try:
+                if self._interrupted or self._broken or self._sock is None:
+                    raise RuntimeError(self._broken_error or 'SUBREAPER_CLOSED')
+                sock = self._sock
+                self._active_rpc_teardown = teardown
+                if not teardown:
+                    deadline = self._effective_rpc_deadline(timeout_s)
+                self._active_rpc_deadline = deadline
+                try:
+                    _send_subreaper_msg(
+                        sock,
+                        payload,
+                        deadline=deadline,
+                        cancel_check=self._abort_check,
+                    )
+                    resp, fds = _recv_subreaper_msg(
+                        sock,
+                        max_fds=max_fds,
+                        deadline=deadline,
+                        cancel_check=self._abort_check,
+                    )
+                except Exception as exc:
+                    err_name = (
+                        'SUBREAPER_INTERRUPTED'
+                        if self._interrupted
+                        else (
+                            'SUBREAPER_RPC_TIMEOUT'
+                            if isinstance(exc, (TimeoutError, socket.timeout))
+                            else type(exc).__name__
+                        )
+                    )
+                    self._fail_channel(err_name)
+                    self._reap_worker(force=True)
+                    raise
+                if 'stderr_bytes' in resp:
+                    self.stderr_bytes = resp['stderr_bytes']
+                return resp, fds
+            finally:
+                self._active_rpc_deadline = None
+                self._active_rpc_teardown = False
+                self._rpc_lock.release()
+        finally:
+            self._rpc_in_flight -= 1
+
+    def discover(self):
+        resp, _ = self._rpc({'op': 'discover'})
+        if not resp.get('ok'):
+            raise RuntimeError(resp.get('msg') or resp.get('error') or 'DISCOVER_FAILED')
+
+    def spawn(self, args, **kwargs):
+        with self.lock:
+            if self.closed or self.disposed or len(self.processes) >= 8:
+                raise RuntimeError('CHILD_LIMIT')
+        stdin_opt = kwargs.get('stdin', subprocess.DEVNULL)
+        stdout_opt = kwargs.get('stdout', None)
+        stderr_opt = kwargs.get('stderr', None)
+        req = {
+            'op': 'spawn',
+            'args': [str(a) for a in args],
+            'stdin': 'devnull' if stdin_opt == subprocess.DEVNULL else ('pipe' if stdin_opt == subprocess.PIPE else 'none'),
+            'stdout': 'devnull' if stdout_opt == subprocess.DEVNULL else ('pipe' if stdout_opt == subprocess.PIPE else 'none'),
+            'stderr': 'devnull' if stderr_opt == subprocess.DEVNULL else ('pipe' if stderr_opt == subprocess.PIPE else 'none'),
+            'env': None if kwargs.get('env') is None else {str(k): str(v) for k, v in kwargs['env'].items()},
+        }
+        resp, fds = self._rpc(req, max_fds=3)
+        if not resp.get('ok'):
+            for fd in fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise RuntimeError(resp.get('msg') or resp.get('error') or 'SPAWN_FAILED')
+        fd_order = resp.get('fd_order') or []
+        streams = {'stdin': None, 'stdout': None, 'stderr': None}
+        opened_fds = set()
+        try:
+            for name, fd in zip(fd_order, fds):
+                mode = 'wb' if name == 'stdin' else 'rb'
+                streams[name] = os.fdopen(fd, mode, buffering=0)
+                opened_fds.add(fd)
+        except Exception:
+            for s in streams.values():
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            for fd in fds:
+                if fd not in opened_fds:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            raise
+        proc = _SubreaperProcess(
+            self,
+            resp['proc_id'],
+            resp['pid'],
+            stdin=streams['stdin'],
+            stdout=streams['stdout'],
+            stderr=streams['stderr'],
+        )
+        with self.lock:
+            self.processes.append(proc)
+            if isinstance(proc.pid, int):
+                self.handles[proc.pid] = (-1, 0)
+                self.process_refs[id(proc)] = self.handles[proc.pid]
+        return proc
+
+    def terminate(self, process):
+        proc_id = getattr(process, '_proc_id', None)
+        if proc_id is None:
+            return False
+        try:
+            resp, _ = self._rpc(
+                {'op': 'terminate', 'proc_id': proc_id},
+                # The owned supervisor allows 0.4s for TERM and another 0.2s
+                # for descendants. Keep this owned teardown within its normal
+                # finite RPC budget even after a coalesced service stop.
+                timeout_s=self.rpc_timeout_s,
+            )
+            if resp.get('ok'):
+                if resp.get('returncode') is not None:
+                    process.returncode = resp.get('returncode')
+                return True
+        except Exception:
+            pass
+        return False
+
+    def cleanup(self):
+        with self.lock:
+            if self.disposed and self._last_cleanup is not None:
+                return dict(self._last_cleanup)
+            self.closed = True
+        if self._broken or self._interrupted or self._sock is None:
+            res = {
+                'verified': False,
+                'remaining_owned_count': 0,
+                'error': self._broken_error or 'SUBREAPER_CLOSED',
+                'tracked_count': len(self.handles),
+                'stderr_discarded_bytes': self.stderr_bytes,
+            }
+        else:
+            try:
+                resp, _ = self._rpc({'op': 'cleanup'}, timeout_s=self.cleanup_timeout_s)
+                if (
+                    resp.get('ok')
+                    and isinstance(resp.get('cleanup'), dict)
+                    and not self._broken
+                    and not self._interrupted
+                ):
+                    res = dict(resp['cleanup'])
+                else:
+                    res = {
+                        'verified': False,
+                        'remaining_owned_count': 0,
+                        'error': resp.get('error') or self._broken_error or 'CLEANUP_FAILED',
+                        'tracked_count': len(self.handles),
+                        'stderr_discarded_bytes': self.stderr_bytes,
+                    }
+            except Exception as exc:
+                res = {
+                    'verified': False,
+                    'remaining_owned_count': 0,
+                    'error': self._broken_error or type(exc).__name__,
+                    'tracked_count': len(self.handles),
+                    'stderr_discarded_bytes': self.stderr_bytes,
+                }
+        try:
+            for p in list(self.processes):
+                for s_name in ('stdin', 'stdout', 'stderr'):
+                    s = getattr(p, s_name, None)
+                    if s is not None and hasattr(s, 'close'):
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+            self._close_channel()
+            worker_reaped = self._reap_worker(
+                force=self._broken or self._interrupted or not res.get('verified')
+            )
+            if not worker_reaped and res.get('verified'):
+                res['verified'] = False
+                if res.get('error') is None:
+                    res['error'] = 'SUBREAPER_WORKER_HUNG'
+        finally:
+            with self.lock:
+                self.disposed = True
+                self._last_cleanup = dict(res)
+        return res
+
+    def reap(self):
+        return bool(self.cleanup().get('verified'))
+
+    def close(self):
+        return self.cleanup()
+
+
+def _is_unpatched_linux_process_owner_cls(owner_factory):
+    if sys.platform != 'linux' or not isinstance(owner_factory, type):
+        return False
+    if getattr(owner_factory, '__name__', None) != 'ProcessOwner':
+        return False
+    discover_fn = getattr(owner_factory, 'discover', None)
+    d_globals = getattr(discover_fn, '__globals__', None)
+    if not isinstance(d_globals, dict):
+        return False
+    children_fn = d_globals.get('children')
+    status_fn = d_globals.get('status')
+    os_mod = d_globals.get('os')
+    if (
+        not callable(children_fn)
+        or not callable(status_fn)
+        or hasattr(children_fn, '_mock_name')
+        or hasattr(status_fn, '_mock_name')
+        or getattr(getattr(children_fn, '__code__', None), 'co_name', None) != 'children'
+        or getattr(getattr(status_fn, '__code__', None), 'co_name', None) != 'status'
+        or getattr(os_mod, 'waitpid', None) is not os.waitpid
+    ):
+        return False
+    return True
+
+
+def _create_session_process_owner(owner_factory, *, cancel_check=None):
+    if owner_factory is None:
+        return None
+    if owner_factory is IsolatedProcessOwner or _is_unpatched_linux_process_owner_cls(owner_factory):
+        return IsolatedProcessOwner(cancel_check=cancel_check)
+    owner = owner_factory()
+    if isinstance(owner, (_SubreaperOwner, IsolatedProcessOwner)):
+        return owner
+    if (
+        hasattr(owner, 'handles')
+        and hasattr(owner, 'discover')
+        and hasattr(owner, '_track')
+    ):
+        return _SubreaperOwner(owner)
+    return owner
+
+
+def _native_pipe_fd(stream):
+    """Return a non-blocking OS descriptor only when stream uses standard OS file I/O."""
+    if stream is None or not hasattr(stream, 'fileno'):
+        return None
+    stream_dict = getattr(stream, '__dict__', None)
+    if isinstance(stream_dict, dict) and 'read' in stream_dict:
+        return None
+    if not isinstance(stream, (io.BufferedReader, io.FileIO, io.TextIOWrapper)):
+        return None
+    try:
+        fd = stream.fileno()
+        if isinstance(fd, int) and fd >= 0:
+            os.set_blocking(fd, False)
+            return fd
+    except Exception:
+        return None
+    return None
+
+
+class AirPlayReceiverConfig:
+    """Validated, authenticated Spark AirPlay receiver configuration."""
+
+    def __init__(
+        self,
+        *,
+        enabled=True,
+        pin=None,
+        password=None,
+        receiver_name=DEFAULT_RECEIVER_NAME,
+        requested_profile='4k60_hevc',
+        relay_mode='b2',
+        short_fragment=True,
+        video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+        audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+        airplay_port=DEFAULT_AIRPLAY_PORT,
+        viewer_port=PORT,
+        device_id=None,
+        fps_data=False,
+        listen_timeout_s=DEFAULT_SDP_TIMEOUT_S,
+        uxplay_bin=None,
+    ):
+        if type(enabled) is not bool:
+            raise ValueError('AIRPLAY_ENABLED_FLAG')
+        if relay_mode not in ('b1', 'b2'):
+            raise ValueError('AIRPLAY_RELAY_MODE')
+        if type(viewer_port) is not int or isinstance(viewer_port, bool) or not 1024 <= viewer_port <= 65535:
+            raise ValueError('AIRPLAY_VIEWER_PORT')
+        if pin is not None and password is not None:
+            raise ValueError('UXPLAY_AUTH_CONFLICT')
+        if pin is None and password is None:
+            raise ValueError('AIRPLAY_AUTH_REQUIRED')
+        resolved_bin = resolve_uxplay_bin(uxplay_bin)
+        profile = profile_for_name(requested_profile)
+        build_uxplay_command(
+            uxplay_bin=resolved_bin,
+            profile_name=profile.name,
+            receiver_name=receiver_name,
+            video_rtp_port=video_rtp_port,
+            audio_rtp_port=audio_rtp_port,
+            airplay_port=airplay_port,
+            pin=pin,
+            password=password,
+            device_id=device_id,
+            fps_data=fps_data,
+        )
+        if viewer_port in (video_rtp_port, audio_rtp_port, airplay_port):
+            raise ValueError('UXPLAY_PORT_COLLISION')
+        if relay_mode == 'b1':
+            build_remux_command(
+                video_rtp_port=video_rtp_port,
+                audio_rtp_port=audio_rtp_port,
+                short_fragment=short_fragment,
+                listen_timeout_s=listen_timeout_s,
+            )
+        else:
+            build_reencode_command(
+                profile_name=profile.name,
+                video_rtp_port=video_rtp_port,
+                audio_rtp_port=audio_rtp_port,
+                short_fragment=short_fragment,
+                listen_timeout_s=listen_timeout_s,
+            )
+        self.enabled = enabled
+        self.pin = pin
+        self.password = password
+        self.receiver_name = receiver_name
+        self.requested_profile = profile.name
+        self.relay_mode = relay_mode
+        self.short_fragment = short_fragment
+        self.video_rtp_port = video_rtp_port
+        self.audio_rtp_port = audio_rtp_port
+        self.airplay_port = airplay_port
+        self.viewer_port = viewer_port
+        self.device_id = device_id
+        self.fps_data = fps_data
+        self.listen_timeout_s = listen_timeout_s
+        self.uxplay_bin = resolved_bin
+
+    @property
+    def auth_mode(self):
+        return 'pin' if self.pin is not None else 'password'
+
+    def snapshot(self):
+        """Privacy-safe configuration summary; never exposes PIN, password, or MAC/device_id."""
+        return {
+            'enabled': self.enabled,
+            'authenticated': True,
+            'authMode': self.auth_mode,
+            'requestedProfile': self.requested_profile,
+            'relayMode': self.relay_mode,
+            'shortFragment': self.short_fragment,
+            'videoRtpPort': self.video_rtp_port,
+            'audioRtpPort': self.audio_rtp_port,
+            'airplayPort': self.airplay_port,
+            'viewerPort': self.viewer_port,
+            'listenTimeoutS': self.listen_timeout_s,
+        }
+
+
+def validate_airplay_config(raw):
+    """Validate a raw dictionary into an authenticated AirPlayReceiverConfig."""
+    if isinstance(raw, AirPlayReceiverConfig):
+        return raw
+    if type(raw) is not dict or not set(raw).issubset(AIRPLAY_CONFIG_KEYS):
+        raise ValueError('AIRPLAY_CONFIG_SCHEMA')
+    return AirPlayReceiverConfig(**raw)
+
+
+def _read_private_json(path, *, limit=8192, expected_uid=None):
+    """Read and parse a 0600 private JSON file with no symlinks or hardlinks."""
+    target = Path(path)
+    uid = os.getuid() if expected_uid is None else expected_uid
+    lst = os.lstat(target)
+    if (
+        not stat.S_ISREG(lst.st_mode)
+        or lst.st_uid != uid
+        or lst.st_nlink != 1
+        or (lst.st_mode & 0o077) != 0
+        or not 0 < lst.st_size <= limit
+    ):
+        raise ValueError('PRIVATE_CONFIG_REQUIRED')
+    fd = os.open(target, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    try:
+        with os.fdopen(fd, 'rb') as handle:
+            fst = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(fst.st_mode)
+                or (fst.st_dev, fst.st_ino, fst.st_uid, fst.st_mode, fst.st_size)
+                != (lst.st_dev, lst.st_ino, lst.st_uid, lst.st_mode, lst.st_size)
+            ):
+                raise ValueError('PRIVATE_CONFIG_REQUIRED')
+            raw = handle.read(limit + 1)
+    except Exception:
+        raise
+    if len(raw) > limit:
+        raise ValueError('PRIVATE_CONFIG_REQUIRED')
+    return parse_json(raw, limit)
+
+
+def load_airplay_config(path=DEFAULT_AIRPLAY_CONFIG_PATH, *, expected_uid=None):
+    """Load and validate a 0600 private JSON AirPlay configuration file."""
+    doc = _read_private_json(path, limit=8192, expected_uid=expected_uid)
+    return validate_airplay_config(doc)
+
+
+def _valid_private_spark_ip(spark_ip):
+    try:
+        addr = ipaddress.IPv4Address(spark_ip)
+        return str(addr) == spark_ip and any(
+            addr in ipaddress.IPv4Network(net)
+            for net in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '192.0.2.0/24')
+        )
+    except (ValueError, TypeError):
+        return False
+
+
+def _apply_sock_deadline(sock, deadline, clock=time.monotonic):
+    if deadline is None:
+        return
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError('SSAP_DEADLINE_EXCEEDED')
+    settimeout = getattr(sock, 'settimeout', None)
+    if callable(settimeout):
+        settimeout(remaining)
+
+
+def _ws_send_frame(sock, opcode, raw, *, deadline=None, clock=time.monotonic):
+    _apply_sock_deadline(sock, deadline, clock)
+    mask = os.urandom(4)
+    header = bytearray([0x80 | (opcode & 0x0F)])
+    length = len(raw)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 65536 and (opcode & 0x08) == 0:
+        header.append(0x80 | 126)
+        header.extend(struct.pack('>H', length))
+    else:
+        raise ValueError('SSAP_FRAME_TOO_LARGE')
+    header.extend(mask)
+    masked = bytes(b ^ mask[i & 3] for i, b in enumerate(raw))
+    sock.sendall(bytes(header) + masked)
+
+
+def _ws_send_text(sock, text, *, deadline=None, clock=time.monotonic):
+    _ws_send_frame(sock, 0x1, text.encode('utf-8'), deadline=deadline, clock=clock)
+
+
+def _ws_send_pong(sock, payload=b'', *, deadline=None, clock=time.monotonic):
+    _ws_send_frame(sock, 0xA, bytes(payload), deadline=deadline, clock=clock)
+
+
+def _ws_recv_exact(sock, count, *, deadline=None, clock=time.monotonic):
+    buf = bytearray()
+    while len(buf) < count:
+        _apply_sock_deadline(sock, deadline, clock)
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise EOFError('SSAP_EOF')
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ws_recv_json(sock, max_bytes=16384, *, deadline=None, clock=time.monotonic, max_control_frames=8):
+    control_frames = 0
+    while True:
+        _apply_sock_deadline(sock, deadline, clock)
+        head = _ws_recv_exact(sock, 2, deadline=deadline, clock=clock)
+        opcode = head[0] & 0x0F
+        masked = bool(head[1] & 0x80)
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack('>H', _ws_recv_exact(sock, 2, deadline=deadline, clock=clock))[0]
+        elif length == 127:
+            raise ValueError('SSAP_FRAME_TOO_LARGE')
+        if length > max_bytes:
+            raise ValueError('SSAP_FRAME_TOO_LARGE')
+        mask = _ws_recv_exact(sock, 4, deadline=deadline, clock=clock) if masked else None
+        payload = _ws_recv_exact(sock, length, deadline=deadline, clock=clock)
+        if mask is not None:
+            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        if opcode == 0x8:
+            raise EOFError('SSAP_CLOSED')
+        if opcode in (0x9, 0xA):
+            if len(payload) > 125:
+                raise ValueError('SSAP_FRAME_TOO_LARGE')
+            control_frames += 1
+            if control_frames > max_control_frames:
+                raise ValueError('SSAP_CONTROL_FRAME_FLOOD')
+            if opcode == 0x9 and callable(getattr(sock, 'sendall', None)):
+                _ws_send_pong(sock, payload, deadline=deadline, clock=clock)
+            continue
+        if opcode != 0x1:
+            raise ValueError('SSAP_OPCODE')
+        _apply_sock_deadline(sock, deadline, clock)
+        return parse_json(payload, max_bytes)
+
+
+class PinnedSSAPTransport:
+    """Certificate-pinned, pairing-prompt-refusing SSAP launcher for the configured TV."""
+
+    def __init__(
+        self,
+        key_path=DEFAULT_SSAP_KEY_PATH,
+        pin_path=DEFAULT_SSAP_PIN_PATH,
+        *,
+        tv_ip=TV,
+        port=3001,
+        expected_uid=None,
+        session_factory=None,
+        clock=time.monotonic,
+    ):
+        if not _valid_private_spark_ip(tv_ip):
+            raise ValueError('SSAP_TV_IP')
+        if type(port) is not int or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError('SSAP_TV_PORT')
+        self.key_path = Path(key_path)
+        self.pin_path = Path(pin_path)
+        self.tv_ip = tv_ip
+        self.port = port
+        self.expected_uid = expected_uid
+        self.session_factory = session_factory
+        self.clock = clock
+
+    def validate_credentials(self):
+        key_doc = _read_private_json(self.key_path, limit=2048, expected_uid=self.expected_uid)
+        pin_doc = _read_private_json(self.pin_path, limit=2048, expected_uid=self.expected_uid)
+        if (
+            type(key_doc) is not dict
+            or set(key_doc) != {SSAP_CLIENT_KEY_FIELD}
+            or type(key_doc[SSAP_CLIENT_KEY_FIELD]) is not str
+            or not re.fullmatch(r'[a-f0-9]{32,128}', key_doc[SSAP_CLIENT_KEY_FIELD])
+        ):
+            raise ValueError('SSAP_KEY_CONFIG')
+        if (
+            type(pin_doc) is not dict
+            or set(pin_doc) != {'sha256'}
+            or type(pin_doc['sha256']) is not str
+            or not re.fullmatch(r'[a-f0-9]{64}', pin_doc['sha256'])
+        ):
+            raise ValueError('SSAP_PIN_CONFIG')
+        return key_doc[SSAP_CLIENT_KEY_FIELD], pin_doc['sha256']
+
+    @staticmethod
+    def _valid_launch_payload(payload):
+        if type(payload) is not dict:
+            return False
+        if payload == {'id': TV_HOME_APP_ID}:
+            return True
+        if set(payload) == {'id', 'params'} and payload.get('id') == TV_BROWSER_APP_ID:
+            params = payload.get('params')
+            target = params.get('contentTarget') if type(params) is dict and set(params) == {'contentTarget'} else None
+            return (
+                type(target) is str
+                and re.fullmatch(r'http://[0-9.]+:[0-9]{4,5}/[a-f0-9]{48}/viewer', target) is not None
+            )
+        return False
+
+    def request(self, uri, payload, *, timeout_s=3.0):
+        if uri != SSAP_LAUNCH_URI or not self._valid_launch_payload(payload):
+            raise ValueError('SSAP_REQUEST_FORBIDDEN')
+        if (
+            type(timeout_s) not in (int, float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or not 0 < timeout_s <= 10
+        ):
+            raise ValueError('SSAP_TIMEOUT')
+        launch_dispatched = False
+        raw_sock = None
+        tls_sock = None
+        try:
+            client_key, pin_sha256 = self.validate_credentials()
+            if self.session_factory is not None:
+                launch_dispatched = True
+                return self.session_factory(
+                    uri,
+                    payload,
+                    client_key=client_key,
+                    pin_sha256=pin_sha256,
+                    timeout_s=float(timeout_s),
+                )
+            deadline = self.clock() + float(timeout_s)
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise TimeoutError('SSAP_DEADLINE_EXCEEDED')
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            raw_sock = socket.create_connection((self.tv_ip, self.port), timeout=remaining)
+            _apply_sock_deadline(raw_sock, deadline, self.clock)
+            tls_sock = ctx.wrap_socket(raw_sock, server_hostname=self.tv_ip)
+            raw_sock = None
+            _apply_sock_deadline(tls_sock, deadline, self.clock)
+            peer_der = tls_sock.getpeercert(binary_form=True)
+            if not peer_der or hashlib.sha256(peer_der).hexdigest() != pin_sha256:
+                raise RuntimeError('TV_CERT_PIN_MISMATCH')
+            ws_key = base64.b64encode(os.urandom(16)).decode('ascii')
+            expected_accept = base64.b64encode(
+                hashlib.sha1((ws_key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()
+            ).decode('ascii')
+            handshake = (
+                f'GET / HTTP/1.1\r\n'
+                f'Host: {self.tv_ip}:{self.port}\r\n'
+                f'Upgrade: websocket\r\n'
+                f'Connection: Upgrade\r\n'
+                f'Sec-WebSocket-Key: {ws_key}\r\n'
+                f'Sec-WebSocket-Version: 13\r\n\r\n'
+            ).encode('ascii')
+            _apply_sock_deadline(tls_sock, deadline, self.clock)
+            tls_sock.sendall(handshake)
+            resp_buf = bytearray()
+            while b'\r\n\r\n' not in resp_buf:
+                if len(resp_buf) >= 4096:
+                    raise RuntimeError('SSAP_HANDSHAKE_FAILED')
+                _apply_sock_deadline(tls_sock, deadline, self.clock)
+                chunk = tls_sock.recv(1)
+                if not chunk:
+                    raise RuntimeError('SSAP_HANDSHAKE_EOF')
+                resp_buf.extend(chunk)
+            header_lines = resp_buf.decode('latin-1').split('\r\n\r\n', 1)[0].split('\r\n')
+            status_parts = header_lines[0].split(None, 2) if header_lines else []
+            accept_values = []
+            for raw_line in header_lines[1:]:
+                if ':' not in raw_line:
+                    continue
+                h_name, h_val = raw_line.split(':', 1)
+                if h_name.strip().lower() == 'sec-websocket-accept':
+                    accept_values.append(h_val.strip())
+            if (
+                len(status_parts) < 2
+                or status_parts[0].upper() != 'HTTP/1.1'
+                or status_parts[1] != '101'
+                or accept_values != [expected_accept]
+            ):
+                raise RuntimeError('SSAP_HANDSHAKE_REJECTED')
+            reg_msg = json.dumps(
+                {'id': 'reg', 'type': 'register', 'payload': {SSAP_CLIENT_KEY_FIELD: client_key}},
+                separators=(',', ':'),
+            )
+            _ws_send_text(tls_sock, reg_msg, deadline=deadline, clock=self.clock)
+            reg_reply = _ws_recv_json(tls_sock, deadline=deadline, clock=self.clock)
+            reg_payload = reg_reply.get('payload') if type(reg_reply) is dict else None
+            if (
+                type(reg_reply) is not dict
+                or reg_reply.get('type') != 'registered'
+                or (type(reg_payload) is dict and 'pairingType' in reg_payload)
+                or (type(reg_payload) is dict and reg_payload.get(SSAP_CLIENT_KEY_FIELD) not in (None, client_key))
+            ):
+                raise RuntimeError('SSAP_REGISTER_REFUSED')
+            req_msg = json.dumps(
+                {'id': 'launch', 'type': 'request', 'uri': uri, 'payload': payload},
+                separators=(',', ':'),
+            )
+            launch_dispatched = True
+            _ws_send_text(tls_sock, req_msg, deadline=deadline, clock=self.clock)
+            req_reply = _ws_recv_json(tls_sock, deadline=deadline, clock=self.clock)
+            _apply_sock_deadline(tls_sock, deadline, self.clock)
+            if type(req_reply) is not dict or req_reply.get('id') not in (None, 'launch'):
+                raise RuntimeError('SSAP_INVALID_RESPONSE')
+            reply_type = req_reply.get('type')
+            out = req_reply.get('payload')
+            if reply_type == 'error':
+                if out is None:
+                    return {'returnValue': False}
+                if type(out) is dict and out.get('returnValue') in (None, False):
+                    return dict(out, returnValue=False)
+                raise RuntimeError('SSAP_INVALID_RESPONSE')
+            if reply_type != 'response' or type(out) is not dict or type(out.get('returnValue')) is not bool:
+                raise RuntimeError('SSAP_INVALID_RESPONSE')
+            return out
+        except Exception as exc:
+            if not launch_dispatched:
+                try:
+                    exc._ssap_launch_unsent = True
+                except Exception:
+                    pass
+            raise
+        finally:
+            for s in (tls_sock, raw_sock):
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+
+
+class AirPlayTVHandoff:
+    """Bounded TV viewer launch (`com.webos.app.tinybrowser`) and Holly return (`local.owner.applibrary`).
+
+    Accepts either a `launch(payload, *, timeout_s=...)` callable or an SSAP
+    transport object providing `request(uri, payload, *, timeout_s=...)`.
+    Never logs or exposes capability tokens or viewer URLs in snapshots.
+    """
+
+    def __init__(
+        self,
+        launch=None,
+        *,
+        transport=None,
+        spark_ip=SPARK,
+        viewer_port=PORT,
+        timeout_s=3.0,
+        clock=time.monotonic,
+    ):
+        if not _valid_private_spark_ip(spark_ip):
+            raise ValueError('AIRPLAY_TV_SPARK_IP')
+        if type(viewer_port) is not int or isinstance(viewer_port, bool) or not 1024 <= viewer_port <= 65535:
+            raise ValueError('AIRPLAY_TV_VIEWER_PORT')
+        if (
+            type(timeout_s) not in (int, float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or not 0 < timeout_s <= 10
+        ):
+            raise ValueError('AIRPLAY_TV_TIMEOUT')
+        if launch is not None and not callable(launch) and transport is None:
+            if hasattr(launch, 'request') and callable(launch.request):
+                transport = launch
+                launch = None
+        if launch is None and transport is not None:
+            req_fn = getattr(transport, 'request', None)
+            if not callable(req_fn):
+                raise ValueError('AIRPLAY_TV_TRANSPORT')
+            launch = lambda payload, timeout_s=timeout_s: req_fn(SSAP_LAUNCH_URI, payload, timeout_s=timeout_s)
+        if not callable(launch):
+            raise ValueError('AIRPLAY_TV_LAUNCH')
+        self._launch = launch
+        self.transport = transport
+        self.spark_ip = spark_ip
+        self.viewer_port = viewer_port
+        self.timeout_s = float(timeout_s)
+        self.clock = clock
+        self._viewer_pattern = re.compile(
+            r'http://%s:%d/[a-f0-9]{48}/viewer' % (re.escape(spark_ip), viewer_port)
+        )
+        self.lock = threading.RLock()
+        self._tokens_by_epoch = {}
+        self._epoch_order = {}
+        self._attempted_open_epochs = set()
+        self._opened_epochs = set()
+        self._ambiguous_open_epochs = set()
+        self._torn_down_epochs = set()
+        self._reconciled_epochs = set()
+        self.open_count = 0
+        self.teardown_count = 0
+        self.last_open_status = None
+        self.last_teardown_status = None
+        self.last_teardown_reason = None
+        self.last_codec = None
+        self.last_profile = None
+
+    def _track_epoch(self, epoch):
+        if epoch in self._epoch_order:
+            return
+        while len(self._epoch_order) >= 64:
+            evict = next(
+                (
+                    old
+                    for old in self._epoch_order
+                    if old in self._reconciled_epochs
+                    or (old not in self._opened_epochs and old not in self._ambiguous_open_epochs)
+                ),
+                next(iter(self._epoch_order)),
+            )
+            self._epoch_order.pop(evict, None)
+            self._tokens_by_epoch.pop(evict, None)
+            self._attempted_open_epochs.discard(evict)
+            self._opened_epochs.discard(evict)
+            self._ambiguous_open_epochs.discard(evict)
+            self._torn_down_epochs.discard(evict)
+            self._reconciled_epochs.discard(evict)
+        self._epoch_order[epoch] = None
+
+    def bind_viewer(self, epoch, token):
+        """Bind a 32-hex media epoch to its 48-hex viewer capability token."""
+        if type(epoch) is not str or not re.fullmatch(r'[a-f0-9]{32}', epoch):
+            raise ValueError('AIRPLAY_EPOCH')
+        if type(token) is not str or not re.fullmatch(r'[a-f0-9]{48}', token):
+            raise ValueError('AIRPLAY_VIEWER_TOKEN')
+        with self.lock:
+            self._track_epoch(epoch)
+            if epoch not in self._tokens_by_epoch and len(self._tokens_by_epoch) >= 64:
+                self._tokens_by_epoch.pop(next(iter(self._tokens_by_epoch)), None)
+            self._tokens_by_epoch[epoch] = token
+            return f'http://{self.spark_ip}:{self.viewer_port}/{token}/viewer'
+
+    def unbind_viewer(self, epoch):
+        """Retire a viewer token binding without launching Home on the TV."""
+        with self.lock:
+            return self._tokens_by_epoch.pop(epoch, None)
+
+    def viewer_url_for(self, epoch):
+        with self.lock:
+            token = self._tokens_by_epoch.get(epoch)
+            if token is None:
+                return None
+            return f'http://{self.spark_ip}:{self.viewer_port}/{token}/viewer'
+
+    def was_opened(self, epoch):
+        with self.lock:
+            return epoch in self._opened_epochs
+
+    def was_open_ambiguous(self, epoch):
+        with self.lock:
+            return epoch in self._ambiguous_open_epochs
+
+    def needs_teardown(self, epoch):
+        with self.lock:
+            return (
+                epoch in self._opened_epochs or epoch in self._ambiguous_open_epochs
+            ) and epoch not in self._torn_down_epochs
+
+    def is_reconciled(self, epoch):
+        with self.lock:
+            if epoch not in self._opened_epochs and epoch not in self._ambiguous_open_epochs:
+                return True
+            return epoch in self._reconciled_epochs
+
+    def was_torn_down(self, epoch):
+        with self.lock:
+            return epoch in self._torn_down_epochs
+
+    def _call_launch(self, payload, *, unsent_status='unknown'):
+        deadline = self.clock() + self.timeout_s
+        remaining = max(0.001, deadline - self.clock())
+        try:
+            sig = inspect.signature(self._launch)
+            accepts_timeout = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD or p.name == 'timeout_s'
+                for p in sig.parameters.values()
+            )
+        except (ValueError, TypeError):
+            accepts_timeout = True
+        try:
+            if accepts_timeout:
+                reply = self._launch(payload, timeout_s=remaining)
+            else:
+                reply = self._launch(payload)
+        except Exception as exc:
+            if getattr(exc, '_ssap_launch_unsent', False):
+                return unsent_status
+            return 'unknown'
+        if self.clock() > deadline:
+            return 'unknown'
+        if type(reply) is dict and reply.get('returnValue') is True:
+            return 'accepted'
+        if type(reply) is dict and reply.get('returnValue') is False:
+            return 'rejected'
+        return 'unknown'
+
+    def on_tv_open(self, *, epoch, codec, profile, viewer_url=None):
+        """Launch `com.webos.app.tinybrowser` on the TV for the active AirPlay viewer."""
+        if type(epoch) is not str or not re.fullmatch(r'[a-f0-9]{32}', epoch):
+            raise ValueError('AIRPLAY_EPOCH')
+        profile_obj = profile_for_name(profile)
+        if codec != profile_obj.codec_string:
+            raise ValueError('AIRPLAY_CODEC_MISMATCH')
+        with self.lock:
+            if epoch in self._attempted_open_epochs or epoch in self._torn_down_epochs:
+                return 'rejected'
+            target_url = viewer_url or self.viewer_url_for(epoch)
+            if type(target_url) is not str or not self._viewer_pattern.fullmatch(target_url):
+                raise ValueError('AIRPLAY_VIEWER_URL')
+            self._track_epoch(epoch)
+            self._attempted_open_epochs.add(epoch)
+            payload = {
+                'id': TV_BROWSER_APP_ID,
+                'params': {'contentTarget': target_url},
+            }
+            status = self._call_launch(payload, unsent_status='rejected')
+            if status == 'accepted':
+                self._opened_epochs.add(epoch)
+            elif status == 'unknown':
+                self._ambiguous_open_epochs.add(epoch)
+            self.open_count += 1
+            self.last_open_status = status
+            self.last_codec = codec
+            self.last_profile = profile
+            return status
+
+    def on_tv_teardown(self, *, epoch, reason):
+        """Return the TV to `local.owner.applibrary` (Holly Home) once when the session closes."""
+        if type(epoch) is not str or not re.fullmatch(r'[a-f0-9]{32}', epoch):
+            raise ValueError('AIRPLAY_EPOCH')
+        if type(reason) is not str or reason not in (
+            'teardown',
+            'viewer-hidden',
+            'sender-disconnected',
+            'error',
+            'owner-ended',
+        ):
+            raise ValueError('AIRPLAY_CLOSE_REASON')
+        with self.lock:
+            if epoch in self._torn_down_epochs:
+                return 'rejected'
+            self._track_epoch(epoch)
+            self._torn_down_epochs.add(epoch)
+            self._tokens_by_epoch.pop(epoch, None)
+            if reason == 'viewer-hidden':
+                self._reconciled_epochs.add(epoch)
+                self.last_teardown_status = 'suppressed'
+                self.last_teardown_reason = reason
+                return 'suppressed'
+            payload = {'id': TV_HOME_APP_ID}
+            status = self._call_launch(payload)
+            if status == 'accepted':
+                self._reconciled_epochs.add(epoch)
+            self.teardown_count += 1
+            self.last_teardown_status = status
+            self.last_teardown_reason = reason
+            return status
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                'openCount': self.open_count,
+                'teardownCount': self.teardown_count,
+                'lastOpenStatus': self.last_open_status,
+                'lastTeardownStatus': self.last_teardown_status,
+                'lastTeardownReason': self.last_teardown_reason,
+                'lastCodec': self.last_codec,
+                'lastProfile': self.last_profile,
+            }
+
+
+def _tune_stream_socket(sock):
+    sock.settimeout(STREAM_SOCKET_TIMEOUT)
+    for level, name, value in (
+        (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+        (socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT, STREAM_NOTSENT_LOWAT),
+        (socket.IPPROTO_IP, socket.IP_TOS, STREAM_TOS),
+    ):
+        try:
+            sock.setsockopt(level, name, value)
+        except OSError:
+            pass
+
+
+def _route_viewer_request(peer, method, path, headers, token, *, spark_ip=None, tv_ip=None, viewer_port=None):
+    effective_spark = SPARK if spark_ip is None else spark_ip
+    effective_tv = TV if tv_ip is None else tv_ip
+    effective_port = PORT if viewer_port is None else viewer_port
+    expected_host = f'{effective_spark}:{effective_port}'
+    expected_origin = f'http://{effective_spark}:{effective_port}'
+    for key in (
+        'Host',
+        'Origin',
+        'Content-Type',
+        'Content-Length',
+        'Transfer-Encoding',
+        'Expect',
+        'X-R2D2-Media-Epoch',
+        'X-R2D2-Media-Generation',
+    ):
+        if len(headers.get_all(key, [])) > 1:
+            return None
+    if peer not in (effective_spark, effective_tv) or headers.get('Host') != expected_host:
+        return None
+    if (
+        headers.get('Origin') not in (None, expected_origin)
+        or headers.get('Transfer-Encoding') is not None
+        or headers.get('Expect') is not None
+    ):
+        return None
+    match = re.fullmatch(
+        r'/([a-f0-9]{48})/(viewer|stream\.mp4|stream-state|stream-open|stream-ready|metrics|input|end)',
+        path,
+    )
+    if not match or not hmac.compare_digest(match[1], token):
+        return None
+    route = match[2]
+    expected_method = 'GET' if route in ('viewer', 'stream.mp4', 'stream-state') else 'POST'
+    if peer != effective_tv or method != expected_method:
+        return None
+    if method == 'GET' and headers.get('Content-Length') not in (None, '0'):
+        return None
+    return route
+
+
+def _build_airplay_viewer_html(token, *, codec, bind_address=None, viewer_port=None):
+    raw = build_viewer_html(
+        token,
+        codec=codec,
+        history_enabled=False,
+        tabs_enabled=False,
+        text_enabled=False,
+        audio_enabled=True,
+        layout_enabled=True,
+        fixed_viewport=True,
+        ring_enabled=True,
+        transport='mse',
+    )
+    effective_spark = SPARK if bind_address is None else bind_address
+    effective_port = PORT if viewer_port is None else viewer_port
+    expected_origin = f'http://{effective_spark}:{effective_port}'
+    html = raw.decode('utf-8')
+    script_start = html.index('<script>') + len('<script>')
+    script_end = html.rindex('</script>')
+    old_script = html[script_start:script_end]
+    old_guard = f"location.origin!=='{ORIGIN}'"
+    if old_guard not in old_script:
+        raise ValueError('VIEWER_ORIGIN_GUARD')
+    new_script = old_script.replace(old_guard, f"location.origin!=='{expected_origin}'", 1)
+    new_script = new_script.replace('\n  toolbarFocus(address);\n', '\n  pageFocus();\n', 1)
+    old_digest = base64.b64encode(hashlib.sha256(old_script.encode('utf-8')).digest()).decode('ascii')
+    new_digest = base64.b64encode(hashlib.sha256(new_script.encode('utf-8')).digest()).decode('ascii')
+    prefix = (
+        html[:script_start]
+        .replace(f"script-src 'sha256-{old_digest}'", f"script-src 'sha256-{new_digest}'", 1)
+        .replace('<body>', '<body class="page-mode">', 1)
+    )
+    updated = prefix + new_script + html[script_end:]
+    return updated.encode('utf-8')
+
+
+class AirPlayViewerHost:
+    """Hosts the MSE viewer page and MediaStream HTTP endpoints for one AirPlayRelaySession."""
+
+    def __init__(
+        self,
+        session,
+        token=None,
+        *,
+        bind_address=None,
+        viewer_port=None,
+        tv_address=None,
+        max_duration_s=315360000,
+        heartbeat_timeout_s=15.0,
+        clock=time.monotonic,
+    ):
+        if not isinstance(session, AirPlayRelaySession):
+            raise ValueError('AIRPLAY_SESSION_REQUIRED')
+        token = secrets.token_hex(24) if token is None else token
+        if type(token) is not str or not re.fullmatch(r'[a-f0-9]{48}', token):
+            raise ValueError('AIRPLAY_VIEWER_TOKEN')
+        if bind_address is not None and not (_valid_private_spark_ip(bind_address) or bind_address == '127.0.0.1'):
+            raise ValueError('AIRPLAY_BIND_ADDRESS')
+        if viewer_port is not None and (
+            type(viewer_port) is not int or isinstance(viewer_port, bool) or not 1024 <= viewer_port <= 65535
+        ):
+            raise ValueError('AIRPLAY_VIEWER_PORT')
+        if (
+            type(max_duration_s) not in (int, float)
+            or isinstance(max_duration_s, bool)
+            or not math.isfinite(max_duration_s)
+            or not 0 < max_duration_s <= 315360000
+        ):
+            raise ValueError('AIRPLAY_VIEWER_DURATION')
+        if (
+            type(heartbeat_timeout_s) not in (int, float)
+            or isinstance(heartbeat_timeout_s, bool)
+            or not math.isfinite(heartbeat_timeout_s)
+            or not 0 < heartbeat_timeout_s <= 86400
+        ):
+            raise ValueError('AIRPLAY_HEARTBEAT_TIMEOUT')
+        self.session = session
+        self.token = token
+        self.bind_address = bind_address
+        self.viewer_port = viewer_port
+        self.tv_address = tv_address
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.stop = threading.Event()
+        self.deadline = self.clock() + float(max_duration_s)
+        self.heartbeat_timeout_s = float(heartbeat_timeout_s)
+        self.get_budget = Budget(12, 10**9)
+        self.metric_budget = Budget(4, 10**9)
+        self.metrics = []
+        self.metrics_total = 0
+        self.handoff_at = self.clock() if session.tv_opened else None
+        self.last_viewer_heartbeat = None
+        self.close_reason = None
+        self._codec = session.requested_profile.codec_string
+        self._viewer = _build_airplay_viewer_html(
+            self.token,
+            codec=self._codec,
+            bind_address=self.bind_address,
+            viewer_port=self.viewer_port,
+        )
+        self.media_stream = MediaStream(
+            lambda: None,
+            lambda _e, _n: b'',
+            lambda _e: None,
+            self.capture_allowed,
+            clock=clock,
+            epoch=session.ring.epoch,
+            ring=session.ring,
+        )
+        with self.media_stream.cv:
+            self.media_stream.started = True
+        session.bind_media_stream(self.media_stream, on_profile=self.set_codec)
+        session.bind_viewer_host(self)
+        self._watchdog_thread = threading.Thread(
+            target=self._supervise_deadline,
+            name='airplay-viewer-deadline',
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _supervise_deadline(self):
+        while not self.stop.is_set() and not self.session.closed:
+            if self.session._check_stop_requested() or not self.capture_allowed():
+                break
+            self.stop.wait(0.02)
+
+    def note_tv_open(self):
+        with self.lock:
+            if self.handoff_at is None:
+                self.handoff_at = self.clock()
+
+    def viewer_expired(self):
+        with self.lock:
+            anchor = self.last_viewer_heartbeat if self.last_viewer_heartbeat is not None else self.handoff_at
+            return anchor is not None and (self.clock() - anchor) >= self.heartbeat_timeout_s
+
+    def set_codec(self, codec):
+        with self.lock:
+            if codec != self._codec:
+                self._codec = codec
+                self._viewer = _build_airplay_viewer_html(
+                    self.token,
+                    codec=codec,
+                    bind_address=self.bind_address,
+                    viewer_port=self.viewer_port,
+                )
+
+    def viewer_bytes(self):
+        with self.lock:
+            return self._viewer
+
+    def capture_allowed(self):
+        if self.stop.is_set() or self.session.closed or self.session._stop_requested:
+            return False
+        if self.clock() >= self.deadline:
+            self.request_stop('deadline-expired')
+            return False
+        if self.viewer_expired():
+            self.request_stop('viewer-heartbeat-lost')
+            return False
+        return True
+
+    def media_open(self, body):
+        if not self.capture_allowed():
+            raise StreamError('STARTUP_NOT_PROVED')
+        return self.media_stream.open(body)
+
+    def request_stop(self, reason='viewer-ended'):
+        with self.lock:
+            if self.close_reason is None:
+                self.close_reason = reason
+            effective_reason = self.close_reason
+        self.stop.set()
+        self.media_stream.cancel.set()
+        with self.media_stream.cv:
+            self.media_stream.finished = True
+            self.media_stream.ready = False
+            self.media_stream.cv.notify_all()
+        if not self.session.closed:
+            if effective_reason == 'viewer-hidden':
+                close_reason = 'viewer-hidden'
+            elif effective_reason == 'viewer-ended':
+                close_reason = 'teardown'
+            else:
+                close_reason = 'owner-ended'
+            self.session.close(close_reason)
+
+    def close(self):
+        self.request_stop('owner-ended')
+        return self.media_stream.close(timeout=1)
+
+
+def airplay_viewer_handler_for(host_or_getter):
+    """Build a bounded HTTP handler serving viewer, stream-state, stream-open, stream-ready, stream.mp4, metrics, end."""
+
+    def _resolve_host():
+        return host_or_getter() if callable(host_or_getter) else host_or_getter
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *_args):
+            pass
+
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2)
+
+        def handle_expect_100(self):
+            self.reply(417)
+            return False
+
+        def _route(self, host):
+            if host is None or not host.capture_allowed():
+                return None
+            return _route_viewer_request(
+                self.client_address[0],
+                self.command,
+                self.path,
+                self.headers,
+                host.token,
+                spark_ip=host.bind_address,
+                tv_ip=host.tv_address,
+                viewer_port=host.viewer_port,
+            )
+
+        def reply(self, code, data=b'', kind='application/json'):
+            self.close_connection = True
+            self.send_response(code)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(data)
+            self.wfile.flush()
+
+        def do_GET(self):
+            host = _resolve_host()
+            route = self._route(host)
+            if route is None or route not in ('viewer', 'stream-state', 'stream.mp4'):
+                return self.reply(404)
+            if not host.get_budget.take():
+                return self.reply(429)
+            if route == 'stream-state':
+                return self.reply(200, json.dumps(host.media_stream.state(), separators=(',', ':')).encode())
+            if route == 'viewer':
+                return self.reply(200, host.viewer_bytes(), 'text/html; charset=utf-8')
+            identity = header_identity(self.headers)
+            try:
+                reservation = host.media_stream.attach(identity)
+            except (StreamError, mr.MediaError):
+                return self.reply(409)
+            generation = identity['generation']
+            cursor = reservation.cursor
+            _tune_stream_socket(self.connection)
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+
+                def send(data, write_deadline):
+                    for offset in range(0, len(data), 65536):
+                        if not host.capture_allowed() or host.clock() >= write_deadline:
+                            raise StreamError('OWNER_OR_VIEWER_LOST_OR_SLOW_CONSUMER')
+                        part = memoryview(data)[offset:offset + 65536]
+                        if host.clock() >= write_deadline:
+                            raise StreamError('SLOW_CONSUMER')
+                        self.wfile.write(b''.join((('%x\r\n' % len(part)).encode(), part, b'\r\n')))
+                    if host.clock() >= write_deadline:
+                        raise StreamError('SLOW_CONSUMER')
+                    self.wfile.flush()
+
+                send(reservation.init, host.clock() + 2)
+                reservation = None
+                while host.capture_allowed():
+                    try:
+                        value = host.media_stream.next(generation, cursor)
+                    except mr.Lagged:
+                        jumped = host.media_stream.skip_to_latest(generation, cursor)
+                        if jumped is None:
+                            raise
+                        cursor = jumped
+                        continue
+                    if value is None:
+                        self.wfile.write(b'0\r\n\r\n')
+                        break
+                    fragment, next_cursor = value
+                    if host.media_stream.behind(fragment) > STREAM_MAX_BEHIND:
+                        jumped = host.media_stream.skip_to_latest(generation, next_cursor)
+                        if jumped is not None:
+                            cursor = jumped
+                            fragment = value = None
+                            continue
+                    cursor = next_cursor
+                    write_deadline = host.clock() + 4
+                    send(fragment.moof, write_deadline)
+                    send(fragment.mdat, write_deadline)
+                    fragment = value = None
+            except (OSError, ValueError, RuntimeError, TimeoutError):
+                pass
+            finally:
+                self.close_connection = True
+                host.media_stream.detach(generation)
+
+        def do_POST(self):
+            host = _resolve_host()
+            route = self._route(host)
+            if route is None or route not in ('stream-open', 'stream-ready', 'metrics', 'end', 'input'):
+                return self.reply(404)
+            if self.headers.get('Content-Type') != 'application/json':
+                return self.reply(415)
+            raw_length = self.headers.get('Content-Length', '')
+            if not raw_length.isascii() or not raw_length.isdecimal() or len(raw_length) > 5 or not 0 < int(raw_length) <= 2048:
+                return self.reply(413)
+            try:
+                raw = self.rfile.read(int(raw_length))
+                if len(raw) != int(raw_length):
+                    return self.reply(400)
+                body = parse_json(raw, 2048)
+            except (ValueError, OSError, RecursionError):
+                return self.reply(400)
+            if route in ('stream-open', 'stream-ready'):
+                if not host.get_budget.take():
+                    return self.reply(429)
+                if route == 'stream-ready':
+                    return self.reply(200, b'{"ok":true}') if host.media_stream.mark_ready(body) else self.reply(409)
+                try:
+                    value = host.media_open(body)
+                except (StreamError, mr.MediaError):
+                    return self.reply(409)
+                return self.reply(200, json.dumps(value, separators=(',', ':')).encode())
+            if route == 'metrics':
+                if not valid_metrics(body, host.token, 'mse'):
+                    return self.reply(400)
+                if not host.metric_budget.take():
+                    return self.reply(429)
+                stop_reason = None
+                if body['final']:
+                    stop_reason = 'viewer-hidden' if body.get('error') == 'PAGE_HIDDEN' else 'viewer-ended'
+                with host.lock:
+                    host.metrics.append({k: v for k, v in body.items() if k != 'token'})
+                    host.metrics = host.metrics[-128:]
+                    host.metrics_total += 1
+                    host.last_viewer_heartbeat = host.clock()
+                    if stop_reason is not None and host.close_reason is None:
+                        host.close_reason = stop_reason
+                try:
+                    self.reply(200, b'{"ok":true}')
+                finally:
+                    if stop_reason is not None:
+                        host.request_stop(stop_reason)
+                return
+            if route == 'end':
+                if body != {}:
+                    return self.reply(400)
+                with host.lock:
+                    if host.close_reason is None:
+                        host.close_reason = 'viewer-ended'
+                try:
+                    self.reply(200, b'{"ok":true}')
+                finally:
+                    host.request_stop('viewer-ended')
+                return
+            return self.reply(409)
+
+    return Handler
+
+
+class AirPlayViewerServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    """Bounded HTTP/1.1 viewer server restricted to SPARK and TV peers."""
+
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 4
+    allow_reuse_address = True
+    allow_reuse_port = False
+
+    def __init__(self, address, handler, *, allowed_peers=None):
+        self.slots = threading.BoundedSemaphore(6)
+        self.active = set()
+        self.active_lock = threading.Lock()
+        self.allowed_peers = None if allowed_peers is None else frozenset(allowed_peers)
+        super().__init__(address, handler)
+
+    def verify_request(self, request, address):
+        peers = (SPARK, TV) if self.allowed_peers is None else self.allowed_peers
+        return address[0] in peers
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(False):
+            self.shutdown_request(request)
+            return
+        with self.active_lock:
+            self.active.add(request)
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            with self.active_lock:
+                self.active.discard(request)
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            with self.active_lock:
+                self.active.discard(request)
+            self.slots.release()
+
+    def handle_error(self, request, address):
+        pass
+
+    def close_connections(self):
+        with self.active_lock:
+            for connection in list(self.active):
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+
+class _SessionRingView:
+    """Routes Producer.step() init, fragment, and EOF callbacks through AirPlayRelaySession."""
+    def __init__(self, session):
+        object.__setattr__(self, 'session', session)
+
+    @property
+    def lock(self):
+        return self.session.ring.lock
+
+    def initialize(self, ftyp, moov):
+        return self.session.ingest_init(ftyp, moov)
+
+    def _append(self, moof, mdat, terminal_candidate):
+        return self.session.ingest_fragment(moof, mdat, _terminal_candidate=terminal_candidate)
+
+    def _finish_eof(self):
+        with self.session.lock:
+            mr.require(not self.session.closed, 'SESSION_CLOSED')
+            self.session.ring._finish_eof()
+            self.session._maybe_notify_tv_open()
+            streams = list(self.session._media_streams)
+        for ms in streams:
+            with ms.cv:
+                ms.finished = True
+                ms.cv.notify_all()
+
+    def __getattr__(self, name):
+        return getattr(self.session.ring, name)
+
+    def __setattr__(self, name, value):
+        setattr(self.session.ring, name, value)
+
+
+class AirPlayRelaySession:
+    """Manages one private Spark AirPlay receiver -> MediaRing -> TV MSE session.
+
+    - Supports both 4K60 (`hvc1.1.6.L153.B0`, 1500-tick frame duration) and
+      4K120 (`hvc1.1.6.L156.B0`, 750-tick frame duration).
+    - Auto-detects the actual negotiated HEVC level (L5.1 vs L5.2) from the
+      sender's fMP4 init segment (`ftyp` + `moov`) without rewriting media bytes.
+    - Triggers `tv_open_callback` once upon the first published IDR checkpoint
+      and `tv_teardown_callback` once when the session closes, strictly serialized
+      under `self.lock` so a racing `close()` can never be followed by a late open.
+    """
+
+    def __init__(
+        self,
+        epoch,
+        *,
+        uxplay_bin='uxplay',
+        requested_profile='4k60_hevc',
+        relay_mode='b2',
+        short_fragment=True,
+        receiver_name=DEFAULT_RECEIVER_NAME,
+        video_rtp_port=DEFAULT_VIDEO_RTP_PORT,
+        audio_rtp_port=DEFAULT_AUDIO_RTP_PORT,
+        airplay_port=DEFAULT_AIRPLAY_PORT,
+        pin=None,
+        password=None,
+        device_id=None,
+        fps_data=False,
+        listen_timeout_s=DEFAULT_SDP_TIMEOUT_S,
+        require_auth=False,
+        tv_open_callback=None,
+        tv_teardown_callback=None,
+        clock=time.monotonic,
+    ):
+        if relay_mode not in ('b1', 'b2'):
+            raise ValueError('AIRPLAY_RELAY_MODE')
+        if type(require_auth) is not bool:
+            raise ValueError('AIRPLAY_AUTH_FLAG')
+        if require_auth and pin is None and password is None:
+            raise ValueError('AIRPLAY_AUTH_REQUIRED')
+        if tv_open_callback is not None and not callable(tv_open_callback):
+            raise ValueError('AIRPLAY_OPEN_CALLBACK')
+        if tv_teardown_callback is not None and not callable(tv_teardown_callback):
+            raise ValueError('AIRPLAY_TEARDOWN_CALLBACK')
+
+        self.requested_profile = profile_for_name(requested_profile)
+        self.active_profile = None
+        self.relay_mode = relay_mode
+        self.short_fragment = short_fragment
+        self.listen_timeout_s = listen_timeout_s
+        self.authenticated = pin is not None or password is not None
+        self.sdp_bytes = build_loopback_sdp(
+            video_rtp_port=video_rtp_port,
+            audio_rtp_port=audio_rtp_port,
+        )
+        self.uxplay_command = build_uxplay_command(
+            uxplay_bin=uxplay_bin,
+            profile_name=self.requested_profile.name,
+            receiver_name=receiver_name,
+            video_rtp_port=video_rtp_port,
+            audio_rtp_port=audio_rtp_port,
+            airplay_port=airplay_port,
+            pin=pin,
+            password=password,
+            device_id=device_id,
+            fps_data=fps_data,
+        )
+        self.ffmpeg_command = (
+            build_remux_command(
+                video_rtp_port=video_rtp_port,
+                audio_rtp_port=audio_rtp_port,
+                short_fragment=short_fragment,
+                listen_timeout_s=listen_timeout_s,
+            )
+            if relay_mode == 'b1'
+            else build_reencode_command(
+                profile_name=self.requested_profile.name,
+                video_rtp_port=video_rtp_port,
+                audio_rtp_port=audio_rtp_port,
+                short_fragment=short_fragment,
+                listen_timeout_s=listen_timeout_s,
+            )
+        )
+        self.ring = mr.MediaRing(
+            epoch,
+            clock=clock,
+            short_fragment=short_fragment,
+            allow_level_156=True,
+        )
+        self._tv_open_callback = tv_open_callback
+        self._tv_teardown_callback = tv_teardown_callback
+        self._probe_proc = None
+        self._uxplay_proc = None
+        self._ffmpeg_proc = None
+        self._ffmpeg_fd = None
+        self._terminate_fn = None
+        self._process_owner = None
+        self._media_streams = []
+        self._viewer_hosts = []
+        self._profile_callbacks = []
+        self.tv_opened = False
+        self.closed = False
+        self.close_reason = None
+        self._stop_requested = False
+        self._stop_reason = None
+        self.lock = threading.RLock()
+        self._probe_io_lock = threading.Lock()
+        self._probe_io_owner = None
+        self._ffmpeg_io_lock = threading.Lock()
+        self._ffmpeg_io_owner = None
+        self._at_step_boundary = True
+
+    def bind_process_owner(self, owner):
+        """Attach a session process owner for signal-safe stop propagation and RPC bounding."""
+        self._process_owner = owner
+        if owner is not None and (self._stop_requested or self.closed):
+            stop_fn = getattr(owner, 'request_stop', None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+
+    def request_stop(self, reason='owner-ended'):
+        """Signal-safe non-blocking stop request that defers lock-acquiring cleanup."""
+        if self._stop_reason is None:
+            self._stop_reason = reason
+        self._stop_requested = True
+        owner = self._process_owner
+        if owner is not None:
+            stop_fn = getattr(owner, 'request_stop', None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+
+    def _check_stop_requested(self):
+        if self.closed:
+            return True
+        if self._stop_requested:
+            self.close(self._stop_reason or 'owner-ended')
+            return True
+        return False
+
+    def bind_media_stream(self, media_stream, *, on_profile=None):
+        """Attach a MediaStream consumer view to this session's MediaRing."""
+        with self.lock:
+            if media_stream not in self._media_streams:
+                self._media_streams.append(media_stream)
+            if callable(on_profile) and on_profile not in self._profile_callbacks:
+                self._profile_callbacks.append(on_profile)
+
+    def bind_viewer_host(self, host):
+        """Attach an AirPlayViewerHost so session lifecycle respects viewer deadlines."""
+        with self.lock:
+            if host not in self._viewer_hosts:
+                self._viewer_hosts.append(host)
+
+    def _check_viewer_deadlines(self):
+        if self._check_stop_requested():
+            return False
+        with self.lock:
+            if self.closed:
+                return False
+            hosts = list(self._viewer_hosts)
+        for host in hosts:
+            if not host.capture_allowed():
+                return False
+        return not self._check_stop_requested()
+
+    @staticmethod
+    def _reap_process(proc, terminate=None, *, io_lock=None, io_owner=None):
+        if proc is None:
+            return
+        try:
+            if callable(terminate):
+                terminate(proc)
+            elif hasattr(proc, 'terminate'):
+                poll_fn = getattr(proc, 'poll', None)
+                if not callable(poll_fn) or poll_fn() is None:
+                    proc.terminate()
+        except Exception:
+            pass
+        stdin = getattr(proc, 'stdin', None)
+        if stdin is not None and hasattr(stdin, 'close'):
+            try:
+                stdin.close()
+            except Exception:
+                pass
+        wait_fn = getattr(proc, 'wait', None)
+        if callable(wait_fn):
+            try:
+                wait_fn(timeout=2)
+            except Exception:
+                kill_fn = getattr(proc, 'kill', None)
+                if callable(kill_fn):
+                    try:
+                        kill_fn()
+                    except Exception:
+                        pass
+                try:
+                    wait_fn(timeout=1)
+                except Exception:
+                    pass
+
+        def _close_streams():
+            for stream_name in ('stdout', 'stderr'):
+                stream = getattr(proc, stream_name, None)
+                if stream is not None and hasattr(stream, 'close'):
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+        if io_lock is not None:
+            if io_owner is not None and io_owner == threading.get_ident():
+                return
+            with io_lock:
+                _close_streams()
+        else:
+            _close_streams()
+
+    def _stop_processes(self):
+        with self.lock:
+            probe_proc, self._probe_proc = self._probe_proc, None
+            uxplay_proc, self._uxplay_proc = self._uxplay_proc, None
+            ffmpeg_proc, self._ffmpeg_proc = self._ffmpeg_proc, None
+            self._ffmpeg_fd = None
+            terminate = self._terminate_fn
+            owner = self._process_owner
+        # Normal sender/viewer teardown still needs the supervisor's full
+        # cleanup grace. Only explicit cancellation requests the short RPC cap.
+        if owner is not None and self._stop_requested:
+            stop_fn = getattr(owner, 'request_stop', None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+        self._reap_process(
+            probe_proc,
+            terminate=terminate,
+            io_lock=self._probe_io_lock,
+            io_owner=self._probe_io_owner,
+        )
+        self._reap_process(uxplay_proc, terminate=terminate)
+        self._reap_process(
+            ffmpeg_proc,
+            terminate=terminate,
+            io_lock=self._ffmpeg_io_lock,
+            io_owner=self._ffmpeg_io_owner,
+        )
+
+    def _maybe_notify_tv_open(self):
+        snap = self.ring.snapshot()
+        if snap['avBootstrapSeen'] and not self.tv_opened:
+            profile = self.active_profile or self.requested_profile
+            for cb in list(self._profile_callbacks):
+                cb(profile.codec_string)
+            if self._tv_open_callback is not None:
+                self._tv_open_callback(
+                    epoch=self.ring.epoch,
+                    codec=profile.codec_string,
+                    profile=profile.name,
+                )
+            self.tv_opened = True
+            for host in list(self._viewer_hosts):
+                host.note_tv_open()
+
+    def ingest_init(self, ftyp, moov):
+        """Validate init segment, detect 4K60 vs 4K120 profile, and initialize ring."""
+        with self.lock:
+            mr.require(not self.closed and not self._stop_requested, 'SESSION_CLOSED')
+            detected = inspect_init_profile(ftyp, moov)
+            self.ring.initialize(ftyp, moov)
+            self.active_profile = detected
+            self._at_step_boundary = True
+            callbacks = list(self._profile_callbacks)
+            streams = list(self._media_streams)
+        for cb in callbacks:
+            cb(detected.codec_string)
+        for ms in streams:
+            with ms.cv:
+                ms.total = min(6442450944, ms.total + len(ftyp) + len(moov))
+                ms.cv.notify_all()
+        return detected
+
+    def ingest_fragment(self, moof, mdat, *, _terminal_candidate=False):
+        """Append one moof+mdat fragment pair and fire TV handoff on first IDR bootstrap."""
+        with self.lock:
+            mr.require(not self.closed and not self._stop_requested, 'SESSION_CLOSED')
+            index = self.ring._append(moof, mdat, _terminal_candidate)
+            self._at_step_boundary = True
+            self._maybe_notify_tv_open()
+            streams = list(self._media_streams)
+        for ms in streams:
+            with ms.cv:
+                ms.fragments += 1
+                ms.total = min(6442450944, ms.total + len(moof) + len(mdat))
+                ms.cv.notify_all()
+        return index
+
+    def pump_stream(self, read):
+        """Parse an fMP4 stdout stream into MediaRing via ingest_init/ingest_fragment."""
+        self._at_step_boundary = True
+        producer = mr.Producer(_SessionRingView(self), read)
+        while not self._check_stop_requested() and self._check_viewer_deadlines() and producer.step() != 'end':
+            self._at_step_boundary = True
+            producer.last_init = producer.last_pair = producer.last_box = None
+        return self.snapshot()
+
+    def _probe_uxplay_version(self, spawn, terminate=None, *, env=None, timeout_s=2.0):
+        if (
+            type(timeout_s) not in (int, float)
+            or isinstance(timeout_s, bool)
+            or not math.isfinite(timeout_s)
+            or not 0 < timeout_s <= 30
+        ):
+            raise ValueError('UXPLAY_PROBE_TIMEOUT')
+        owner_spawn = _is_process_owner_spawn(spawn)
+        if self._check_stop_requested():
+            return None
+        with self.lock:
+            if self._process_owner is None and owner_spawn:
+                self.bind_process_owner(getattr(spawn, '__self__', None))
+            if terminate is not None:
+                self._terminate_fn = terminate
+            elif self._terminate_fn is None and owner_spawn:
+                self._terminate_fn = getattr(spawn.__self__, 'terminate', None)
+            effective_terminate = self._terminate_fn
+            prev_probe, self._probe_proc = self._probe_proc, None
+            if self.closed or self._stop_requested:
+                return None
+        if prev_probe is not None:
+            self._reap_process(
+                prev_probe,
+                terminate=effective_terminate,
+                io_lock=self._probe_io_lock,
+                io_owner=self._probe_io_owner,
+            )
+        spawn_kwargs = {
+            'env': env,
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.PIPE,
+        }
+        if not owner_spawn:
+            spawn_kwargs['stderr'] = subprocess.PIPE
+        probe_proc = spawn([self.uxplay_command[0], '-v'], **spawn_kwargs)
+        raw_parts = []
+        fd_buffers = {}
+        fd_streams = {}
+        mock_streams = []
+        stream_names = ('stdout',) if owner_spawn else ('stdout', 'stderr')
+        with self.lock:
+            self._probe_proc = probe_proc
+            if self.closed or self._stop_requested:
+                pass
+            else:
+                with self._probe_io_lock:
+                    self._probe_io_owner = threading.get_ident()
+                    try:
+                        for stream_name in stream_names:
+                            stream = getattr(probe_proc, stream_name, None)
+                            if stream is None:
+                                continue
+                            fd = _native_pipe_fd(stream)
+                            if fd is not None:
+                                fd_buffers[fd] = bytearray()
+                                fd_streams[fd] = stream
+                            elif hasattr(stream, 'read'):
+                                mock_streams.append(stream)
+                    finally:
+                        self._probe_io_owner = None
+        if self._check_stop_requested():
+            self._stop_processes()
+            return None
+
+        try:
+            deadline = time.monotonic() + timeout_s
+            if fd_buffers:
+                open_fds = set(fd_buffers)
+                poller = select.poll()
+                poll_mask = select.POLLIN | select.POLLPRI | select.POLLHUP | select.POLLERR
+                for fd in open_fds:
+                    poller.register(fd, poll_mask)
+                poll_fn = getattr(probe_proc, 'poll', None)
+                while open_fds and not self.closed and not self._stop_requested:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    exited = callable(poll_fn) and poll_fn() is not None
+                    timeout_ms = 0 if exited else max(1, int(min(0.02, remaining) * 1000))
+                    try:
+                        events = poller.poll(timeout_ms)
+                    except Exception:
+                        break
+                    for fd, _revents in events:
+                        if fd not in open_fds:
+                            continue
+                        need = 4096 - len(fd_buffers[fd])
+                        if need <= 0:
+                            open_fds.discard(fd)
+                            try:
+                                poller.unregister(fd)
+                            except Exception:
+                                pass
+                            continue
+                        with self._probe_io_lock:
+                            self._probe_io_owner = threading.get_ident()
+                            try:
+                                if (
+                                    self.closed
+                                    or self._stop_requested
+                                    or self._probe_proc is not probe_proc
+                                    or getattr(fd_streams[fd], 'closed', False)
+                                ):
+                                    open_fds.discard(fd)
+                                    try:
+                                        poller.unregister(fd)
+                                    except Exception:
+                                        pass
+                                    continue
+                                try:
+                                    chunk = os.read(fd, need)
+                                except BlockingIOError:
+                                    continue
+                                except Exception:
+                                    open_fds.discard(fd)
+                                    try:
+                                        poller.unregister(fd)
+                                    except Exception:
+                                        pass
+                                    continue
+                            finally:
+                                if self.closed or self._stop_requested:
+                                    for s in fd_streams.values():
+                                        if hasattr(s, 'close'):
+                                            try:
+                                                s.close()
+                                            except Exception:
+                                                pass
+                                self._probe_io_owner = None
+                        if self.closed or self._stop_requested:
+                            break
+                        if not chunk:
+                            open_fds.discard(fd)
+                            try:
+                                poller.unregister(fd)
+                            except Exception:
+                                pass
+                        else:
+                            fd_buffers[fd].extend(chunk)
+                            if len(fd_buffers[fd]) >= 4096:
+                                open_fds.discard(fd)
+                                try:
+                                    poller.unregister(fd)
+                                except Exception:
+                                    pass
+                    if exited and not events:
+                        break
+                with self._probe_io_lock:
+                    self._probe_io_owner = threading.get_ident()
+                    try:
+                        for fd, stream in fd_streams.items():
+                            if hasattr(stream, 'close'):
+                                try:
+                                    stream.close()
+                                except Exception:
+                                    pass
+                            if fd_buffers[fd]:
+                                raw_parts.append(fd_buffers[fd].decode('utf-8', errors='replace'))
+                    finally:
+                        self._probe_io_owner = None
+                if self._check_stop_requested():
+                    self._stop_processes()
+                    return None
+                if time.monotonic() >= deadline and open_fds:
+                    self._stop_processes()
+                    raise RuntimeError('UXPLAY_VERSION_PROBE_TIMEOUT')
+
+            if mock_streams:
+                read_done = threading.Event()
+
+                def _read_mock_streams():
+                    try:
+                        for stream in mock_streams:
+                            try:
+                                chunk = stream.read(4096)
+                                if isinstance(chunk, bytes):
+                                    raw_parts.append(chunk.decode('utf-8', errors='replace'))
+                                elif isinstance(chunk, str):
+                                    raw_parts.append(chunk)
+                            except Exception:
+                                pass
+                            finally:
+                                if hasattr(stream, 'close'):
+                                    try:
+                                        stream.close()
+                                    except Exception:
+                                        pass
+                    finally:
+                        read_done.set()
+
+                reader = threading.Thread(target=_read_mock_streams, name='uxplay-version-probe', daemon=True)
+                reader.start()
+                while not read_done.is_set() and not self.closed and not self._stop_requested:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    read_done.wait(timeout=min(0.02, remaining))
+                if self._check_stop_requested():
+                    self._stop_processes()
+                    reader.join(timeout=0.05)
+                    return None
+                if not read_done.is_set():
+                    self._stop_processes()
+                    reader.join(timeout=0.05)
+                    raise RuntimeError('UXPLAY_VERSION_PROBE_TIMEOUT')
+                reader.join(timeout=0.05)
+
+            wait_fn = getattr(probe_proc, 'wait', None)
+            if callable(wait_fn):
+                while not self.closed and not self._stop_requested:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._stop_processes()
+                        raise RuntimeError('UXPLAY_VERSION_PROBE_TIMEOUT')
+                    try:
+                        wait_fn(timeout=min(0.02, max(0.005, remaining)))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                    except Exception as exc:
+                        self._stop_processes()
+                        raise RuntimeError('UXPLAY_VERSION_PROBE_TIMEOUT') from exc
+                if self._check_stop_requested():
+                    self._stop_processes()
+                    return None
+            with self.lock:
+                if self._probe_proc is probe_proc:
+                    self._probe_proc = None
+            if self._check_stop_requested():
+                return None
+        finally:
+            with self.lock:
+                still_owned = self._probe_proc is probe_proc
+            if still_owned:
+                self._stop_processes()
+        return require_uxplay_version('\n'.join(raw_parts).strip())
+
+    def _spawn_ffmpeg(self, spawn, *, env=None):
+        owner_spawn = _is_process_owner_spawn(spawn)
+        if self._check_stop_requested():
+            return None
+        with self.lock:
+            if self._process_owner is None and owner_spawn:
+                self.bind_process_owner(getattr(spawn, '__self__', None))
+            prev_ffmpeg, self._ffmpeg_proc = self._ffmpeg_proc, None
+            self._ffmpeg_fd = None
+            terminate = self._terminate_fn
+            if self.closed or self._stop_requested:
+                return None
+        if prev_ffmpeg is not None:
+            self._reap_process(
+                prev_ffmpeg,
+                terminate=terminate,
+                io_lock=self._ffmpeg_io_lock,
+                io_owner=self._ffmpeg_io_owner,
+            )
+        spawn_kwargs = {
+            'env': env,
+            'stdin': subprocess.PIPE,
+            'stdout': subprocess.PIPE,
+        }
+        if not owner_spawn:
+            spawn_kwargs['stderr'] = subprocess.DEVNULL
+        ffmpeg_proc = spawn(list(self.ffmpeg_command), **spawn_kwargs)
+        with self.lock:
+            self._ffmpeg_proc = ffmpeg_proc
+            if not self.closed and not self._stop_requested:
+                with self._ffmpeg_io_lock:
+                    self._ffmpeg_io_owner = threading.get_ident()
+                    try:
+                        self._ffmpeg_fd = _native_pipe_fd(getattr(ffmpeg_proc, 'stdout', None))
+                    finally:
+                        self._ffmpeg_io_owner = None
+        if self._check_stop_requested():
+            self._stop_processes()
+            return None
+        try:
+            ffmpeg_proc.stdin.write(self.sdp_bytes)
+        finally:
+            ffmpeg_proc.stdin.close()
+        return ffmpeg_proc
+
+    def _read_ffmpeg_stdout(self, proc, count, *, timeout_s=None):
+        if count <= 0:
+            return b''
+        if self._check_stop_requested() or not self._check_viewer_deadlines():
+            raise TimeoutError('AIRPLAY_STREAM_STOPPED')
+        with self.lock:
+            fd = self._ffmpeg_fd if self._ffmpeg_proc is proc else None
+        stream = getattr(proc, 'stdout', None)
+        if stream is None:
+            return b''
+        if fd is None:
+            return stream.read(count)
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLPRI | select.POLLHUP | select.POLLERR)
+        poll_fn = getattr(proc, 'poll', None)
+        deadline = None if timeout_s is None else (time.monotonic() + timeout_s)
+        while not self._check_stop_requested() and self._check_viewer_deadlines():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('FFMPEG_STDOUT_READ_TIMEOUT')
+            else:
+                remaining = 0.02
+            exited = callable(poll_fn) and poll_fn() is not None
+            timeout_ms = 0 if exited else max(1, int(min(0.02, remaining) * 1000))
+            try:
+                events = poller.poll(timeout_ms)
+            except Exception as exc:
+                raise TimeoutError('FFMPEG_STDOUT_POLL_FAILED') from exc
+            if events:
+                with self._ffmpeg_io_lock:
+                    self._ffmpeg_io_owner = threading.get_ident()
+                    try:
+                        if (
+                            self.closed
+                            or self._stop_requested
+                            or self._ffmpeg_proc is not proc
+                            or self._ffmpeg_fd != fd
+                            or getattr(stream, 'closed', False)
+                        ):
+                            raise TimeoutError('AIRPLAY_STREAM_STOPPED')
+                        try:
+                            chunk = os.read(fd, count)
+                        except BlockingIOError:
+                            continue
+                        except Exception as exc:
+                            raise TimeoutError('FFMPEG_STDOUT_READ_FAILED') from exc
+                    finally:
+                        if self.closed or self._stop_requested:
+                            if hasattr(stream, 'close'):
+                                try:
+                                    stream.close()
+                                except Exception:
+                                    pass
+                        self._ffmpeg_io_owner = None
+                if self._check_stop_requested():
+                    raise TimeoutError('AIRPLAY_STREAM_STOPPED')
+                return chunk
+            if exited:
+                raise TimeoutError('FFMPEG_STDOUT_OPEN_AFTER_EXIT')
+        raise TimeoutError('AIRPLAY_STREAM_STOPPED')
+
+    def run_relay(self, spawn=subprocess.Popen, terminate=None, *, env=None, max_startup_attempts=12):
+        """Verify UxPlay >= 1.73.7, spawn UxPlay + FFmpeg relay, feed SDP over stdin, and pump fMP4."""
+        if type(max_startup_attempts) is not int or isinstance(max_startup_attempts, bool) or not 1 <= max_startup_attempts <= 120:
+            raise ValueError('AIRPLAY_STARTUP_ATTEMPTS')
+        owner_spawn = _is_process_owner_spawn(spawn)
+        effective_env = _default_relay_env() if (env is None and (spawn is subprocess.Popen or owner_spawn)) else env
+        reason = 'teardown'
+        if self._check_stop_requested():
+            return self.snapshot()
+        with self.lock:
+            if self._process_owner is None and owner_spawn:
+                self.bind_process_owner(getattr(spawn, '__self__', None))
+            if self.closed:
+                return self.snapshot()
+            if terminate is not None:
+                self._terminate_fn = terminate
+            elif self._terminate_fn is None and owner_spawn:
+                self._terminate_fn = getattr(spawn.__self__, 'terminate', None)
+        try:
+            if self._probe_uxplay_version(spawn, terminate=self._terminate_fn, env=effective_env) is None:
+                return self.snapshot()
+            ffmpeg_proc = self._spawn_ffmpeg(spawn, env=effective_env)
+            if ffmpeg_proc is None:
+                return self.snapshot()
+            uxplay_kwargs = {
+                'env': effective_env,
+                'stdin': subprocess.DEVNULL,
+                'stdout': subprocess.DEVNULL,
+            }
+            if not owner_spawn:
+                uxplay_kwargs['stderr'] = subprocess.DEVNULL
+            uxplay_proc = spawn(list(self.uxplay_command), **uxplay_kwargs)
+            with self.lock:
+                self._uxplay_proc = uxplay_proc
+            if self._check_stop_requested():
+                self._stop_processes()
+                return self.snapshot()
+            startup_read_timeout = float(self.listen_timeout_s) + 2.0
+            for attempt in range(max_startup_attempts):
+                if not self._check_viewer_deadlines():
+                    break
+                if attempt > 0:
+                    poll_fn = getattr(uxplay_proc, 'poll', None)
+                    if callable(poll_fn) and poll_fn() is not None:
+                        break
+                    ffmpeg_proc = self._spawn_ffmpeg(spawn, env=effective_env)
+                    if ffmpeg_proc is None:
+                        return self.snapshot()
+                try:
+                    first_chunk = self._read_ffmpeg_stdout(ffmpeg_proc, 8, timeout_s=startup_read_timeout)
+                except TimeoutError:
+                    first_chunk = b''
+                if not first_chunk:
+                    if self._check_stop_requested() or not self._check_viewer_deadlines():
+                        break
+                    poll_fn = getattr(uxplay_proc, 'poll', None)
+                    if callable(poll_fn) and poll_fn() is not None:
+                        break
+                    continue
+                prefix = memoryview(first_chunk)
+                offset = 0
+
+                def read_stdout(count, proc=ffmpeg_proc):
+                    nonlocal offset
+                    if self._check_stop_requested() or not self._check_viewer_deadlines():
+                        raise TimeoutError('AIRPLAY_STREAM_STOPPED')
+                    if offset < len(prefix):
+                        take = min(count, len(prefix) - offset)
+                        part = bytes(prefix[offset:offset + take])
+                        offset += take
+                        if part:
+                            self._at_step_boundary = False
+                        return part
+                    poll_fn = getattr(uxplay_proc, 'poll', None)
+                    if not self._at_step_boundary or not callable(poll_fn):
+                        chunk = self._read_ffmpeg_stdout(proc, count, timeout_s=startup_read_timeout)
+                        if chunk:
+                            self._at_step_boundary = False
+                        return chunk
+                    deadline = time.monotonic() + startup_read_timeout
+                    while True:
+                        uxplay_exited = poll_fn() is not None and self.ring.bootstrap_seen
+                        slice_timeout = (
+                            0.15
+                            if uxplay_exited
+                            else min(0.2, max(0.01, deadline - time.monotonic()))
+                        )
+                        try:
+                            chunk = self._read_ffmpeg_stdout(proc, count, timeout_s=slice_timeout)
+                        except TimeoutError as exc:
+                            if str(exc) != 'FFMPEG_STDOUT_READ_TIMEOUT':
+                                raise
+                            if uxplay_exited:
+                                with self.ring.lock:
+                                    if self.ring.unpublished and self.ring.pending is None:
+                                        self.ring.unpublished = []
+                                        self.ring.unpublished_bytes = 0
+                                        self.ring.unpublished_since = None
+                                return b''
+                            if time.monotonic() >= deadline:
+                                raise
+                            continue
+                        if chunk:
+                            self._at_step_boundary = False
+                        elif uxplay_exited:
+                            with self.ring.lock:
+                                if self.ring.unpublished and self.ring.pending is None:
+                                    self.ring.unpublished = []
+                                    self.ring.unpublished_bytes = 0
+                                    self.ring.unpublished_since = None
+                        return chunk
+
+                self.pump_stream(read_stdout)
+                if self._check_stop_requested() or self.active_profile is not None:
+                    break
+            if not self._check_stop_requested() and self.active_profile is None:
+                raise RuntimeError('AIRPLAY_STARTUP_TIMEOUT')
+            reason = 'sender-disconnected'
+        except Exception:
+            if self._check_stop_requested():
+                return self.snapshot()
+            reason = 'error'
+            raise
+        finally:
+            self._stop_processes()
+            if not self.closed:
+                self.close(self._stop_reason if self._stop_requested and self._stop_reason else reason)
+        return self.snapshot()
+
+    def close(self, reason='teardown'):
+        """Idempotently stop relay processes, clear media ring, and return TV to Holly."""
+        if type(reason) is not str or reason not in (
+            'teardown',
+            'viewer-hidden',
+            'sender-disconnected',
+            'error',
+            'owner-ended',
+        ):
+            raise ValueError('AIRPLAY_CLOSE_REASON')
+        streams = []
+        hosts = []
+        try:
+            with self.lock:
+                if not self.closed:
+                    if reason == 'sender-disconnected':
+                        # A host publishes its stop before waking media waiters.
+                        # The relay can exit first; preserve the already-recorded
+                        # cause instead of relabelling that stop as sender EOF.
+                        causes = {getattr(host, 'close_reason', None) for host in self._viewer_hosts}
+                        if 'viewer-hidden' in causes:
+                            reason = 'viewer-hidden'
+                        elif 'viewer-ended' in causes:
+                            reason = 'teardown'
+                        elif causes.intersection({'deadline-expired', 'viewer-heartbeat-lost', 'owner-ended'}):
+                            reason = 'owner-ended'
+                    self.closed = True
+                    self.close_reason = reason
+                    self.ring.clear()
+                    streams = list(self._media_streams)
+                    hosts = list(self._viewer_hosts)
+                    if self._tv_teardown_callback is not None:
+                        self._tv_teardown_callback(epoch=self.ring.epoch, reason=reason)
+        finally:
+            for host in hosts:
+                host.stop.set()
+            for ms in streams:
+                ms.cancel.set()
+                with ms.cv:
+                    ms.finished = True
+                    ms.ready = False
+                    if reason == 'error' and ms.error is None:
+                        ms.error = 'SOURCE_INVALID_OR_STOPPED'
+                    ms.cv.notify_all()
+            self._stop_processes()
+        return self.snapshot()
+
+    def snapshot(self):
+        """Privacy-safe scalar diagnostics; never sender names, MACs, or media bytes."""
+        with self.lock:
+            active = self.active_profile or PROFILE_4K60_HEVC
+            return {
+                'epoch': self.ring.epoch,
+                'requestedProfile': self.requested_profile.name,
+                'activeProfile': None if self.active_profile is None else self.active_profile.name,
+                'codec': active.codec_string,
+                'fps': active.fps,
+                'relayMode': self.relay_mode,
+                'shortFragment': self.short_fragment,
+                'authenticated': self.authenticated,
+                'tvOpened': self.tv_opened,
+                'closed': self.closed,
+                'closeReason': self.close_reason,
+                'ring': self.ring.snapshot(),
+            }
+
+
+class AirPlayService:
+    """Production Spark AirPlay receiver owner, HTTP viewer server, and TV handoff coordinator.
+
+    - Enforces authenticated receiver configuration (PIN or password).
+    - Coordinates with the Spark browser Manager and `session-pending` journal so
+      browser and AirPlay sessions never collide on port 4177 or the TV display.
+    - Hosts the MSE viewer HTTP endpoint (`/<token>/viewer`, `/stream-state`,
+      `/stream-open`, `/stream-ready`, `/stream.mp4`, `/metrics`, `/end`) for the
+      `MediaRing` populated by `AirPlayRelaySession`.
+    - Launches the TV viewer on first IDR bootstrap (`com.webos.app.tinybrowser`)
+      and returns the TV to Holly (`local.owner.applibrary`) on teardown.
+    """
+
+    def __init__(
+        self,
+        config,
+        *,
+        tv_launch=None,
+        tv_handoff=None,
+        manager=None,
+        journal=None,
+        owner_factory=None,
+        spawn=subprocess.Popen,
+        terminate=None,
+        server_factory=None,
+        bind_address=SPARK,
+        viewer_port=None,
+        viewer_max_duration_s=315360000,
+        viewer_heartbeat_timeout_s=15.0,
+        clock=time.monotonic,
+    ):
+        if isinstance(config, (str, Path)):
+            config = load_airplay_config(config)
+        else:
+            config = validate_airplay_config(config)
+        self.config = config
+        self.bind_address = bind_address
+        self.viewer_port = config.viewer_port if viewer_port is None else viewer_port
+        if type(self.viewer_port) is not int or isinstance(self.viewer_port, bool) or not 1024 <= self.viewer_port <= 65535:
+            raise ValueError('AIRPLAY_VIEWER_PORT')
+        if (
+            type(viewer_max_duration_s) not in (int, float)
+            or isinstance(viewer_max_duration_s, bool)
+            or not math.isfinite(viewer_max_duration_s)
+            or not 0 < viewer_max_duration_s <= 315360000
+        ):
+            raise ValueError('AIRPLAY_VIEWER_DURATION')
+        if (
+            type(viewer_heartbeat_timeout_s) not in (int, float)
+            or isinstance(viewer_heartbeat_timeout_s, bool)
+            or not math.isfinite(viewer_heartbeat_timeout_s)
+            or not 0 < viewer_heartbeat_timeout_s <= 86400
+        ):
+            raise ValueError('AIRPLAY_HEARTBEAT_TIMEOUT')
+        self.viewer_max_duration_s = float(viewer_max_duration_s)
+        self.viewer_heartbeat_timeout_s = float(viewer_heartbeat_timeout_s)
+        if tv_handoff is not None and not isinstance(tv_handoff, AirPlayTVHandoff):
+            raise ValueError('AIRPLAY_TV_HANDOFF')
+        if tv_handoff is None and tv_launch is not None:
+            tv_handoff = AirPlayTVHandoff(
+                tv_launch,
+                spark_ip=bind_address,
+                viewer_port=self.viewer_port,
+                clock=clock,
+            )
+        if tv_handoff is None:
+            raise ValueError('AIRPLAY_TV_HANDOFF_REQUIRED')
+        self.tv_handoff = tv_handoff
+        self.manager = manager
+        if journal is None and manager is not None:
+            journal = getattr(manager, 'journal', None)
+        self.journal = None if journal is None else Path(journal)
+        self.listen_journal = (
+            None
+            if self.journal is None
+            else self.journal.parent / f'.{self.journal.name}.airplay-listen'
+        )
+        self.owner_factory = owner_factory
+        self.spawn = spawn
+        self.terminate = terminate
+        self.server_factory = server_factory or AirPlayViewerServer
+        self.clock = clock
+        self.lock = threading.RLock()
+        self._journal_fds = {}
+        self._listen_journal_fds = {}
+        self.state = 'error' if self._is_unlocked_airplay_crash_journal() else 'idle'
+        self.closed = False
+        self._run_in_progress = False
+        self._run_thread = None
+        self._run_done = threading.Event()
+        self._run_done.set()
+        self.active_session = None
+        self.active_host = None
+        self.active_owner = None
+        self.server = None
+        self.server_thread = None
+        self.worker_thread = None
+        self.sessions_completed = 0
+        self.last_session_snapshot = None
+
+    def bind_manager(self, manager):
+        with self.lock:
+            self.manager = manager
+            if self.journal is None and getattr(manager, 'journal', None) is not None:
+                self.journal = Path(manager.journal)
+                self.listen_journal = self.journal.parent / f'.{self.journal.name}.airplay-listen'
+
+    def _browser_busy(self):
+        if self.manager is None:
+            return False
+        try:
+            st = self.manager.status()
+            return type(st) is dict and st.get('state') != 'idle'
+        except Exception:
+            return True
+
+    @staticmethod
+    def _close_fd_entry(fds_map, reservation_id):
+        fd = fds_map.pop(reservation_id, None)
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _close_journal_fd(self, reservation_id):
+        self._close_fd_entry(self._journal_fds, reservation_id)
+
+    def _close_listen_journal_fd(self, reservation_id):
+        self._close_fd_entry(self._listen_journal_fds, reservation_id)
+
+    @staticmethod
+    def _is_unlocked_crash_path(path, *, require_airplay_prefix=True):
+        if path is None or not (path.exists() or path.is_symlink()):
+            return False
+        if path.is_symlink():
+            return True
+        fd = None
+        try:
+            fd = os.open(
+                path,
+                os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0),
+            )
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+                or info.st_size > 128
+            ):
+                return True
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            raw = os.read(fd, 129)
+            if require_airplay_prefix and not raw.startswith(b'airplay:'):
+                return False
+            return True
+        except OSError:
+            return False
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _is_unlocked_airplay_crash_journal(self):
+        return self._is_unlocked_crash_path(
+            self.journal, require_airplay_prefix=True
+        ) or self._is_unlocked_crash_path(
+            self.listen_journal, require_airplay_prefix=False
+        )
+
+    def _journal_preflight(self):
+        if self.journal is None:
+            return {'ok': True}
+        if (
+            not self.journal.parent.is_dir()
+            or self.journal.is_symlink()
+            or (self.listen_journal is not None and self.listen_journal.is_symlink())
+        ):
+            return {'ok': False, 'busy': False}
+        if self._is_unlocked_airplay_crash_journal():
+            return {'ok': False, 'busy': False}
+        if self.journal.exists() or (self.listen_journal is not None and self.listen_journal.exists()):
+            return {'ok': False, 'busy': True}
+        return {'ok': True}
+
+    def _reserve_journal_path(self, target_path, reservation_id, fds_map, *, require_airplay_prefix=True):
+        if target_path is None:
+            return {'reserved': True, 'identity': None}
+        if not target_path.parent.is_dir() or target_path.is_symlink():
+            return {'reserved': False, 'busy': False}
+        if self._is_unlocked_airplay_crash_journal():
+            return {'reserved': False, 'busy': False}
+        if target_path.exists():
+            if self._is_unlocked_crash_path(target_path, require_airplay_prefix=require_airplay_prefix):
+                return {'reserved': False, 'busy': False}
+            return {'reserved': False, 'busy': True}
+        fd = None
+        stage_path = target_path.parent / f'.{target_path.name}.airplay-{os.getpid()}-{secrets.token_hex(6)}'
+        try:
+            fd = os.open(
+                stage_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0),
+                0o600,
+            )
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            payload = f'airplay:{reservation_id}'.encode('utf-8')
+            written = 0
+            while written < len(payload):
+                n = os.write(fd, payload[written:])
+                if n <= 0:
+                    raise OSError('JOURNAL_WRITE_FAILED')
+                written += n
+            os.fsync(fd)
+            os.link(stage_path, target_path)
+            try:
+                os.unlink(stage_path)
+            except OSError:
+                pass
+            identity = target_path.lstat()
+            dir_fd = os.open(target_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            with self.lock:
+                fds_map[reservation_id] = fd
+            fd = None
+            return {'reserved': True, 'identity': identity}
+        except FileExistsError:
+            if self._is_unlocked_crash_path(target_path, require_airplay_prefix=require_airplay_prefix):
+                return {'reserved': False, 'busy': False}
+            return {'reserved': False, 'busy': True}
+        except OSError:
+            return {'reserved': False, 'busy': False}
+        finally:
+            try:
+                if stage_path.exists() or stage_path.is_symlink():
+                    stage_path.unlink()
+            except OSError:
+                pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _reserve_journal(self, reservation_id):
+        return self._reserve_journal_path(
+            self.journal, reservation_id, self._journal_fds, require_airplay_prefix=True
+        )
+
+    def _reserve_listen_journal(self, reservation_id):
+        return self._reserve_journal_path(
+            self.listen_journal, reservation_id, self._listen_journal_fds, require_airplay_prefix=False
+        )
+
+    def _release_journal_path(self, target_path, reservation_id, identity, close_fd_fn):
+        if target_path is None or identity is None:
+            return True
+        try:
+            now = target_path.lstat()
+            if (identity.st_dev, identity.st_ino, identity.st_uid, identity.st_mode) != (
+                now.st_dev,
+                now.st_ino,
+                now.st_uid,
+                now.st_mode,
+            ):
+                return False
+            if target_path.read_text() not in (reservation_id, f'airplay:{reservation_id}'):
+                return False
+            target_path.unlink()
+            dir_fd = os.open(target_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            return True
+        except OSError:
+            return False
+        finally:
+            with self.lock:
+                close_fd_fn(reservation_id)
+
+    def _release_journal(self, reservation_id, identity):
+        return self._release_journal_path(
+            self.journal, reservation_id, identity, self._close_journal_fd
+        )
+
+    def _release_listen_journal(self, reservation_id, identity):
+        return self._release_journal_path(
+            self.listen_journal, reservation_id, identity, self._close_listen_journal_fd
+        )
+
+    def _start_viewer_server(self, host):
+        handler = airplay_viewer_handler_for(lambda: self.active_host)
+        server = self.server_factory((self.bind_address, self.viewer_port), handler)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={'poll_interval': 0.1},
+            name='airplay-viewer-http',
+            daemon=True,
+        )
+        thread.start()
+        return server, thread
+
+    def _stop_viewer_server(self, server, thread):
+        if server is None:
+            return
+        close_conns = getattr(server, 'close_connections', None)
+        if callable(close_conns):
+            try:
+                close_conns()
+            except Exception:
+                pass
+        if thread is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            thread.join(timeout=2)
+        try:
+            server.server_close()
+        except Exception:
+            pass
+
+    def run_once(self, *, epoch=None, token=None, max_startup_attempts=6):
+        """Run one complete owned AirPlay relay session with viewer hosting and TV handoff."""
+        if not self.config.enabled:
+            return {'state': 'disabled'}
+        listen_reserved = False
+        listen_identity = None
+        with self.lock:
+            if (
+                self.closed
+                or self._run_in_progress
+                or self.state not in ('idle', 'listening')
+                or self.active_session is not None
+            ):
+                return {'state': self.state, 'busy': True}
+            if self._browser_busy():
+                return {'state': 'idle', 'busy': True, 'reason': 'browser-active'}
+            preflight = self._journal_preflight()
+            if not preflight.get('ok'):
+                if preflight.get('busy'):
+                    return {'state': 'idle', 'busy': True, 'reason': 'journal-busy'}
+                self.state = 'error'
+                return {'state': 'error'}
+            session_epoch = secrets.token_hex(16) if epoch is None else epoch
+            viewer_token = secrets.token_hex(24) if token is None else token
+            listen_reservation = self._reserve_listen_journal(session_epoch)
+            if not listen_reservation.get('reserved'):
+                if listen_reservation.get('busy'):
+                    return {'state': 'idle', 'busy': True, 'reason': 'journal-busy'}
+                self.state = 'error'
+                return {'state': 'error'}
+            listen_reserved = True
+            listen_identity = listen_reservation['identity']
+            self._run_in_progress = True
+            self._run_thread = threading.current_thread()
+            self._run_done.clear()
+            self.state = 'listening'
+
+        owner = None
+        server = None
+        server_thread = None
+        host = None
+        session = None
+        journal_reserved = False
+        journal_identity = None
+        journal_error = False
+        activation_busy = None
+        tv_opened_for_epoch = False
+        tv_open_ambiguous = False
+        tv_open_failed = False
+        try:
+            if self.owner_factory is not None:
+                owner = _create_session_process_owner(
+                    self.owner_factory,
+                    cancel_check=lambda: self.closed,
+                )
+                with self.lock:
+                    self.active_owner = owner
+                    should_stop_owner = self.closed
+                if should_stop_owner and owner is not None:
+                    stop_fn = getattr(owner, 'request_stop', None)
+                    if callable(stop_fn):
+                        try:
+                            stop_fn()
+                        except Exception:
+                            pass
+                effective_spawn = owner.spawn
+                effective_terminate = owner.terminate
+            else:
+                effective_spawn = self.spawn
+                effective_terminate = self.terminate
+
+            self.tv_handoff.bind_viewer(session_epoch, viewer_token)
+
+            def _on_open(*, epoch, codec, profile):
+                nonlocal journal_reserved, journal_identity, journal_error, activation_busy
+                nonlocal server, server_thread, tv_opened_for_epoch, tv_open_ambiguous, tv_open_failed
+                with self.lock:
+                    if self.closed:
+                        raise RuntimeError('AIRPLAY_SERVICE_CLOSED')
+                    if self._browser_busy():
+                        activation_busy = 'browser-active'
+                        raise RuntimeError('AIRPLAY_BROWSER_BUSY')
+                    if not journal_reserved:
+                        reservation = self._reserve_journal(session_epoch)
+                        if not reservation.get('reserved'):
+                            if reservation.get('busy'):
+                                activation_busy = 'journal-busy'
+                                raise RuntimeError('AIRPLAY_JOURNAL_BUSY')
+                            journal_error = True
+                            self.state = 'error'
+                            raise RuntimeError('AIRPLAY_JOURNAL_ERROR')
+                        journal_reserved = True
+                        journal_identity = reservation['identity']
+                    self.state = 'running'
+                if host is not None:
+                    host.set_codec(codec)
+                if server is None:
+                    server, server_thread = self._start_viewer_server(host)
+                    with self.lock:
+                        self.server = server
+                        self.server_thread = server_thread
+                status = self.tv_handoff.on_tv_open(epoch=epoch, codec=codec, profile=profile)
+                if status != 'accepted':
+                    if status == 'unknown':
+                        tv_open_ambiguous = True
+                    tv_open_failed = True
+                    raise RuntimeError('AIRPLAY_TV_OPEN_FAILED')
+                tv_opened_for_epoch = True
+
+            def _on_teardown(*, epoch, reason):
+                if (
+                    tv_opened_for_epoch
+                    or tv_open_ambiguous
+                    or self.tv_handoff.needs_teardown(epoch)
+                ):
+                    effective_reason = (
+                        'viewer-hidden'
+                        if (host is not None and host.close_reason == 'viewer-hidden')
+                        else reason
+                    )
+                    self.tv_handoff.on_tv_teardown(epoch=epoch, reason=effective_reason)
+
+            session = AirPlayRelaySession(
+                session_epoch,
+                uxplay_bin=self.config.uxplay_bin,
+                requested_profile=self.config.requested_profile,
+                relay_mode=self.config.relay_mode,
+                short_fragment=self.config.short_fragment,
+                receiver_name=self.config.receiver_name,
+                video_rtp_port=self.config.video_rtp_port,
+                audio_rtp_port=self.config.audio_rtp_port,
+                airplay_port=self.config.airplay_port,
+                pin=self.config.pin,
+                password=self.config.password,
+                device_id=self.config.device_id,
+                fps_data=self.config.fps_data,
+                listen_timeout_s=self.config.listen_timeout_s,
+                require_auth=True,
+                tv_open_callback=_on_open,
+                tv_teardown_callback=_on_teardown,
+                clock=self.clock,
+            )
+            if owner is not None:
+                session.bind_process_owner(owner)
+            host = AirPlayViewerHost(
+                session,
+                token=viewer_token,
+                bind_address=self.bind_address,
+                viewer_port=self.viewer_port,
+                max_duration_s=self.viewer_max_duration_s,
+                heartbeat_timeout_s=self.viewer_heartbeat_timeout_s,
+                clock=self.clock,
+            )
+            with self.lock:
+                self.active_session = session
+                self.active_host = host
+                should_close = self.closed
+            if should_close:
+                session.close('owner-ended')
+            try:
+                snap = session.run_relay(
+                    effective_spawn,
+                    terminate=effective_terminate,
+                    env=_default_relay_env(),
+                    max_startup_attempts=max_startup_attempts,
+                )
+            except Exception as exc:
+                if activation_busy is not None:
+                    return {'state': 'idle', 'busy': True, 'reason': activation_busy}
+                if journal_error:
+                    return {'state': 'error'}
+                if tv_open_failed:
+                    raise RuntimeError('AIRPLAY_TV_OPEN_FAILED') from exc
+                raise
+            return snap
+        finally:
+            if session is not None and not session.closed:
+                try:
+                    fallback_reason = (
+                        'viewer-hidden'
+                        if (host is not None and host.close_reason == 'viewer-hidden')
+                        else ('owner-ended' if self.closed else 'teardown')
+                    )
+                    session.close(fallback_reason)
+                except Exception:
+                    pass
+            if (
+                tv_opened_for_epoch
+                or tv_open_ambiguous
+                or self.tv_handoff.needs_teardown(session_epoch)
+            ) and not self.tv_handoff.was_torn_down(session_epoch):
+                try:
+                    fallback_reason = (
+                        'viewer-hidden'
+                        if (host is not None and host.close_reason == 'viewer-hidden')
+                        else (
+                            (None if session is None else session.close_reason)
+                            or ('owner-ended' if self.closed else 'teardown')
+                        )
+                    )
+                    self.tv_handoff.on_tv_teardown(
+                        epoch=session_epoch,
+                        reason=fallback_reason,
+                    )
+                except Exception:
+                    pass
+            tv_reconciled = self.tv_handoff.is_reconciled(session_epoch)
+            try:
+                self.tv_handoff.unbind_viewer(session_epoch)
+            except Exception:
+                pass
+            if host is not None:
+                try:
+                    host.close()
+                except Exception:
+                    pass
+            self._stop_viewer_server(server, server_thread)
+            cleanup_ok = tv_reconciled and not journal_error
+            if owner is not None and hasattr(owner, 'cleanup'):
+                try:
+                    cleanup = owner.cleanup()
+                    cleanup_ok = cleanup_ok and bool(type(cleanup) is dict and cleanup.get('verified') is True)
+                except Exception:
+                    cleanup_ok = False
+            if journal_reserved:
+                if cleanup_ok:
+                    journal_ok = self._release_journal(session_epoch, journal_identity)
+                    if listen_reserved:
+                        journal_ok = self._release_listen_journal(session_epoch, listen_identity) and journal_ok
+                else:
+                    with self.lock:
+                        self._close_journal_fd(session_epoch)
+                    if listen_reserved:
+                        self._release_listen_journal(session_epoch, listen_identity)
+                    journal_ok = False
+            elif cleanup_ok:
+                if listen_reserved:
+                    journal_ok = self._release_listen_journal(session_epoch, listen_identity)
+                else:
+                    journal_ok = True
+            else:
+                promoted = False
+                if self.journal is not None:
+                    res = self._reserve_journal(session_epoch)
+                    if res.get('reserved'):
+                        with self.lock:
+                            self._close_journal_fd(session_epoch)
+                        promoted = True
+                if listen_reserved:
+                    if promoted:
+                        self._release_listen_journal(session_epoch, listen_identity)
+                    else:
+                        with self.lock:
+                            self._close_listen_journal_fd(session_epoch)
+                journal_ok = False
+            final_snapshot = None if session is None else session.snapshot()
+            with self.lock:
+                if final_snapshot is not None:
+                    self.last_session_snapshot = final_snapshot
+                    self.sessions_completed += 1
+                self._run_in_progress = False
+                self._run_thread = None
+                self._run_done.set()
+                self.active_session = None
+                self.active_host = None
+                self.active_owner = None
+                self.server = None
+                self.server_thread = None
+                if not cleanup_ok or not journal_ok:
+                    self.state = 'error'
+                elif self.closed:
+                    self.state = 'closed'
+                else:
+                    self.state = 'idle'
+
+    def start(self, *, max_sessions=None, max_startup_attempts=6, retry_delay_s=0.5):
+        """Start background AirPlay service loop until closed or max_sessions is reached."""
+        if not self.config.enabled:
+            return False
+        with self.lock:
+            if (
+                self.closed
+                or self.worker_thread is not None
+                or self._run_in_progress
+                or self.state != 'idle'
+            ):
+                return False
+            self.state = 'listening'
+
+            def _loop():
+                count = 0
+                while not self.closed:
+                    if max_sessions is not None and count >= max_sessions:
+                        break
+                    if self._browser_busy():
+                        time.sleep(min(0.2, max(0.01, retry_delay_s)))
+                        continue
+                    try:
+                        res = self.run_once(max_startup_attempts=max_startup_attempts)
+                        if type(res) is dict and res.get('busy') is True:
+                            time.sleep(min(0.2, max(0.01, retry_delay_s)))
+                            continue
+                    except Exception:
+                        pass
+                    count += 1
+                    with self.lock:
+                        if self.state == 'error' or self.closed:
+                            break
+                        if max_sessions is None or count < max_sessions:
+                            self.state = 'listening'
+                    if not self.closed and (max_sessions is None or count < max_sessions) and retry_delay_s > 0:
+                        time.sleep(min(0.2, retry_delay_s))
+                with self.lock:
+                    if self.state == 'listening':
+                        self.state = 'closed' if self.closed else 'idle'
+
+            worker = threading.Thread(target=_loop, name='r2d2-airplay-service', daemon=True)
+            self.worker_thread = worker
+            worker.start()
+            return True
+
+    def request_stop(self, reason='owner-ended'):
+        """Signal-safe lock-free stop request that defers lock/event operations to normal execution."""
+        self.closed = True
+        session = self.active_session
+        if session is not None:
+            try:
+                session.request_stop(reason)
+            except Exception:
+                pass
+        owner = self.active_owner
+        if owner is not None:
+            stop_fn = getattr(owner, 'request_stop', None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+
+    def close(self, *, timeout_s=5.0):
+        """Idempotently stop active AirPlay session, viewer server, and background worker."""
+        wait_budget = max(0.05, float(timeout_s))
+        with self.lock:
+            self.closed = True
+            session = self.active_session
+            host = self.active_host
+            owner = self.active_owner
+            worker = self.worker_thread
+            run_thread = self._run_thread
+        if owner is not None:
+            cap_fn = getattr(owner, 'cap_deadline', None)
+            if callable(cap_fn):
+                try:
+                    cap_fn(min(2.5, wait_budget * 0.5) if wait_budget >= 2.0 else min(0.12, max(0.03, wait_budget * 0.3)))
+                except Exception:
+                    pass
+            stop_fn = getattr(owner, 'request_stop', None)
+            if callable(stop_fn):
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+        if host is not None:
+            try:
+                host.request_stop('owner-ended')
+            except Exception:
+                pass
+        if session is not None:
+            try:
+                session.close('owner-ended')
+            except Exception:
+                pass
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=wait_budget)
+        if run_thread is not None and run_thread is not threading.current_thread():
+            self._run_done.wait(timeout=wait_budget)
+        with self.lock:
+            if not self._run_in_progress:
+                for rid in list(self._journal_fds):
+                    self._close_journal_fd(rid)
+                for rid in list(self._listen_journal_fds):
+                    self._close_listen_journal_fd(rid)
+            if self.state not in ('error', 'running'):
+                self.state = 'closed'
+            return (
+                not self._run_in_progress
+                and self.active_session is None
+                and (worker is None or not worker.is_alive())
+            )
+
+    def snapshot(self):
+        with self.lock:
+            state = self.state
+            closed = self.closed
+            sessions_completed = self.sessions_completed
+            active_session = self.active_session
+            last_session = self.last_session_snapshot
+            tv_handoff = self.tv_handoff
+        return {
+            'state': state,
+            'closed': closed,
+            'sessionsCompleted': sessions_completed,
+            'config': self.config.snapshot(),
+            'activeSession': None if active_session is None else active_session.snapshot(),
+            'lastSession': last_session,
+            'tvHandoff': None if tv_handoff is None else tv_handoff.snapshot(),
+        }
+
+
+AirPlayOwner = AirPlayService
+
+
+def main(argv=None, *, tv_launch=None, tv_handoff=None, journal=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--run', action='store_true')
+    parser.add_argument('--once', action='store_true')
+    parser.add_argument('--subreaper-fd', type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument('--config', type=Path, default=DEFAULT_AIRPLAY_CONFIG_PATH)
+    parser.add_argument('--journal', type=Path, default=DEFAULT_JOURNAL_PATH)
+    parser.add_argument('--ssap-key', type=Path, default=DEFAULT_SSAP_KEY_PATH)
+    parser.add_argument('--ssap-pin', type=Path, default=DEFAULT_SSAP_PIN_PATH)
+    args = parser.parse_args(argv)
+    if args.subreaper_fd is not None:
+        os.umask(0o077)
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM, 0, args.subreaper_fd)
+        except (OSError, ValueError):
+            return 1
+
+        def _stop_subreaper(*_):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, _stop_subreaper)
+        return _run_subreaper_worker(sock)
+    if not args.run:
+        print('Prepared only. --run starts the authenticated Spark AirPlay relay service.')
+        return 0
+    if os.getuid() != 1000 or os.geteuid() != 1000 or platform.node() != '{{SPARK_HOSTNAME}}':
+        raise SystemExit('FIXED_USER_REQUIRED')
+    os.umask(0o077)
+    cfg = load_airplay_config(args.config, expected_uid=1000)
+    if not getattr(cfg, 'enabled', True):
+        return 0
+    if tv_handoff is None and tv_launch is None:
+        transport = PinnedSSAPTransport(args.ssap_key, args.ssap_pin, expected_uid=1000)
+        transport.validate_credentials()
+        tv_handoff = AirPlayTVHandoff(transport, spark_ip=SPARK, viewer_port=cfg.viewer_port)
+    from process_owner import ProcessOwner
+    service = AirPlayService(
+        cfg,
+        tv_launch=tv_launch,
+        tv_handoff=tv_handoff,
+        journal=args.journal if journal is None else Path(journal),
+        owner_factory=ProcessOwner,
+    )
+    stop_requested = [False]
+
+    def _on_signal(*_):
+        stop_requested[0] = True
+        req_stop = getattr(service, 'request_stop', None)
+        if callable(req_stop):
+            req_stop('owner-ended')
+        else:
+            try:
+                service.closed = True
+            except Exception:
+                pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _on_signal)
+    if args.once:
+        try:
+            res = service.run_once()
+        finally:
+            if stop_requested[0]:
+                service.close()
+        if getattr(service, 'state', None) == 'error' or (type(res) is dict and res.get('state') == 'error'):
+            return 1
+        return 0
+    if not service.start():
+        service.close()
+        return 1
+    try:
+        while not stop_requested[0]:
+            if getattr(service, 'state', None) == 'error':
+                return 1
+            worker = getattr(service, 'worker_thread', None)
+            if worker is not None and not worker.is_alive():
+                break
+            time.sleep(0.05)
+    finally:
+        service.close()
+    return 1 if getattr(service, 'state', None) == 'error' else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

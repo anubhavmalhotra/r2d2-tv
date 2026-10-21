@@ -1,0 +1,96 @@
+"""The exact argv Chromium receives, with automation exposure disabled for pages.
+
+PrivateProfile.launch -> audio.browser_launch -> the BOOTSTRAP exec line runs
+under a real noninteractive bash with a stub chrome that only records its argv.
+Only the host-specific runtime guard path is relocated into a temporary
+directory; no snap, browser, display, audio server or network is used.
+
+--remote-debugging-pipe makes Chromium report navigator.webdriver=true to every
+page. --disable-blink-features=AutomationControlled keeps the CDP pipe while
+pages observe webdriver=false; it must appear exactly once, after the pipe
+switch, and no other automation or remote-debugging switch may appear.
+"""
+import importlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+import private_profile as pp
+
+AC_FLAG = '--disable-blink-features=AutomationControlled'
+LAUNCH = ['--load-extension=/x/ext,/x/ubol', '--kiosk', '--ozone-platform=x11', '--class=BaazPrivateTrial',
+          '--window-size=1920,1080', '--force-device-scale-factor=2',
+          'http://{{SPARK_IP}}:4177/' + 'c' * 48 + '/fixture']
+GUARD = '^/run/user/1000/snap\\.chromium/baaz-private-[a-f0-9]{16}$'
+
+
+class FakeAudio:
+    server = 'unix:/run/user/1000/pulse/native'
+    name = 'r2d2_' + '0' * 32
+
+    def environment(self):
+        return {}
+
+
+@unittest.skipUnless(Path('/bin/bash').is_file(), 'bash required')
+class ChromiumArgv(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix='r2d2_argv_')).resolve()
+        self.addCleanup(shutil.rmtree, self.work, True)
+
+    def chrome_argv(self, bootstrap=None):
+        audio = importlib.import_module('audio')
+        private = self.work / ('baaz-private-' + '0123456789abcdef')
+        (private / 'profile').mkdir(parents=True)
+        profile = object.__new__(pp.PrivateProfile)
+        profile.path = private
+        argv, _ = audio.browser_launch(profile, list(LAUNCH), FakeAudio())
+        self.assertEqual(argv[:7], ['/usr/bin/snap', 'run', '--shell', 'chromium', '--noprofile', '--norc', '-c'])
+        script, rest = argv[7], argv[8:]
+        if bootstrap is not None:
+            script = bootstrap(script)
+        self.assertEqual(rest[:2], ['baaz-private', str(private)])
+        self.assertEqual(rest[2:], LAUNCH)
+        self.assertEqual(script.count('exec "$SNAP/usr/lib/chromium-browser/chrome"'), 1)
+        self.assertEqual(script.count(GUARD), 1)
+        self.assertRegex(str(self.work), r'^[A-Za-z0-9_./-]+$')
+        script = script.replace(GUARD, '^' + str(self.work).replace('.', '\\.') + '/baaz-private-[a-f0-9]{16}$')
+        snap = self.work / 'snap'
+        stub = snap / 'usr/lib/chromium-browser/chrome'
+        stub.parent.mkdir(parents=True)
+        stub.write_text('#!%s\nimport json,os,sys\nopen(os.environ["ARGV_OUT"],"w").write(json.dumps(sys.argv[1:]))\n'
+                        % sys.executable)
+        stub.chmod(0o700)
+        env = {'PATH': '/usr/bin:/bin', 'SNAP': str(snap), 'SNAP_NAME': 'chromium',
+               'ARGV_OUT': str(self.work / 'argv.json')}
+        result = subprocess.run(['/bin/bash', '--noprofile', '--norc', '-c', script] + rest, env=env,
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        return json.loads((self.work / 'argv.json').read_text())
+
+    def test_pages_do_not_see_automation(self):
+        argv = self.chrome_argv()
+        self.assertEqual(argv.count(AC_FLAG), 1)
+        self.assertEqual(argv.count('--remote-debugging-pipe'), 1)
+        self.assertLess(argv.index('--remote-debugging-pipe'), argv.index(AC_FLAG))
+        self.assertEqual([a for a in argv if a.startswith('--disable-blink-features')], [AC_FLAG])
+        self.assertFalse(any(a.startswith(('--enable-automation', '--enable-blink-features', '--remote-debugging-port'))
+                             for a in argv))
+        self.assertEqual(argv[:4], ['--incognito', '--no-first-run', '--no-default-browser-check', '--gtk-version=3'])
+        self.assertEqual(argv[-len(LAUNCH):], LAUNCH)
+
+    def test_control_without_the_switch_keeps_the_pipe_only(self):
+        argv = self.chrome_argv(lambda script: script.replace(' ' + AC_FLAG, '', 1))
+        self.assertEqual((argv.count(AC_FLAG), argv.count('--remote-debugging-pipe')), (0, 1))
+
+    def test_bootstrap_carries_the_switch_once(self):
+        self.assertEqual(pp.BOOTSTRAP.count(AC_FLAG), 1)
+        self.assertEqual(pp.BOOTSTRAP.count('--remote-debugging-pipe'), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,105 @@
+"""Trial-side mirror of the Manager's closed voice receipt card.
+
+Written only by the authenticated inherited Manager channel and read only by the
+/metrics heartbeat reply. Trial also runs without voice control, so this module
+never imports voice_control. The search echo is never logged, persisted or
+copied into metrics, and the mirror forgets everything 2.5 s after a push.
+"""
+import json
+import re
+import threading
+import time
+import unicodedata
+
+EXPIRY_S = 2.5
+ECHO_S = 8.0
+MAX_REPLY = 1024
+MAX_SEQUENCE = 2147483647
+KEYS = frozenset(('v', 'seq', 'phase', 'ageMs', 'tone', 'word', 'headline', 'detail',
+                  'badge', 'meter', 'meterMs', 'dwellMs', 'mood', 'echo'))
+ENUMS = (
+    ('phase', ('idle', 'pressed', 'listening', 'released', 'doing', 'confirm', 'result'), False),
+    ('tone', ('idle', 'ready', 'listen', 'work', 'done', 'sent', 'unsure', 'nothing', 'failed', 'ask'), False),
+    ('mood', ('idle', 'front', 'listening', 'thinking', 'verified', 'asking', 'dim', 'sleepy'), False),
+    ('badge', ('confirmed', 'sent', 'unconfirmed', 'nothing', 'changed', 'failed', 'waiting'), True),
+    ('meter', ('hold', 'sweep', 'countdown'), True))
+COPY = r'[ -~\u2018\u2019\u201c\u201d\u2026]{0,%d}'
+REFUSED = ('Cc', 'Cf', 'Cs', 'Co', 'Cn', 'Zl', 'Zp')
+
+
+def bounded(value, high):
+    return type(value) is int and 0 <= value <= high
+
+
+def valid_card(value):
+    """Same closed shape the Manager channel admits, checked again on this side."""
+    if type(value) is not dict or set(value) != KEYS or type(value['v']) is not int or value['v'] != 1:
+        return False
+    if (not bounded(value['seq'], MAX_SEQUENCE) or not bounded(value['ageMs'], 600000) or
+            not all(value[k] is None and nullable or type(value[k]) is str and value[k] in options
+                    for k, options, nullable in ENUMS) or
+            not all(value[k] is None or bounded(value[k], 20000) for k in ('meterMs', 'dwellMs')) or
+            not all(type(value[k]) is str for k in ('word', 'headline', 'detail')) or
+            re.fullmatch(r"[A-Z' \u2019]{0,20}", value['word']) is None or
+            re.fullmatch(COPY % 40, value['headline']) is None or
+            re.fullmatch(COPY % 72, value['detail']) is None):
+        return False
+    echo = value['echo']
+    if echo is not None and (type(echo) is not str or not 1 <= len(echo) <= 48 or
+                             value['phase'] not in ('doing', 'result') or
+                             any(unicodedata.category(c) in REFUSED for c in echo)):
+        return False
+    return value['phase'] != 'idle' or (value['word'] == value['headline'] == value['detail'] == '' and
+                                        value['badge'] is None and value['meter'] is None and echo is None)
+
+
+class VoiceCard:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        # Leaf lock: the heartbeat handler may already hold Trial.lock and the
+        # channel thread holds nothing else. Reentrant because request_stop can
+        # run from a signal handler on a thread that is inside this lock.
+        self.lock = threading.RLock()
+        self.card = self.at = self.delivered = None
+        self.closed = False
+
+    def exchange(self, card):
+        """Channel thread: keep the newest card; report one recent delivery once."""
+        now = self.clock()
+        with self.lock:
+            fresh = not self.closed and (card is None or valid_card(card))
+            self.card, self.at = (dict(card) if fresh and card is not None else None), now
+            seq, at = self.delivered or (None, None)
+            self.delivered = None
+            return {'delivered': seq if at is not None and 0 <= now - at <= EXPIRY_S else None}
+
+    def reply(self, close=False):
+        """Heartbeat reply bytes (at most MAX_REPLY) and the card seq they carry."""
+        now = self.clock()
+        with self.lock:
+            card = None
+            if not self.closed and self.card is not None and 0 <= now - self.at <= EXPIRY_S:
+                card = dict(self.card)
+                card['ageMs'] = min(600000, card['ageMs'] + round((now - self.at) * 1000))
+                if card['ageMs'] > ECHO_S * 1000:
+                    card['echo'] = None
+        # Escaped astral echo characters can exceed the viewer's bound: drop the
+        # echo before the card, and never the close request.
+        for value in ((card, dict(card, echo=None), None) if card is not None else (None,)):
+            body = {'ok': True, 'voice': value}
+            if close:
+                body['close'] = True
+            data = json.dumps(body, separators=(',', ':'), ensure_ascii=True, allow_nan=False).encode('ascii')
+            if len(data) <= MAX_REPLY:
+                return data, value['seq'] if value is not None else None
+
+    def mark_delivered(self, seq):
+        """A non-final heartbeat reply carrying this seq was written to the viewer."""
+        with self.lock:
+            if not self.closed and bounded(seq, MAX_SEQUENCE) and (self.delivered is None or seq >= self.delivered[0]):
+                self.delivered = (seq, self.clock())
+
+    def close(self):
+        self.closed = True
+        with self.lock:
+            self.card = self.at = self.delivered = None

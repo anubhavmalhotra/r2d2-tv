@@ -1,0 +1,43 @@
+"""Own fixed extension activation check; no arbitrary URL/content/request capture."""
+import json,re,time
+from dns_proof import ProofError,_id
+
+FIELDS={'qualified','incognito','rulesetsExact','sameContext','localStartRestored'}
+PROOF={'state':'complete','incognito':True,'incognitoAllowed':True,'rulesetsExact':True,'ruleSetCount':4,'ownerPolicyExact':True}
+
+def prove(page,extension_id):
+    if not re.fullmatch('[a-p]{32}',extension_id) or getattr(page,'protection_attempted',False):
+        raise ProofError('PROTECTION_SCOPE')
+    page.protection_attempted=True
+    if not _id(page.context) or not _id(page.target) or not _id(page.session):raise ProofError('PROTECTION_OWNER')
+    original=(page.context,page.target,page.session)
+    page.assert_alive();page.deadline=time.monotonic()+8
+    def navigate(url):
+        value=page._call('Page.navigate',{'url':url},True)
+        if 'errorText'in value or value.get('isDownload')is True or not _id(value.get('frameId')):
+            raise ProofError('PROTECTION_NAVIGATION')
+    def wait_for(expression,expected):
+        for _ in range(20):
+            page._remaining()
+            try:value=page._evaluate(expression)
+            except ProofError as exc:
+                if str(exc)!='PAGE_CONTEXT_TRANSITION':raise
+                value=None
+            # Python bool equals int; make native receipt type checks explicit.
+            if type(value)is dict and set(value)==set(expected) and all(type(value[k])is type(v) and value[k]==v for k,v in expected.items()):return
+            time.sleep(.05)
+        raise ProofError('PROTECTION_NOT_PROVED')
+    navigate('chrome-extension://'+extension_id+'/proof.html')
+    wait_for('globalThis.r2d2ProtectionProof||null',PROOF)
+    navigate(page.start_url)
+    wait_for('(()=>({local:location.href==='+json.dumps(page.start_url)+',loaded:document.readyState==="interactive"||document.readyState==="complete"}))()',{'local':True,'loaded':True})
+    # Do not leave the extension proof document in disposable user Back history.
+    page._call('Page.resetNavigationHistory',{},True)
+    history=page._call('Page.getNavigationHistory',{},True);entries=history.get('entries')
+    if type(history.get('currentIndex'))is not int or history['currentIndex']!=0 or type(entries)is not list or len(entries)!=1 or type(entries[0])is not dict or entries[0].get('url')!=page.start_url:
+        raise ProofError('PROTECTION_HISTORY')
+    del history,entries
+    page.assert_alive()
+    if (page.context,page.target,page.session)!=original:raise ProofError('PROTECTION_OWNER_CHANGED')
+    page.protection_preflight=dict.fromkeys(FIELDS,True)
+    return dict(page.protection_preflight)

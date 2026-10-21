@@ -1,0 +1,435 @@
+"""Local weather for Home. RAM-only, no access/history logging.
+
+Location is never configured or built in. Spark asks ipinfo.io for the
+city-level coordinates of its own public IP (US only), rounds them to two
+decimals (about 1 km), and asks api.weather.gov for the nearest observation
+stations. Only those station ids are kept, in RAM, and they are re-resolved
+every 24 hours; the coordinates and every other lookup field are discarded at
+once. Nothing about the location is logged or written to disk.
+
+Readings: one real-time METAR request for the discovered stations, with the
+nearest station's NWS latest observation as a backup when METAR gives no fresh
+reading. The last good reading is kept across failed polls; its age alone
+decides live versus stale. The snapshot never carries a postal code.
+"""
+import datetime as dt
+import http.client
+import json
+import math
+import re
+import socket
+import ssl
+import threading
+import time
+
+ENABLED = {{WEATHER_ENABLED_PY}}
+LOCATE_HOST = 'ipinfo.io'
+LOCATE_PATH = '/json'
+METAR_HOST = 'aviationweather.gov'
+METAR_PATH = '/api/data/metar'
+NWS_HOST = 'api.weather.gov'
+NWS_ORIGIN = 'https://' + NWS_HOST
+INTERVAL = 600    # seconds between polls while the best reading is fresh
+RETRY = 60        # after a failed poll, or while the best reading is not fresh
+FRESH = 4500      # 75 min: an older station report yields to a fresher one
+STALE = 7200      # Home's stale threshold (2 h)
+RESOLVE = 86400   # re-resolve location and stations daily (moves, VPN changes)
+LOCATE_RETRY = 60       # first retry after a failed location or station lookup
+LOCATE_RETRY_MAX = 600  # backoff ceiling for those retries
+MAX_BYTES = 65536
+LOCATE_BYTES = 4096
+MAX_METARS = 64
+MAX_STATIONS = 3
+STATION_LIMIT = 25  # nearest stations asked of weather.gov; keeps the reply small
+ICONS = frozenset(('clear','partly-cloudy','cloudy','fog','rain','snow','storm','wind','unknown'))
+CONDITION = r'[A-Za-z0-9 ,./()\-]{1,64}'
+STAMP = '%Y-%m-%dT%H:%M:%SZ'
+UTC = dt.timezone.utc
+STATION_ID = re.compile(r'[A-Z0-9]{4}')
+LOC = re.compile(r'(-?\d{1,2}(?:\.\d{1,8})?),(-?\d{1,3}(?:\.\d{1,8})?)')
+STATIONS_URL = re.compile(r'https://api\.weather\.gov/gridpoints/[A-Z]{3}/\d{1,3},\d{1,3}/stations')
+# Every request path is one of these; anything else never connects.
+_PATHS = {
+    LOCATE_HOST: (re.compile(re.escape(LOCATE_PATH)),),
+    NWS_HOST: (re.compile(r'/points/-?\d{1,2}\.\d{2},-?\d{1,3}\.\d{2}'),
+               re.compile(r'/gridpoints/[A-Z]{3}/\d{1,3},\d{1,3}/stations\?limit=' + str(STATION_LIMIT)),
+               re.compile(r'/stations/[A-Z0-9]{4}/observations/latest')),
+    METAR_HOST: (re.compile(re.escape(METAR_PATH) + r'\?ids=[A-Z0-9]{4}(?:,[A-Z0-9]{4}){0,2}&format=json'),),
+}
+
+def unavailable():
+    return dict(state='unavailable',zip='',temperatureF=None,condition=None,icon=None,observedAt=None)
+
+def _checked(stations):
+    """Discovered ids in preference order; refuse anything but 1-3 distinct ids."""
+    if (type(stations) is not tuple or not 1<=len(stations)<=MAX_STATIONS or
+        not all(type(s) is str and STATION_ID.fullmatch(s) for s in stations) or len(set(stations))!=len(stations)):
+        raise ValueError('STATIONS')
+    return stations
+
+def metar_path(stations):
+    return METAR_PATH+'?ids='+','.join(_checked(stations))+'&format=json'
+
+def nws_path(station):
+    return '/stations/'+_checked((station,))[0]+'/observations/latest'
+
+def points_path(lat, lon):
+    if (type(lat) is not float or type(lon) is not float or not math.isfinite(lat) or not math.isfinite(lon) or
+        not -90<=lat<=90 or not -180<=lon<=180):
+        raise ValueError('COORDINATES')
+    return '/points/%.2f,%.2f'%(round(lat,2)+0.0,round(lon,2)+0.0)
+
+def _icon(text):
+    text=text.lower()
+    for words,icon in ((('thunder','storm','tornado'),'storm'),(('snow','sleet','ice','freezing'),'snow'),
+                       (('rain','drizzle','shower'),'rain'),(('fog','mist','haze','smoke'),'fog'),
+                       (('partly','few clouds','mostly clear'),'partly-cloudy'),(('cloud','overcast'),'cloudy'),
+                       (('wind','breezy'),'wind'),(('clear','fair','sunny'),'clear')):
+        if any(word in text for word in words):return icon
+    return 'unknown'
+
+def _pairs(items):
+    out={}
+    for key,value in items:
+        if key in out:raise ValueError('DUPLICATE')
+        out[key]=value
+    return out
+
+def _constant(_):
+    raise ValueError('CONSTANT')
+
+def _loads(raw, cap=MAX_BYTES):
+    if type(raw) is not bytes or not 0<len(raw)<=cap:raise ValueError('SIZE')
+    return json.loads(raw,object_pairs_hook=_pairs,parse_constant=_constant)
+
+_ERRORS = (KeyError,TypeError,ValueError,OverflowError,RecursionError,AttributeError)
+
+def parse_locate(raw):
+    """(lat, lon) rounded to 2 decimals from ipinfo's "loc", US only, else None.
+    Every other field (ip, city, region, postal, org, ...) is dropped here."""
+    try:
+        root=_loads(raw,LOCATE_BYTES)
+        if type(root) is not dict:return None
+        loc,country=root.get('loc'),root.get('country')
+        root.clear()
+        if country!='US' or type(loc) is not str:return None
+        match=LOC.fullmatch(loc)
+        if match is None:return None
+        lat,lon=float(match[1]),float(match[2])
+        if not math.isfinite(lat) or not math.isfinite(lon) or not -90<=lat<=90 or not -180<=lon<=180:return None
+        return round(lat,2)+0.0,round(lon,2)+0.0
+    except _ERRORS:return None
+
+def parse_points(raw):
+    """The gridpoint's observation-stations path from a points reply, else None."""
+    try:
+        url=_loads(raw)['properties']['observationStations']
+        if type(url) is not str or not STATIONS_URL.fullmatch(url):return None
+        return url[len(NWS_ORIGIN):]+'?limit='+str(STATION_LIMIT)
+    except _ERRORS:return None
+
+def parse_stations(raw):
+    """First MAX_STATIONS distinct 4-character ids, in the reply's (distance) order."""
+    try:
+        features=_loads(raw)['features']
+        if type(features) is not list:return None
+        out=[]
+        for feature in features:
+            props=feature.get('properties') if type(feature) is dict else None
+            station=props.get('stationIdentifier') if type(props) is dict else None
+            if type(station) is str and STATION_ID.fullmatch(station) and station not in out:
+                out.append(station)
+                if len(out)==MAX_STATIONS:break
+        return tuple(out) or None
+    except _ERRORS:return None
+
+def _observed(value):
+    return dt.datetime.strptime(value['observedAt'],STAMP).replace(tzinfo=UTC)
+
+def _age(value, now=None):
+    return ((now or dt.datetime.now(UTC))-_observed(value)).total_seconds()
+
+def _reading(celsius, observed, condition, icon, now):
+    """Common reading checks; never fill a missing temperature/time."""
+    if type(celsius) not in (int,float) or not math.isfinite(celsius):return None
+    if (observed-now).total_seconds()>300:return None
+    fahrenheit=celsius*9/5+32
+    if not math.isfinite(fahrenheit):return None
+    f=round(fahrenheit)
+    if not -100<=f<=150:return None
+    if type(condition) is not str or not re.fullmatch(CONDITION,condition) or not condition.strip() or icon not in ICONS:return None
+    return dict(temperatureF=f,condition=condition.strip(),icon=icon,observedAt=observed.strftime(STAMP))
+
+def parse_observation(raw, station, now=None):
+    """NWS observations/latest of the nearest discovered station."""
+    now=now or dt.datetime.now(UTC)
+    try:
+        root=_loads(raw)
+        p=root['properties']
+        if type(p) is not dict or p.get('station')!=NWS_ORIGIN+'/stations/'+_checked((station,))[0]:return None
+        temp=p['temperature'];c=temp['value'];condition=p.get('textDescription');stamp=p['timestamp']
+        if condition is None or (type(condition) is str and not condition.strip()):
+            condition='Conditions unavailable'
+        if (temp.get('unitCode')!='wmoUnit:degC' or type(condition) is not str or
+            type(stamp) is not str or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:Z|[+-]\d\d:\d\d)',stamp)):
+            return None
+        observed=dt.datetime.fromisoformat(stamp.replace('Z','+00:00')).astimezone(UTC)
+        return _reading(c,observed,condition,_icon(condition),now)
+    except _ERRORS:return None
+
+# METAR present weather. Lower rank wins across all tokens: thunder, then
+# snow/ice, rain, wind-borne, and obscurations; cloud cover only without any.
+_WX = re.compile(r'(-|\+|VC)?(MI|PR|BC|DR|BL|SH|TS|FZ)?((?:DZ|RA|SN|SG|IC|PL|GR|GS|UP|BR|FG|FU|VA|DU|SA|HZ|PY|PO|SQ|FC|SS|DS)*)')
+_PHENOMENA = {
+    'FC':(0,'Funnel Cloud','storm'),
+    'GR':(1,'Hail','snow'),'GS':(1,'Small Hail','snow'),'PL':(1,'Ice Pellets','snow'),
+    'SN':(1,'Snow','snow'),'SG':(1,'Snow Grains','snow'),'IC':(1,'Ice Crystals','snow'),
+    'RA':(2,'Rain','rain'),'DZ':(2,'Drizzle','rain'),'UP':(2,'Precipitation','rain'),
+    'SQ':(3,'Squalls','wind'),'DS':(3,'Dust Storm','wind'),'SS':(3,'Sandstorm','wind'),'PO':(3,'Dust Whirls','wind'),
+    'FG':(4,'Fog','fog'),'BR':(4,'Mist','fog'),'HZ':(4,'Haze','fog'),'FU':(4,'Smoke','fog'),
+    'VA':(4,'Volcanic Ash','fog'),'DU':(4,'Dust','fog'),'SA':(4,'Sand','fog'),'PY':(4,'Spray','fog'),
+}
+_COVER = {'CLR':0,'SKC':0,'NSC':0,'NCD':0,'CAVOK':0,'FEW':1,'SCT':2,'BKN':3,'OVC':4,'OVX':4}
+_SKY = (('Clear','clear'),('Mostly Clear','partly-cloudy'),('Partly Cloudy','partly-cloudy'),
+        ('Mostly Cloudy','cloudy'),('Cloudy','cloudy'))
+
+def _wx_token(token):
+    match=_WX.fullmatch(token)
+    if match is None:return None
+    intensity,descriptor,codes=match.groups()
+    codes=[codes[i:i+2] for i in range(0,len(codes),2)]
+    if descriptor=='TS':best=(0,'Thunderstorm','storm')
+    elif descriptor=='FZ' and ('RA' in codes or 'DZ' in codes):
+        best=(1,'Freezing Rain' if 'RA' in codes else 'Freezing Drizzle','snow')
+    elif not codes:
+        if descriptor!='SH':return None
+        best=(2,'Showers','rain')
+    else:
+        rank,text,icon=min((_PHENOMENA[code] for code in codes),key=lambda item:item[0])
+        if text=='Funnel Cloud' and intensity=='+':text='Tornado';intensity=None
+        elif descriptor=='SH' and rank<=2:text+=' Showers'
+        elif descriptor in ('BL','DR'):
+            text=('Blowing ' if descriptor=='BL' else 'Drifting ')+text
+            if rank==4:rank,icon=3,'wind'
+        elif descriptor=='FZ' and text=='Fog':text='Freezing Fog'
+        elif descriptor in ('MI','PR','BC') and text=='Fog':
+            text={'MI':'Shallow Fog','PR':'Partial Fog','BC':'Patches of Fog'}[descriptor]
+        best=(rank,text,icon)
+    rank,text,icon=best
+    if intensity=='VC':text+=' Nearby'
+    elif intensity and rank<=2:text=('Light ' if intensity=='-' else 'Heavy ')+text
+    return rank,text,icon
+
+def metar_condition(wx, cover, clouds):
+    """(condition, icon) from wxString, then cloud cover. Unknown codes are ignored."""
+    if wx is not None:
+        if type(wx) is not str or len(wx)>64:return None
+        found=[item for item in map(_wx_token,wx.split()) if item is not None]
+        if found:
+            _,text,icon=min(found,key=lambda item:item[0])
+            return text,icon
+    level=_COVER.get(cover) if type(cover) is str else None
+    if level is None and type(clouds) is list:
+        levels=[_COVER[c['cover']] for c in clouds if type(c) is dict and type(c.get('cover')) is str and c['cover'] in _COVER]
+        level=max(levels) if levels else None
+    return _SKY[level] if level is not None else ('Conditions unavailable','unknown')
+
+def _metar_reading(item, stations, now):
+    if type(item) is not dict:return None
+    station=item.get('icaoId');stamp=item.get('obsTime')
+    if type(station) is not str or station not in stations:return None
+    if type(stamp) is not int or not 0<stamp<2**33:return None
+    sky=metar_condition(item.get('wxString'),item.get('cover'),item.get('clouds'))
+    if sky is None:return None
+    reading=_reading(item.get('temp'),dt.datetime.fromtimestamp(stamp,UTC),sky[0],sky[1],now)
+    return None if reading is None else (station,reading)
+
+def metar_readings(raw, stations, now=None):
+    """Newest valid reading per discovered station from one METAR JSON response."""
+    now=now or dt.datetime.now(UTC)
+    try:
+        stations=_checked(stations)
+        root=_loads(raw)
+        if type(root) is not list or len(root)>MAX_METARS:return {}
+        out={}
+        for item in root:
+            found=_metar_reading(item,stations,now)
+            if found is not None and (found[0] not in out or _observed(found[1])>_observed(out[found[0]])):
+                out[found[0]]=found[1]
+        return out
+    except _ERRORS+(OSError,):return {}
+
+def select_metar(readings, stations, now=None):
+    """First station in distance order reporting within FRESH; otherwise the freshest."""
+    now=now or dt.datetime.now(UTC)
+    for station in _checked(stations):
+        value=readings.get(station)
+        if value is not None and _age(value,now)<=FRESH:return value
+    return newest(*readings.values())
+
+def parse_metar(raw, stations, now=None):
+    try:return select_metar(metar_readings(raw,stations,now),stations,now)
+    except _ERRORS:return None
+
+def newest(*values):
+    best=None
+    for value in values:
+        if value is not None and (best is None or _observed(value)>_observed(best)):best=value
+    return best
+
+def allowed(host, path):
+    patterns=_PATHS.get(host,()) if type(host) is str else ()
+    return type(path) is str and any(pattern.fullmatch(path) for pattern in patterns)
+
+def _fetch(stop, host, path, accept, types, cap=MAX_BYTES):
+    # Fixed hosts and strictly validated paths; HTTPSConnection neither follows
+    # redirects nor uses an environment proxy. The default TLS context verifies
+    # certificate and hostname. Replies and errors are never logged.
+    if not allowed(host,path):return None
+    conn=http.client.HTTPSConnection(host,timeout=5,context=ssl.create_default_context())
+    expired=threading.Event();deadline=time.monotonic()+5;active=[]
+    def interrupt():
+        expired.set()
+        sock=active[0] if active else None
+        if sock is not None:
+            try:sock.shutdown(socket.SHUT_RDWR)
+            except OSError:pass
+        conn.close()
+    timer=threading.Timer(5,interrupt);timer.daemon=True;timer.start()
+    try:
+        if stop.is_set():return None
+        conn.connect()
+        active.append(conn.sock)
+        if stop.is_set() or expired.is_set() or time.monotonic()>=deadline:return None
+        conn.sock.settimeout(max(.001,deadline-time.monotonic()))
+        conn.request('GET',path,headers={'User-Agent':'R2D2-Home/1.0','Accept':accept,'Accept-Encoding':'identity'})
+        response=conn.getresponse()
+        if response.status!=200 or response.getheader('Content-Encoding','identity')!='identity':return None
+        if response.getheader('Content-Type','').split(';',1)[0].strip().lower() not in types:return None
+        length=response.getheader('Content-Length')
+        if length is not None and (not length.isascii() or not length.isdecimal() or int(length)>cap):return None
+        raw=response.read(cap+1)
+        if expired.is_set() or stop.is_set() or time.monotonic()>=deadline or len(raw)>cap:return None
+        return raw
+    except (OSError,ValueError,http.client.HTTPException):return None
+    finally:timer.cancel();conn.close()
+
+_GEO = ('application/geo+json','application/json')
+
+def fetch_locate(stop):
+    return _fetch(stop,LOCATE_HOST,LOCATE_PATH,'application/json',('application/json',),LOCATE_BYTES)
+
+def fetch_points(stop, place):
+    try:path=points_path(*place)
+    except (TypeError,ValueError):return None
+    return _fetch(stop,NWS_HOST,path,'application/geo+json',_GEO)
+
+def fetch_stations(stop, path):
+    return _fetch(stop,NWS_HOST,path,'application/geo+json',_GEO)
+
+def fetch_metar(stop, stations):
+    try:path=metar_path(stations)
+    except (TypeError,ValueError):return None
+    return _fetch(stop,METAR_HOST,path,'application/json',('application/json',))
+
+def fetch_observation(stop, station):
+    try:path=nws_path(station)
+    except (TypeError,ValueError):return None
+    return _fetch(stop,NWS_HOST,path,'application/geo+json',_GEO)
+
+def discover(stop):
+    """Nearest station ids for Spark's public IP, or None. The rounded
+    coordinates live only in this call; nothing else from the lookup survives it."""
+    place=parse_locate(fetch_locate(stop))
+    if place is None or stop.is_set():return None
+    path=parse_points(fetch_points(stop,place))
+    del place
+    if path is None or stop.is_set():return None
+    return parse_stations(fetch_stations(stop,path))
+
+def locate_delay(failures):
+    """60 s after the first failed lookup, doubling to a 10 min ceiling."""
+    return min(LOCATE_RETRY*2**min(max(failures,1)-1,16),LOCATE_RETRY_MAX)
+
+def poll(stop, stations, now=None):
+    """One poll: METAR first; NWS only when METAR has no fresh reading. Newest wins."""
+    try:metar=parse_metar(fetch_metar(stop,stations),stations,now)
+    except Exception:metar=None # no exception contents or response logging
+    if metar is not None and _age(metar,now)<=FRESH:return metar
+    if stop.is_set():return None
+    try:nws=parse_observation(fetch_observation(stop,stations[0]),stations[0],now)
+    except Exception:nws=None
+    return newest(metar,nws)
+
+def merge(previous, candidate, now=None):
+    """Keep the last good reading across failures and never step back to an older,
+    non-fresh one; a fresh reading of a nearer station always replaces it."""
+    if candidate is None:return previous
+    if previous is None or _observed(candidate)>=_observed(previous) or _age(candidate,now)<=FRESH:return candidate
+    return previous
+
+def next_delay(candidate, value, now=None):
+    return RETRY if candidate is None or value is None or _age(value,now)>FRESH else INTERVAL
+
+class Weather:
+    # Location state is only _stations (discovered ids) and when to re-resolve them.
+    def __init__(self):
+        self._lock=threading.Lock();self._stop=threading.Event();self._thread=None;self._started=False;self._value=None
+        self._stations=();self._resolve_at=None;self._failures=0;self._clock=time.monotonic
+    def start(self):
+        if not ENABLED:return False
+        with self._lock:
+            if self._started or self._stop.is_set():return False
+            self._started=True
+            thread=threading.Thread(target=self._run,name='r2d2-weather',daemon=True)
+            try:thread.start()
+            except RuntimeError:self._stop.set();return False
+            self._thread=thread
+        return True
+    def _locate(self):
+        """Cached station ids; re-resolved once the 24 h cache or a retry is due.
+        A failed re-resolve keeps the previous ids (and retries with backoff)."""
+        current=self._clock()
+        with self._lock:
+            if self._resolve_at is not None and current<self._resolve_at:return self._stations
+        try:found=discover(self._stop)
+        except Exception:found=None # no exception contents or response logging
+        with self._lock:
+            if self._stop.is_set():return ()
+            if found:
+                if found!=self._stations:self._value=None # a reading from elsewhere is not kept
+                self._stations,self._failures,self._resolve_at=found,0,current+RESOLVE
+            else:
+                self._failures+=1;self._resolve_at=current+locate_delay(self._failures)
+            return self._stations
+    def _step(self, now=None):
+        """Locate if due, then one poll folded into the kept reading; returns the
+        next delay, or None once stopped."""
+        try:stations=self._locate()
+        except Exception:stations=() # no exception contents or response logging
+        if not stations:
+            with self._lock:return None if self._stop.is_set() else locate_delay(self._failures)
+        try:candidate=poll(self._stop,stations,now)
+        except Exception:candidate=None # no exception contents or response logging
+        now=now or dt.datetime.now(UTC)
+        with self._lock:
+            if self._stop.is_set():return None
+            try:
+                self._value=merge(self._value,candidate,now)
+                return next_delay(candidate,self._value,now)
+            except Exception:return RETRY
+    def _run(self):
+        while not self._stop.is_set():
+            delay=self._step()
+            if delay is None or self._stop.wait(delay):break
+    def snapshot(self):
+        with self._lock:value=None if self._value is None or self._stop.is_set() else dict(self._value)
+        if value is None:return unavailable()
+        age=_age(value)
+        if age < -300:return unavailable()
+        return dict(state='stale' if age>STALE else 'live',zip='',**value)
+    def close(self):
+        self._stop.set()
+        with self._lock:thread=self._thread;self._value=None;self._stations=();self._resolve_at=None
+        if thread is not None:thread.join(6)
+        return thread is None or not thread.is_alive()

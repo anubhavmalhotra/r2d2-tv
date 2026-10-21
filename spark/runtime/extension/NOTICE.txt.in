@@ -1,0 +1,8 @@
+R2D2 authored adapter and CSS: GPL-3.0-or-later.
+Filter data adapted from:
+- uBlock Origin Lite, Copyright (C) 2022-present Raymond Hill; GPL-3.0-or-later.
+- EasyList and EasyPrivacy, The EasyList authors (https://easylist.to/); GPL-3.0-or-later or CC BY-SA 3.0 Unported or later, used here under GPL-3.0-or-later.
+- uBlock filters - Badware risks, uBlock Origin uAssets contributors (https://github.com/uBlockOrigin/uAssets); GPL-3.0.
+Upstream: https://github.com/uBlockOrigin/uBOL-home/tree/0d79e9ea78e8bfe31fa139abbce5d63957638fa3
+Original bytes and exact transformation are included in the source stage. This is not uBlock Origin Lite and does not implement its full filtering behavior.
+Additional cosmetic selectors are parsed as data from EasyList compiled by the same pinned uBlock Origin Lite commit. Upstream executable code is not shipped. Generic filtering is omitted on all listed exception hosts. Owner rules are authored, browser-only firmware endpoint-domain seeds and their subdomains; they do not provide complete device network isolation.

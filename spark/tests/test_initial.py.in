@@ -1,0 +1,125 @@
+"""Initial AAC mux-DTS boundary controls; inert bytes, no codec execution."""
+import io,struct,unittest
+from fractions import Fraction
+import media_ring as m
+import test_media_ring as f
+from test_terminal import short_pair,trailer
+
+
+def native_init():
+    a,b=f.init_bytes();b=bytearray(b);p=b.index(b'mdhd');b[p+16:p+20]=f.words(15360)
+    return a,bytes(b)
+
+
+def native_pair(durations=(815,1024),*,seq=1,ad=0,vd=0,explicit=True,default=815,aflags=0x02000000,cts=0):
+    # Only numeric mux metadata matches the observed first native pair. Payloads
+    # are generated fixture bytes; no captured media was saved or reconstructed.
+    vids=[f.nal(19),f.nal(1)];auds=[b'aa']*len(durations)
+    def traf(track,start,data,offset):
+        video=track==1
+        tfhd=f.full(b'tfhd',f.words(track,256 if video else default,0,0x01010000 if video else aflags),0x20038)
+        tfdt=f.full(b'tfdt',struct.pack('>Q',start),version=1)
+        flags=0x205 if video else (0x301 if explicit else 0x201)
+        if cts and not video:flags|=0x800
+        payload=f.words(len(data))+struct.pack('>i',offset)
+        if video:payload+=f.words(0x02000000)
+        for i,raw in enumerate(data):
+            if flags&0x100:payload+=f.words(durations[i])
+            payload+=f.words(len(raw))
+            if flags&0x800:payload+=f.words(cts)
+        return f.box(b'traf',tfhd+tfdt+f.full(b'trun',payload,flags))
+    def build(v,a):return f.box(b'moof',f.full(b'mfhd',f.words(seq))+traf(1,vd,vids,v)+traf(2,ad,auds,a))
+    moof=build(0,0);moof=build(len(moof)+8,len(moof)+8+sum(map(len,vids)))
+    return moof,f.box(b'mdat',b''.join(vids+auds))
+
+
+class Initial(unittest.TestCase):
+    def parse(self,pair=None,**kw):
+        return m.parse_fragment(m.parse_init(*native_init()),*(pair or native_pair()),kw.get('index',0),kw.get('sequence',1),kw.get('prior',{}),_terminal_candidate=kw.get('terminal',False))
+    def test_actual_numeric_shape_accepts_unchanged_complete_pair(self):
+        pair=native_pair()
+        try:x=self.parse(pair)
+        except m.MediaError as exc:self.fail("initial boundary rejected: "+str(exc))
+        self.assertTrue(x.initial_audio_trim);self.assertFalse(x.terminal_audio_trim)
+        self.assertEqual((x.moof,x.mdat),pair);self.assertEqual(dict(x.decode_ends),{1:512,2:1839})
+        self.assertEqual((x.start,x.end),(Fraction(0),Fraction(1839,48000)))
+    def test_bounds_are_not_hardcoded_observation(self):
+        for dur in (1,256,814,815,816,1023):
+            with self.subTest(dur=dur):self.assertTrue(self.parse(native_pair((dur,1024))).initial_audio_trim)
+        self.assertFalse(self.parse(native_pair((1024,1024))).initial_audio_trim)
+    def test_zero_and_oversize_rejected(self):
+        for dur in (0,2048,48000,2**32-1):
+            with self.subTest(dur=dur),self.assertRaises(m.MediaError):self.parse(native_pair((dur,1024)))
+    def test_initial_audio_identity_is_per_track_not_global_fragment(self):
+        # A video-only prefix can precede the first audio sample. The audio
+        # start remains zero and its prior clock must be absent.
+        for idx,seq in ((1,1),(0,2),(1,2)):
+            with self.subTest(idx=idx,seq=seq):
+                self.assertTrue(self.parse(native_pair(seq=seq),index=idx,sequence=seq).initial_audio_trim)
+        for idx,seq in ((False,1),(0,True)):
+            with self.subTest(idx=idx,seq=seq),self.assertRaises(m.MediaError):
+                self.parse(native_pair(seq=seq),index=idx,sequence=seq)
+    def test_prior_clock_or_nonzero_audio_dts_refused(self):
+        for pair,prior in ((native_pair(ad=1),{}),(native_pair(),{1:0,2:0})):
+            with self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):self.parse(pair,prior=prior)
+    def test_only_first_sample_accepts_without_eof(self):
+        for durations in ((1024,815),(1024,815,1024),(815,815,1024)):
+            with self.subTest(durations=durations),self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):
+                self.parse(native_pair(durations))
+    def test_default_only_short_first_duration_from_tfhd_is_admitted(self):
+        # FFmpeg writes a single-sample first audio duration only as this traf's
+        # tfhd default (no trun 0x100). That source is admitted at the same
+        # zero-DTS/no-prior boundary; trex defaults never are (test_media_ring_startup).
+        pair=native_pair((815,),explicit=False)
+        x=self.parse(pair)
+        self.assertEqual((x.moof,x.mdat),pair);self.assertEqual(dict(x.decode_ends)[2],815)
+        self.assertTrue(x.initial_audio_trim);self.assertFalse(x.terminal_audio_trim)
+        with self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):self.parse(native_pair((815,815),explicit=False))
+    def test_flags_cts_bytes_and_first_idr_still_checked(self):
+        for pair in (native_pair(aflags=0x01010000),native_pair(cts=1),
+                     (native_pair()[0],native_pair()[1]+b'x')):
+            with self.assertRaises(m.MediaError):self.parse(pair)
+        r=f.ring()
+        with self.assertRaisesRegex(m.MediaError,'INITIAL_IDR_REQUIRED'):r.append(*short_pair(index=0,sync=False))
+        self.assertFalse(r.initial_audio_trim);self.assertEqual(r.next_index,0)
+    def test_commit_publishes_once_and_next_clock_is_original(self):
+        r=m.MediaRing('a'*32);r.initialize(*native_init());first=native_pair();r.append(*first)
+        self.assertEqual((r.next_index,r.prior,r.pending),(1,{1:512,2:1839},None))
+        self.assertTrue(r.snapshot()['initialAudioTrim']);self.assertFalse(r.ended)
+        r.append(*native_pair((1024,1024),seq=2,ad=1839,vd=512))
+        self.assertTrue(r.snapshot()['initialAudioTrim']);self.assertEqual(r.prior,{1:1024,2:3887})
+        x,_=r.read(r.resume(latest=False).cursor);self.assertEqual((x.moof,x.mdat),first)
+    def test_midstream_shortening_does_not_advance_state(self):
+        r=m.MediaRing('a'*32);r.initialize(*native_init());r.append(*native_pair())
+        before=(r.next_index,r.sequence,r.bytes,r.count,dict(r.prior),tuple(tuple(x)for x in r.groups))
+        with self.assertRaisesRegex(m.MediaError,'AUDIO_SAMPLE'):
+            r.append(*native_pair(seq=2,vd=512,ad=1839))
+        self.assertEqual((r.next_index,r.sequence,r.bytes,r.count,dict(r.prior),tuple(tuple(x)for x in r.groups)),before)
+    def test_initial_only_commits_before_eof_and_partial_next_is_failure(self):
+        raw=b''.join(native_init()+native_pair())+b'partial';r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read)
+        p.step();self.assertEqual(p.step(),'fragment');self.assertFalse(p.eof_seen);self.assertEqual(r.next_index,1)
+        with self.assertRaisesRegex(m.MediaError,'TRUNCATED_STREAM'):p.step()
+        self.assertEqual(r.next_index,1);self.assertFalse(r.ended)
+    def test_first_and_final_short_are_separate_eof_authorities(self):
+        raw=b''.join(native_init()+native_pair((815,256)))+trailer();r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read)
+        p.step();self.assertEqual(p.step(),'fragment');self.assertTrue(p.eof_seen and r.ended)
+        self.assertTrue(r.initial_audio_trim and r.terminal_audio_trim)
+        self.assertEqual(r.prior,{1:512,2:1071})
+    def test_first_and_final_short_next_fragment_rejected_transactionally(self):
+        raw=b''.join(native_init()+native_pair((815,256))+native_pair(seq=2,vd=512,ad=1071))
+        r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(raw).read);p.step()
+        with self.assertRaisesRegex(m.MediaError,'TERMINAL_AUDIO_NOT_LAST'):p.step()
+        self.assertEqual((r.next_index,r.prior,r.count,r.initial_audio_trim),(0,{},0,False))
+    def test_one_sample_first_boundary_does_not_need_eof(self):
+        x=self.parse(native_pair((815,)),terminal=True)
+        self.assertTrue(x.initial_audio_trim);self.assertFalse(x.terminal_audio_trim)
+    def test_first_shortening_does_not_bypass_capacity_or_skew(self):
+        pair=native_pair();size=sum(map(len,native_init()+pair))
+        r=m.MediaRing('a'*32,max_bytes=max(1024,size-1));r.initialize(*native_init())
+        with self.assertRaisesRegex(m.MediaError,'ACCESS_GROUP_OVERFLOW'):r.append(*pair)
+        self.assertEqual((r.next_index,r.prior,r.count,r.initial_audio_trim),(0,{},0,False))
+        r=m.MediaRing('a'*32);r.initialize(*native_init())
+        with self.assertRaisesRegex(m.MediaError,'AV_CLOCK_SKEW'):r.append(*native_pair(vd=10000))
+        self.assertEqual(r.next_index,0)
+
+if __name__=='__main__':unittest.main()

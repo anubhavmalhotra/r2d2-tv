@@ -1,0 +1,249 @@
+"""Linux-only owned descendant supervision. Signals use stable pidfds, never PIDs."""
+import ctypes
+import os
+import re
+from pathlib import Path
+import select
+import signal
+import subprocess
+import threading
+import time
+
+def classify_role(raw):
+    """Chromium can publish argv as NUL fields or one space-separated proctitle."""
+    if len(raw) > 65536:
+        return False, 'cmdline_limit'
+    exact = b'--type=renderer' in raw.split(b'\0')
+    packed = re.search(rb'(?:^|[\x00\t\n\r ])--type=renderer(?=[\x00\t\n\r ]|$)', raw) is not None
+    return (exact or packed), ('nul_renderer' if exact else 'packed_renderer' if packed else 'no_renderer_flag')
+
+def status(pid, diagnostics=False):
+    path = Path('/proc') / str(pid)
+    try:
+        # stat's command may contain spaces and parentheses; parse after its last ).
+        stat = (path / 'stat').read_text().rsplit(')', 1)[1].split()
+        values = dict(line.split(':', 1) for line in (path / 'status').read_text().splitlines() if ':' in line)
+        result = {'pid': pid, 'ppid': int(stat[1]), 'start': int(stat[19]), 'state': stat[0],
+                'renderer': False, 'role_shape': 'unread', 'read_error': None, 'errno': None,
+                'snap_apparmor_enforced': False,
+                'seccomp': values.get('Seccomp', '').strip(),
+                'no_new_privs': values.get('NoNewPrivs', '').strip(),
+                'namespace_pid_depth': len(values.get('NSpid', '').split()),
+                'uid': values.get('Uid', '').split()}
+    except (OSError, ValueError, IndexError) as exc:
+        if diagnostics:
+            return {'pid': pid, 'identity_unreadable': True, 'read_error': type(exc).__name__, 'errno': getattr(exc, 'errno', None)}
+        return None
+    try:
+        with open(path / 'cmdline', 'rb') as f:
+            raw = f.read(65537)
+        result['renderer'], result['role_shape'] = classify_role(raw)
+    except OSError as exc:
+        # Identity remains available for owned cleanup even when a hardened process hides argv.
+        result['role_shape'], result['read_error'] = 'cmdline_unreadable', type(exc).__name__
+        result['errno'] = exc.errno
+    try:
+        with open(path / 'attr/current', 'rb') as f:
+            result['snap_apparmor_enforced'] = f.read(257).strip() == b'snap.chromium.chromium (enforce)'
+    except OSError:
+        pass
+    return result
+
+def children(pid):
+    found = set()
+    try:
+        tasks = list((Path('/proc') / str(pid) / 'task').iterdir())
+        if len(tasks) > 2048:
+            raise RuntimeError('THREAD_LIMIT')
+        for task in tasks:
+            try:
+                found.update(int(x) for x in (task / 'children').read_text().split())
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    return found
+
+class ProcessOwner:
+    def __init__(self):
+        if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+            raise RuntimeError('PIDFD_REQUIRED')
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+        if libc.prctl(36, 1, 0, 0, 0):  # PR_SET_CHILD_SUBREAPER: detached grandchildren remain ours.
+            raise RuntimeError('SUBREAPER_REQUIRED')
+        self.root = os.getpid()
+        self.handles, self.processes, self.drainers = {}, [], []
+        self.retired, self.process_refs = [], {}
+        self.lock = threading.RLock()
+        self.stderr_bytes = 0
+        self.closed = False
+        self.disposed = False
+
+    def _parent_live(self, pid):
+        if pid == self.root:
+            return True
+        entry = self.handles.get(pid)
+        info = status(pid) if entry and self.live(pid) else None
+        return bool(info and info['start'] == entry[1] and self.live(pid))
+
+    def _track(self, pid, allowed_parent):
+        if not self._parent_live(allowed_parent):
+            return
+        if pid in self.handles:
+            if self.live(pid):
+                return
+            self.retired.append(self.handles.pop(pid)[0])
+        before = status(pid)
+        if not before or before['ppid'] != allowed_parent:
+            return
+        try:
+            fd = os.pidfd_open(pid, 0)
+        except ProcessLookupError:
+            return
+        after = status(pid)
+        if (not after or after['start'] != before['start'] or after['ppid'] != allowed_parent
+                or not self._parent_live(allowed_parent)):
+            os.close(fd)
+            return
+        if len(self.handles) + len(self.retired) >= 256:
+            os.close(fd)
+            raise RuntimeError('PROCESS_LIMIT')
+        self.handles[pid] = (fd, after['start'])
+
+    def discover(self):
+        with self.lock:
+            if self.disposed:
+                return
+            pending, seen = [self.root], set()
+            while pending:
+                pid = pending.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                if len(seen) > 257:
+                    raise RuntimeError('PROCESS_LIMIT')
+                if not self._parent_live(pid):
+                    continue
+                for child in children(pid):
+                    self._track(child, pid)
+                    if child in self.handles and self.live(child):
+                        pending.append(child)
+
+    def live(self, pid):
+        entry = self.handles.get(pid)
+        return not self.disposed and bool(entry) and not select.select([entry[0]], [], [], 0)[0]
+
+    def spawn(self, args, **kwargs):
+        with self.lock:
+            if self.closed or len(self.processes) >= 8:
+                raise RuntimeError('CHILD_LIMIT')
+            p = subprocess.Popen(args, stdin=kwargs.pop('stdin', subprocess.DEVNULL),
+                stderr=subprocess.PIPE, start_new_session=True, bufsize=0, **kwargs)
+            self.processes.append(p)
+            self._track(p.pid, self.root)
+            self.process_refs[id(p)] = self.handles.get(p.pid)
+            # stderr is drained, counted and discarded; tokens/profile messages are never logged.
+            def drain():
+                try:
+                    while True:
+                        block = p.stderr.read(4096)
+                        if not block:
+                            break
+                        with self.lock:
+                            self.stderr_bytes = min(1000000000, self.stderr_bytes + len(block))
+                except OSError:
+                    pass
+                finally:
+                    p.stderr.close()
+            t = threading.Thread(target=drain, daemon=True)
+            self.drainers.append(t)
+            t.start()
+            return p
+
+    def send(self, pid, sig):
+        with self.lock:
+            entry = self.handles.get(pid)
+            if entry and not self.disposed:
+                try:
+                    signal.pidfd_send_signal(entry[0], sig, None, 0)
+                except ProcessLookupError:
+                    pass
+
+    def terminate(self, process):
+        # Top-level encoder/helper handle only. A detached browser is handled by cleanup's subtree scan.
+        with self.lock:
+            entry = self.process_refs.get(id(process))
+            if not entry or self.disposed:
+                return
+            def alive():
+                return not self.disposed and not select.select([entry[0]], [], [], 0)[0]
+            def send(sig):
+                try:
+                    signal.pidfd_send_signal(entry[0], sig, None, 0)
+                except ProcessLookupError:
+                    pass
+            send(signal.SIGTERM)
+            end = time.monotonic() + 0.4
+            while alive() and time.monotonic() < end:
+                time.sleep(0.02)
+            if alive():
+                send(signal.SIGKILL)
+
+    def sandbox(self):
+        self.discover()
+        renderers, diagnostics = [], []
+        with self.lock:
+            for pid, (fd, start) in self.handles.items():
+                if not self.live(pid):
+                    continue
+                info = status(pid, diagnostics=True)
+                if info and not info.get('identity_unreadable') and info['start'] == start:
+                    diagnostics.append({k: info[k] for k in ('pid', 'role_shape', 'read_error', 'errno', 'seccomp', 'no_new_privs', 'namespace_pid_depth', 'uid', 'snap_apparmor_enforced')})
+                    if info['renderer']:
+                        renderers.append({k: info[k] for k in ('pid', 'seccomp', 'no_new_privs', 'namespace_pid_depth', 'uid', 'role_shape', 'snap_apparmor_enforced')})
+                else:
+                    diagnostics.append({'pid': pid, 'role_shape': 'identity_unreadable_or_changed', 'read_error': info.get('read_error') if info else None, 'errno': info.get('errno') if info else None})
+        return {'renderers': renderers, 'owned_diagnostics': diagnostics, 'passed': bool(renderers) and all(
+            r['seccomp'] == '2' and r['no_new_privs'] == '1' and r['namespace_pid_depth'] >= 2
+            and r['uid'] == ['1000'] * 4 and r['snap_apparmor_enforced'] for r in renderers)}
+
+    def cleanup(self):
+        self.closed = True
+        error = None
+        started = time.monotonic()
+        while time.monotonic() - started < 7:
+            try:
+                self.discover()
+                active = [pid for pid in self.handles if self.live(pid)]
+                for pid in active:
+                    self.send(pid, signal.SIGTERM if time.monotonic() - started < 1 else signal.SIGKILL)
+                # Reap direct children first through Popen, then adopted detached descendants.
+                for p in self.processes:
+                    p.poll()
+                while True:
+                    try:
+                        if os.waitpid(-1, os.WNOHANG)[0] == 0:
+                            break
+                    except ChildProcessError:
+                        break
+                if not active and not children(self.root):
+                    break
+            except (OSError, RuntimeError) as exc:
+                error = type(exc).__name__
+            time.sleep(0.05)
+        try:
+            self.discover()
+            remaining = [pid for pid in self.handles if self.live(pid)]
+            verified = not remaining and not children(self.root) and error is None
+        except (OSError, RuntimeError):
+            remaining, verified = [], False
+        for t in self.drainers:
+            t.join(timeout=0.2)
+        with self.lock:
+            self.disposed = True
+            for fd in [v[0] for v in self.handles.values()] + self.retired:
+                os.close(fd)
+        return {'verified': verified, 'remaining_owned_count': len(remaining), 'error': error,
+                'tracked_count': len(self.handles), 'stderr_discarded_bytes': self.stderr_bytes}

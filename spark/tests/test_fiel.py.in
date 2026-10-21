@@ -1,0 +1,48 @@
+"""Inert progressive-field dialect controls; no media/native execution."""
+import json
+from pathlib import Path
+import unittest
+import media_ring as m
+from test_media_ring import box,init_bytes,pair
+
+HERE=Path(__file__).resolve().parent
+
+class FieldOrder(unittest.TestCase):
+ def test_absent_still_supported(self):
+  original=init_bytes();parsed=m.parse_init(*original)
+  self.assertEqual(parsed.data,b''.join(original))
+ def test_optional_progressive_box_preserves_exact_init_and_fragments(self):
+  before=init_bytes();raw=init_bytes(video_children=box(b'fiel',b'\x01\x00'))
+  parsed=m.parse_init(*raw)
+  self.assertEqual(parsed.tracks,m.parse_init(*before).tracks)
+  self.assertEqual(parsed.data,b''.join(raw))
+  f=m.parse_fragment(parsed,*pair(),0,1,{})
+  self.assertEqual((f.moof,f.mdat),pair());self.assertTrue(f.access_point)
+ def test_malformed_length_is_not_ignored(self):
+  for body in (b'',b'\x01',b'\x01\x00\x00',b'\x01\x00'*100):
+   with self.subTest(body=body),self.assertRaisesRegex(m.MediaError,'FIEL_PROGRESSIVE_ONLY'):
+    m.parse_init(*init_bytes(video_children=box(b'fiel',body)))
+ def test_interlaced_and_unknown_values_refused(self):
+  for body in (b'\x02\x01',b'\x02\x06',b'\x02\x09',b'\x02\x0e',b'\x02\x00',b'\x00\x00',b'\x03\x00',b'\x01\x01',b'\xff\xff'):
+   with self.subTest(body=body),self.assertRaisesRegex(m.MediaError,'FIEL_PROGRESSIVE_ONLY'):
+    m.parse_init(*init_bytes(video_children=box(b'fiel',body)))
+ def test_duplicate_refused_even_if_both_progressive(self):
+  with self.assertRaisesRegex(m.MediaError,'FIEL_MULTIPLICITY'):
+   m.parse_init(*init_bytes(video_children=box(b'fiel',b'\x01\x00')*2))
+ def test_wrong_parent_and_other_unknown_box_still_refused(self):
+  for kw in ({'audio_children':box(b'fiel',b'\x01\x00')},{'video_children':box(b'fiel',b'\x01\x00')+box(b'zzzz')}):
+   with self.subTest(kw=kw),self.assertRaisesRegex(m.MediaError,'UNSUPPORTED_BOX'):
+    m.parse_init(*init_bytes(**kw))
+ def test_codec_and_timing_gates_preserved_with_progressive_field(self):
+  for kwargs in ({'edits':True},{'hvcc_change':lambda h:h.__setitem__(21,2)},{'external':True}):
+   with self.subTest(kwargs=kwargs),self.assertRaises(m.MediaError):
+    m.parse_init(*init_bytes(video_children=box(b'fiel',b'\x01\x00'),**kwargs))
+  parsed=m.parse_init(*init_bytes(video_children=box(b'fiel',b'\x01\x00')))
+  with self.assertRaisesRegex(m.MediaError,'VIDEO_SAMPLE_FLAGS'):
+   m.parse_fragment(parsed,*pair(vflags=0),0,1,{})
+ def test_eviction_retains_init_field_box_unchanged(self):
+  raw=init_bytes(video_children=box(b'fiel',b'\x01\x00'));r=m.MediaRing('a'*32,max_groups=1)
+  r.initialize(*raw);r.append(*pair());old=r.resume().cursor;r.append(*pair(2,16000,12288))
+  with self.assertRaises(m.Lagged):r.read(old)
+  resume=r.resume();self.assertEqual(resume.init,b''.join(raw));self.assertTrue(r.read(resume.cursor)[0].access_point)
+if __name__=='__main__':unittest.main()

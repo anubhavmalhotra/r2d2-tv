@@ -1,0 +1,390 @@
+"""Actual controller and HTTP parser, inert adapter; no devices or sockets."""
+import io
+import json
+from pathlib import Path
+import unittest
+import threading
+from unittest.mock import Mock
+import viewer_voice as v
+import trial as t
+import protocol as p
+
+BINDING = ('a'*32, 1, 0)
+REQUEST = 'b'*16
+TOKEN = 'c'*48
+
+def body(action='start', identifier=REQUEST):
+    return dict(schema=1, action=action, request=identifier)
+
+class Timer:
+    def __init__(self, at, callback): self.at, self.callback, self.cancelled = at, callback, False
+    def cancel(self): self.cancelled = True
+
+class Clock:
+    def __init__(self): self.now, self.timers = 0., []
+    def later(self, delay, callback):
+        timer = Timer(self.now+delay, callback); self.timers.append(timer); return timer
+    def advance(self, seconds):
+        end = self.now + seconds
+        while True:
+            due = [timer for timer in self.timers if not timer.cancelled and timer.at <= end]
+            if not due: break
+            timer = min(due, key=lambda timer: timer.at); self.timers.remove(timer)
+            self.now = timer.at; timer.callback()
+        self.now = end
+
+class Job:
+    def __init__(self):
+        self.value = dict(state='preparing', started=False, stopped=False, cleanupComplete=False)
+        self.releases = self.cancels = 0
+    def snapshot(self): return dict(self.value)
+    def release(self): self.releases += 1
+    def cancel(self): self.cancels += 1
+    def listening(self): self.value.update(state='listening', started=True)
+    def finish(self, accepted=False):
+        self.value.update(state='accepted' if accepted else 'refused', stopped=self.value['started'], cleanupComplete=True)
+
+class Adapter:
+    def __init__(self): self.enabled = True; self.jobs = []; self.calls = []
+    def ready(self, binding): return self.enabled
+    def begin(self, binding, identifier, deadline):
+        self.calls.append((binding, identifier, deadline)); job = Job(); self.jobs.append(job); return job
+
+class VoiceTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock(); self.adapter = Adapter(); self.allowed = True
+        self.control = v.ViewerVoice(lambda identity: self.allowed and identity == BINDING,
+                                    adapter=self.adapter, clock=lambda: self.clock.now, later=self.clock.later)
+    def start(self):
+        code, status = self.control.command(BINDING, body()); self.assertEqual(code, 202)
+        self.assertEqual(status['state'], 'preparing'); return self.adapter.jobs[-1]
+    def test_production_default_inert(self):
+        default = v.ViewerVoice(lambda _: True)
+        self.assertEqual(default.status(BINDING), dict(schema=1, available=False, state='unavailable', request=None))
+        self.assertEqual(default.command(BINDING, body())[0], 503)
+    def test_no_listening_from_begin_ack(self):
+        job = self.start(); self.assertEqual(self.control.status(BINDING)['state'], 'preparing')
+        job.listening(); self.assertEqual(self.control.status(BINDING)['state'], 'listening')
+    def test_release_requires_real_start_and_cleanup(self):
+        job = self.start(); job.listening(); self.control.status(BINDING)
+        code, status = self.control.command(BINDING, body('release'))
+        self.assertEqual((code, status['state'], job.releases), (202, 'finishing', 1))
+        job.finish(True); self.assertEqual(self.control.status(BINDING)['state'], 'accepted')
+        self.assertFalse(any(not timer.cancelled for timer in self.clock.timers))
+    def test_accepted_without_explicit_release_is_unknown(self):
+        job = self.start(); job.listening(); self.control.status(BINDING); job.finish(True)
+        self.assertEqual(self.control.status(BINDING)['state'], 'unknown')
+    def test_release_before_start_cancels_instead(self):
+        job = self.start(); self.control.command(BINDING, body('release'))
+        self.assertEqual((job.cancels, job.releases), (1, 0))
+    def test_cancel_overtakes_start_and_no_replay(self):
+        self.assertEqual(self.control.command(BINDING, body('cancel'))[1]['state'], 'refused')
+        self.assertEqual(self.control.command(BINDING, body())[0], 409)
+        self.assertEqual(self.adapter.calls, [])
+    def test_single_owner_wrong_id_does_not_release_or_cancel(self):
+        job = self.start()
+        self.assertEqual(self.control.command(BINDING, body('start', 'd'*16))[0], 409)
+        self.assertEqual(self.control.command(BINDING, body('release', 'd'*16))[0], 409)
+        self.control.command(BINDING, body('cancel', 'd'*16))
+        self.assertEqual((job.releases, job.cancels), (0, 0))
+    def test_exact_cancel_survives_reconnect_and_is_idempotent(self):
+        job = self.start(); self.allowed = False
+        for _ in range(2): self.assertEqual(self.control.command(None, body('cancel'))[0], 202)
+        self.assertEqual(job.cancels, 1)
+        job.finish(); self.assertEqual(self.control.status(None)['state'], 'refused')
+    def test_power_or_page_loss_cancels_without_poll(self):
+        job = self.start(); self.allowed = False; self.clock.advance(.11)
+        self.assertEqual(job.cancels, 1)
+    def test_preparation_deadline_never_renews_from_poll(self):
+        job = self.start(); self.clock.advance(9); self.control.status(BINDING)
+        self.clock.advance(1.1); self.assertEqual(job.cancels, 1)
+    def test_result_deadline_remains_absolute_and_cleanup_quarantines(self):
+        job = self.start(); job.listening(); self.control.status(BINDING)
+        self.control.command(BINDING, body('release')); self.clock.advance(199)
+        self.control.status(BINDING); self.clock.advance(3.2)
+        self.assertEqual((job.cancels, self.control.status(BINDING)['state']), (1, 'unknown'))
+        self.assertFalse(self.control.status(BINDING)['available'])
+        self.assertEqual(self.control.command(BINDING, body('start', 'd'*16))[0], 503)
+    def test_close_revokes_then_finishes_actual_cleanup(self):
+        job = self.start(); self.control.close(); self.assertEqual(job.cancels, 1)
+        job.finish(); self.clock.advance(.11)
+        self.assertEqual(self.control.status(BINDING), dict(schema=1, available=False, state='refused', request=REQUEST))
+    def test_late_accepted_after_cancel_never_promoted(self):
+        job = self.start(); job.listening(); self.control.status(BINDING)
+        self.control.command(BINDING, body('release')); self.control.command(BINDING, body('cancel'))
+        job.finish(True); self.assertEqual(self.control.status(BINDING)['state'], 'unknown')
+    def test_missing_stop_cannot_hide_prior_started_capture(self):
+        job = self.start(); job.listening(); self.control.status(BINDING)
+        job.value.update(state='refused', started=False, stopped=False, cleanupComplete=True)
+        self.assertEqual(self.control.status(BINDING)['state'], 'unknown')
+    def test_clean_protective_stop_preserves_unconfirmed_start_and_retires(self):
+        job = self.start()
+        job.value.update(state='refused', started=False, stopped=True, cleanupComplete=True)
+        self.assertEqual(self.control.status(BINDING), dict(schema=1, available=True, state='refused', request=REQUEST))
+        self.assertFalse(self.control.current['started'])
+        self.assertFalse(self.control.poisoned)
+        self.assertEqual(job.cancels, 0)
+        self.assertEqual(self.control.command(BINDING, body(identifier='d'*16))[0], 202)
+    def test_protective_stop_never_qualifies_unfinished_unclean_or_accepted(self):
+        for state, cleanup in (('preparing', False), ('listening', False), ('finishing', False),
+                               ('refused', False), ('accepted', True)):
+            with self.subTest(state=state):
+                self.setUp()
+                job = self.start()
+                job.value.update(state=state, started=False, stopped=True, cleanupComplete=cleanup)
+                self.assertEqual(self.control.status(BINDING)['state'], 'unknown')
+                self.assertTrue(self.control.poisoned)
+                self.assertFalse(self.control.current['started'])
+    def test_malformed_snapshot_cancels_and_does_not_export_details(self):
+        job = self.start(); job.value['transcript'] = 'synthetic private text'
+        status = self.control.status(BINDING)
+        self.assertEqual((job.cancels, status['state']), (1, 'unknown'))
+        self.assertNotIn('synthetic', json.dumps(status))
+    def test_adapter_failure_is_unknown_not_clean(self):
+        self.adapter.begin = Mock(side_effect=RuntimeError('private error'))
+        code, status = self.control.command(BINDING, body())
+        self.assertEqual((code, status['state'], status['available']), (503, 'unknown', False))
+        self.assertNotIn('private', json.dumps(status))
+    def test_strict_command_and_bounded_retirement(self):
+        for value in (None, [], {}, dict(body(), schema=True), dict(body(), request='x'), dict(body(), extra=True), dict(body(), action='capture')):
+            self.assertEqual(self.control.command(BINDING, value), (400, None))
+        for index in range(v.MAX_REQUESTS): self.control.command(BINDING, body('cancel', '%016x' % index))
+        self.assertEqual(self.control.command(BINDING, body())[0], 409)
+
+class HTTPTests(unittest.TestCase):
+    def setUp(self):
+        self.trial = t.Trial(Path('/unused'), TOKEN, Mock(), 'mse')
+        self.trial.media_stream = Mock(); self.trial.media_stream.permits_input.return_value = True; self.trial.media_stream.permits_voice.return_value = True
+    def request(self, method='GET', value=None, extra=(), peer=None, path=None):
+        raw = b'' if value is None else value if isinstance(value, bytes) else json.dumps(value).encode()
+        lines = [method+' '+(path or '/'+TOKEN+'/voice')+' HTTP/1.1', 'Host: '+p.SPARK+':4177',
+                 'X-R2D2-Media-Epoch: '+'a'*32, 'X-R2D2-Media-Generation: 1']
+        if method == 'POST': lines += ['Origin: '+p.ORIGIN, 'Content-Type: application/json', 'Content-Length: '+str(len(raw))]
+        lines += list(extra)
+        handler = t.handler_for(self.trial).__new__(t.handler_for(self.trial))
+        handler.rfile = io.BytesIO(('\r\n'.join(lines)+'\r\n\r\n').encode()+raw)
+        handler.wfile = io.BytesIO(); handler.connection = Mock(); handler.server = Mock()
+        handler.client_address = (peer or p.TV, 1); handler.close_connection = True
+        handler.handle_one_request()
+        header, data = handler.wfile.getvalue().split(b'\r\n\r\n', 1)
+        return int(header.split(b' ')[1]), data, header
+    def test_actual_handler_default_unavailable_no_secrets(self):
+        code, raw, header = self.request()
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(raw), dict(schema=1, available=False, state='unavailable', request=None))
+        self.assertIn(b'Cache-Control: no-store', header)
+        self.assertEqual(self.request('POST', body())[0], 503)
+    def test_origin_duplicate_token_peer_and_methods_refused(self):
+        for options in (dict(peer=p.SPARK), dict(path='/'+'d'*48+'/voice'), dict(extra=['Origin: https://foreign.invalid']),
+                        dict(extra=['Host: '+p.SPARK+':4177']), dict(extra=['X-R2D2-Media-Generation: 1']), dict(method='DELETE')):
+            self.assertIn(self.request(**options)[0], (404, 501))
+        self.assertEqual(self.request('POST', body(), extra=['Origin: '+p.ORIGIN])[0], 404)
+    def test_current_media_required_but_cancel_cleanup_survives(self):
+        self.trial.media_stream.permits_input.return_value = False
+        self.assertEqual(self.request()[0], 409)
+        self.assertEqual(self.request('POST', body())[0], 409)
+        self.assertEqual(self.request('POST', body('cancel'))[0], 503)
+    def test_body_no_unknown_fields_duplicates_or_scalar(self):
+        for raw in (b'[]', b'null', b'{"schema":1,"schema":1}', json.dumps(dict(body(), pcm='x')).encode()):
+            self.assertEqual(self.request('POST', raw)[0], 400)
+        self.assertEqual(self.request('POST', b' '*257)[0], 400)
+        self.assertEqual(self.request('POST', json.dumps(body()).encode()+b' '*257)[0], 413)
+    def test_default_ignores_preferences_and_close_revokes(self):
+        self.trial.voice_enabled = True
+        self.assertFalse(json.loads(self.request()[1])['available'])
+        self.trial.request_stop('viewer-ended')
+        self.assertEqual(self.request()[0], 404)
+    def test_binding_page_epoch_and_power_context(self):
+        self.trial.page_ready = True; self.trial.owner_verified_at = self.trial.ready_at = t.time.monotonic()
+        self.assertTrue(self.trial.voice_allowed(BINDING))
+        self.trial.input_epoch += 1
+        self.assertFalse(self.trial.voice_allowed(BINDING))
+        self.trial.input_epoch = 0; self.trial.navigation_pending = {}
+        self.assertFalse(self.trial.voice_allowed(BINDING))
+
+def owner_status(state='idle', identifier=None, *, started=False, stopped=False, cleanup=True, available=True):
+    return dict(available=available, state=state, request=identifier, started=started,
+                stopped=stopped, cleanupComplete=cleanup)
+
+
+class MailboxTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.mailbox = v.NativeMailbox(clock=lambda: self.clock.now)
+        self.control = v.ViewerVoice(lambda b: b == BINDING, adapter=self.mailbox,
+                                    clock=lambda: self.clock.now, later=self.clock.later)
+        self.session = 'e'*32
+    def exchange(self, value):
+        return self.mailbox.exchange(dict(session=self.session, status=value))['command']
+    def test_unavailable_unknown_cleanup_is_valid_but_idle_requires_cleanup(self):
+        absent = owner_status('unavailable', cleanup=False, available=False)
+        self.assertTrue(v.valid_owner_status(absent))
+        self.assertIsNone(self.exchange(absent))
+        self.assertFalse(self.mailbox.ready(BINDING))
+        self.assertEqual(self.control.command(BINDING, body())[0], 503)
+        with self.assertRaises(ValueError): self.exchange(owner_status(cleanup=False))
+        with self.assertRaises(ValueError): self.exchange(owner_status('unavailable'))
+    def test_two_sequential_commands_consume_start_release_once(self):
+        self.exchange(owner_status())
+        for identifier in (REQUEST, 'f'*16):
+            self.assertEqual(self.control.command(BINDING, body(identifier=identifier))[0], 202)
+            self.assertEqual(self.exchange(owner_status()), dict(request=identifier, action='start'))
+            self.assertIsNone(self.exchange(owner_status('preparing', identifier, cleanup=False)))
+            self.exchange(owner_status('listening', identifier, started=True, cleanup=False))
+            self.assertEqual(self.control.status(BINDING)['state'], 'listening')
+            self.control.command(BINDING, body('release', identifier))
+            self.assertEqual(self.exchange(owner_status('listening', identifier, started=True, cleanup=False)), dict(request=identifier, action='release'))
+            self.assertIsNone(self.exchange(owner_status('finishing', identifier, started=True, stopped=True, cleanup=False)))
+            self.exchange(owner_status('accepted', identifier, started=True, stopped=True))
+            self.assertEqual(self.control.status(BINDING)['state'], 'accepted')
+    def test_cancel_queued_start_has_no_native_effect(self):
+        self.exchange(owner_status())
+        self.control.command(BINDING, body())
+        self.control.command(BINDING, body('cancel'))
+        self.assertEqual(self.control.status(BINDING)['state'], 'refused')
+        self.assertIsNone(self.exchange(owner_status()))
+    def test_stale_owner_cancels_delivered_request_without_cleanup_promotion(self):
+        self.exchange(owner_status()); self.control.command(BINDING, body())
+        self.exchange(owner_status()); self.clock.advance(2.1)
+        self.assertEqual(self.exchange(owner_status('unavailable', available=False, cleanup=False)), dict(request=REQUEST, action='cancel'))
+        self.clock.advance(2.1)
+        self.assertEqual(self.control.status(BINDING)['state'], 'unknown')
+    def test_retired_mailbox_and_changed_session_refuse(self):
+        self.exchange(owner_status())
+        with self.assertRaises(ValueError): self.mailbox.exchange(dict(session='f'*32, status=owner_status()))
+        self.mailbox.close()
+        with self.assertRaises(ValueError): self.exchange(owner_status())
+        self.assertFalse(self.mailbox.ready(BINDING))
+    def test_wrong_request_cannot_supply_success(self):
+        self.exchange(owner_status()); self.control.command(BINDING, body()); self.exchange(owner_status())
+        self.exchange(owner_status('accepted', 'f'*16, started=True, stopped=True))
+        self.assertEqual(self.control.status(BINDING)['state'], 'preparing')
+    def test_new_unavailability_cancels_queued_start_before_delivery(self):
+        self.exchange(owner_status()); self.control.command(BINDING, body())
+        result = self.control.exchange(dict(session=self.session, status=owner_status('unavailable', available=False, cleanup=False)))
+        self.assertIsNone(result['command'])
+        self.assertEqual(self.control.status(BINDING)['state'], 'refused')
+        self.assertFalse(self.mailbox.job.delivered)
+    def test_new_row_between_context_and_exchange_waits_for_fresh_check(self):
+        self.exchange(owner_status())
+        original = self.control._context
+        def overtaken(binding):
+            snapshot = original(binding)
+            self.control._context = original
+            self.control.command(BINDING, body())
+            return snapshot
+        self.control._context = overtaken
+        self.assertIsNone(self.control.exchange(dict(session=self.session, status=owner_status()))['command'])
+        self.assertFalse(self.mailbox.job.delivered)
+        self.assertEqual(self.control.exchange(dict(session=self.session, status=owner_status()))['command'], dict(request=REQUEST, action='start'))
+    def test_status_schema_rejects_payload_and_nonboolean(self):
+        for value in (dict(owner_status(), transcript='private'), dict(owner_status(), available=1),
+                      dict(owner_status(), state=[]), dict(owner_status(), request='bad')):
+            with self.assertRaises(ValueError): self.exchange(value)
+
+
+class TrialJoinTests(unittest.TestCase):
+    def setUp(self):
+        self.trial = t.Trial(Path('/unused'), TOKEN, Mock(), 'mse')
+        self.trial.media_stream = Mock(); self.trial.media_stream.permits_input.return_value = True; self.trial.media_stream.permits_voice.return_value = True
+        self.trial.page_ready = True; self.trial.owner_verified_at = self.trial.ready_at = t.time.monotonic()
+        self.clock = Clock(); self.adapter = Adapter()
+        self.trial.voice = v.ViewerVoice(self.trial.voice_allowed, continuing=self.trial.voice_continuing,
+                                         adapter=self.adapter, clock=lambda: self.clock.now, later=self.clock.later)
+    def released(self):
+        self.assertEqual(self.trial.voice.command(BINDING, body())[0], 202)
+        job = self.adapter.jobs[-1]; job.listening(); self.trial.voice.status(BINDING)
+        self.assertEqual(self.trial.voice.command(BINDING, body('release'))[0], 202)
+        return job
+    def test_actual_navigation_after_release_preserves_correlated_result(self):
+        job = self.released()
+        self.assertTrue(self.trial.queue_page_action('https://example.invalid/'))
+        self.assertNotEqual(self.trial.input_epoch, BINDING[2])
+        self.trial.page_ready = False
+        self.assertEqual(self.trial.voice.status(BINDING)['state'], 'finishing')
+        self.assertEqual(job.cancels, 0)
+        job.finish(True)
+        result = self.trial.voice.status(BINDING)
+        self.assertEqual(result['state'], 'accepted')
+        self.assertFalse(result['available'])
+    def test_stop_after_release_refuses_late_acceptance_as_unknown(self):
+        job = self.released(); self.trial.request_stop('viewer-ended'); job.finish(True)
+        self.assertEqual(self.trial.voice.status(BINDING)['state'], 'unknown')
+        self.assertEqual(job.cancels, 1)
+    def test_expired_agent_close_refuses_start_and_released_continuation(self):
+        self.trial.agent_close_deadline = t.time.monotonic()-1
+        self.assertFalse(self.trial.voice_allowed(BINDING))
+        self.assertEqual(self.trial.voice.command(BINDING, body())[0], 503)
+        self.trial.agent_close_deadline = None
+        job = self.released()
+        self.trial.agent_close_deadline = t.time.monotonic()-1
+        self.assertFalse(self.trial.voice_continuing(BINDING))
+        self.trial.voice.status(BINDING)
+        self.assertEqual(job.cancels, 1)
+    def test_epoch_change_before_release_revokes_capture(self):
+        self.trial.voice.command(BINDING, body()); job = self.adapter.jobs[-1]
+        self.assertTrue(self.trial.queue_page_action('https://example.invalid/'))
+        self.trial.voice.status(BINDING); self.assertEqual(job.cancels, 1)
+    def test_actual_rtc_context_does_not_hold_voice_lock_during_shutdown(self):
+        from display_transport import RTCDisplay
+        media = RTCDisplay(self.trial, Mock())
+        sender = Mock(answer_taken=True, connection_ready=True, video_count=1, error=None)
+        sender.stop = threading.Event(); sender.media_ended = threading.Event()
+        media.sender = sender; media.ready = media.active = True; media.generation = 1
+        self.trial.media_stream = media; self.trial.display_transport = 'webrtc'
+        binding = (media.epoch, 1, 0)
+        self.assertEqual(self.trial.voice.command(binding, body())[0], 202)
+        entered, proceed = threading.Event(), threading.Event()
+        original = media.permits_voice
+        def paused(value):
+            entered.set()
+            if not proceed.wait(2): raise RuntimeError('fixture timeout')
+            return original(value)
+        media.permits_voice = paused
+        status = threading.Thread(target=lambda: self.trial.voice.status(binding), daemon=True)
+        status.start(); self.assertTrue(entered.wait(1))
+        def expired_snapshot():
+            with self.trial.lock:
+                self.trial.owner_verified_at = t.time.monotonic()-6
+                self.trial.text_snapshot()
+        closer = threading.Thread(target=expired_snapshot, daemon=True); closer.start()
+        try:
+            closer.join(.5)
+            self.assertFalse(closer.is_alive(), 'shutdown inverted Trial/voice locks')
+            self.assertTrue(self.trial.stop.is_set())
+        finally:
+            proceed.set(); status.join(1); closer.join(1)
+        self.assertFalse(status.is_alive()); self.assertFalse(closer.is_alive())
+        self.assertEqual(self.adapter.jobs[-1].cancels, 1)
+    def test_media_lock_contention_refuses_promptly_without_start(self):
+        from display_transport import RTCDisplay
+        for mode in ('mse', 'webrtc'):
+            trial = t.Trial(Path('/unused'), TOKEN, Mock(), 'mse')
+            trial.page_ready = True; trial.owner_verified_at = trial.ready_at = t.time.monotonic()
+            media = trial.media_stream
+            if mode == 'webrtc':
+                media = RTCDisplay(trial, Mock())
+                sender = Mock(answer_taken=True, connection_ready=True, video_count=1, error=None)
+                sender.stop = threading.Event(); sender.media_ended = threading.Event(); media.sender = sender
+                trial.media_stream = media
+            media.ready = media.active = True; media.generation = 1
+            lock = media.lock if mode == 'webrtc' else media.cv
+            binding = (media.epoch, 1, 0)
+            self.assertTrue(trial.voice_allowed(binding))
+            held, release = threading.Event(), threading.Event()
+            def hold():
+                with lock:
+                    held.set(); release.wait(2)
+            thread = threading.Thread(target=hold); thread.start(); self.assertTrue(held.wait(1))
+            try:
+                before = t.time.monotonic()
+                self.assertFalse(trial.voice_allowed(binding))
+                self.assertLess(t.time.monotonic()-before, .1)
+            finally:
+                release.set(); thread.join(1)
+            self.assertFalse(thread.is_alive())
+            media.cancel.set()
+            self.assertFalse(trial.voice_allowed(binding))
+
+
+if __name__ == '__main__': unittest.main()

@@ -1,0 +1,775 @@
+import threading
+from popup_census import PopupCensus, PopupError
+"""Finite user-requested HTTPS navigation on the existing isolated browser pipe.
+
+Only bounded viewport/video scalars leave the owned target. No login, consent,
+quality setter, account state, page text, history, URLs or cookies are exported.
+"""
+import json
+import os
+import math
+import re
+import time
+import secrets
+from urllib.parse import urlsplit
+from dns_proof import DnsProof, ProofError, _id, _json
+from protocol import valid_navigation, valid_history, CSS_WIDTH, CSS_HEIGHT, DEVICE_SCALE, valid_tabs, valid_text
+
+ORIGIN = 'http://{{SPARK_IP}}:4177'
+FIELDS = {'width','height','dpr','visible','focused','documentReady','fixtureGone',
+          'httpsDocument','localStart','videoCount','video'}
+VIDEO_FIELDS = {'width','height','paused','readyState'}
+
+def scalar_snapshot(value):
+    if type(value) is not dict or set(value) != FIELDS:
+        raise ProofError('PAGE_SCALAR_SHAPE')
+    for key in ('width','height'):
+        if type(value[key]) is not int or not 0 <= value[key] <= 8192:
+            raise ProofError('PAGE_SCALAR_TYPE')
+    if type(value['dpr']) not in (float,int) or not math.isfinite(value['dpr']) or not 0 < value['dpr'] <= 8:
+        raise ProofError('PAGE_SCALAR_TYPE')
+    for key in ('visible','focused','fixtureGone','httpsDocument','localStart'):
+        if type(value[key]) is not bool:raise ProofError('PAGE_SCALAR_TYPE')
+    if value['documentReady'] not in ('loading','interactive','complete'):
+        raise ProofError('PAGE_SCALAR_TYPE')
+    if type(value['videoCount']) is not int or not 0 <= value['videoCount'] <= 33:
+        raise ProofError('PAGE_SCALAR_TYPE')
+    video=value['video']
+    if value['videoCount'] != 1:
+        if video is not None:raise ProofError('PAGE_SCALAR_SHAPE')
+    else:
+        if type(video) is not dict or set(video)!=VIDEO_FIELDS:raise ProofError('PAGE_SCALAR_SHAPE')
+        if any(type(video[k]) is not int or not 0<=video[k]<=8192 for k in ('width','height')):
+            raise ProofError('PAGE_SCALAR_TYPE')
+        if type(video['paused']) is not bool or type(video['readyState']) is not int or not 0<=video['readyState']<=4:
+            raise ProofError('PAGE_SCALAR_TYPE')
+    return value
+
+HEALTH_FIELDS = {'width','height','readyState','networkState','paused','seeking','ended',
+                 'errorCode','totalFrames','droppedFrames'}
+VIDEO_HEALTH_EXPRESSION = """(()=>{const all=document.querySelectorAll('video');const videos=[];for(let i=0;i<Math.min(all.length,4);i++){const v=all[i];if(typeof v.getVideoPlaybackQuality!=='function')return null;const q=v.getVideoPlaybackQuality();videos.push({width:v.videoWidth,height:v.videoHeight,readyState:v.readyState,networkState:v.networkState,paused:v.paused,seeking:v.seeking,ended:v.ended,errorCode:v.error?v.error.code:null,totalFrames:q.totalVideoFrames,droppedFrames:q.droppedVideoFrames});}return {available:true,videoCount:Math.min(all.length,5),truncated:all.length>4,videos:videos};})()"""
+
+def unavailable_video_health():
+    return {'available':False,'videoCount':None,'truncated':False,'videos':[]}
+
+def scalar_video_health(value):
+    """Top-document video scalars only; no frame enumeration or page payloads."""
+    if (type(value) is not dict or set(value)!={'available','videoCount','truncated','videos'}
+            or type(value['available']) is not bool or type(value['truncated']) is not bool
+            or type(value['videos']) is not list):
+        raise ProofError('VIDEO_HEALTH_SHAPE')
+    if not value['available']:
+        if value != unavailable_video_health():raise ProofError('VIDEO_HEALTH_SHAPE')
+        return value
+    n=value['videoCount']
+    if (type(n) is not int or not 0<=n<=5 or len(value['videos'])!=min(n,4)
+            or value['truncated']!=(n>4)):
+        raise ProofError('VIDEO_HEALTH_SHAPE')
+    for video in value['videos']:
+        if type(video) is not dict or set(video)!=HEALTH_FIELDS:raise ProofError('VIDEO_HEALTH_SHAPE')
+        for key, maximum in (('width',8192),('height',8192),('readyState',4),('networkState',3),
+                             ('totalFrames',2147483647),('droppedFrames',2147483647)):
+            if type(video[key]) is not int or not 0<=video[key]<=maximum:raise ProofError('VIDEO_HEALTH_TYPE')
+        if any(type(video[k]) is not bool for k in ('paused','seeking','ended')):raise ProofError('VIDEO_HEALTH_TYPE')
+        if video['errorCode'] is not None and (type(video['errorCode']) is not int or not 1<=video['errorCode']<=4):
+            raise ProofError('VIDEO_HEALTH_TYPE')
+        if video['droppedFrames']>video['totalFrames']:raise ProofError('VIDEO_HEALTH_TYPE')
+    return value
+
+def presented(value):
+    return ((value['width'],value['height'],value['dpr'])==(CSS_WIDTH,CSS_HEIGHT,DEVICE_SCALE) and
+            value['visible'] and value['focused'] and value['fixtureGone'] and
+            (value['httpsDocument'] or value['localStart']) and value['documentReady'] in ('interactive','complete'))
+
+EDITOR_LOCATE = r"""function locate(){let d=document,e=d.activeElement,n=0;if(!document.hasFocus())return {e:null};while(e&&n++<16){if(e.shadowRoot&&e.shadowRoot.activeElement){e=e.shadowRoot.activeElement;continue}if(e.tagName==='IFRAME'||e.tagName==='FRAME'){let child;try{child=e.contentDocument}catch(ignore){return {e:null,unavailable:true}}if(!child)return {e:null,unavailable:true};d=child;e=d.activeElement;continue}break}if(!e||n>=16||!e.isConnected)return {e:null};let kind='text',multi=false,ok=false;if(e.tagName==='TEXTAREA'){ok=!e.disabled&&!e.readOnly;multi=true}else if(e.tagName==='INPUT'){ok=['text','search','email','url','tel','password','number'].includes(e.type)&&!e.disabled&&!e.readOnly;kind=e.type==='password'?'password':'text'}else if(e.isContentEditable){ok=true;multi=true}return ok?{e:e,kind:kind,multiline:multi}:{e:null}}"""
+
+def cdp_error(method, value, context=None):
+    """No native message/data/IDs escape this finite diagnostic projection."""
+    known = {'Target.getTargets','Target.attachToTarget','Target.activateTarget',
+             'Page.navigate','Runtime.evaluate','Target.getTargetInfo',
+             'Page.getNavigationHistory','Page.navigateToHistoryEntry','Page.reload',
+             'Target.createTarget','Target.closeTarget','Page.resetNavigationHistory',
+             'Page.getFrameTree','Page.createIsolatedWorld','Input.insertText','Input.dispatchKeyEvent'}
+    message = value.get('message') if type(value) is dict else None
+    code = value.get('code') if type(value) is dict else None
+    category = 'UNCLASSIFIED'
+    if type(message) is str:
+        if _id(context) and message == 'Failed to find browser context with id ' + context:
+            category = 'CONTEXT_UNREGISTERED'
+        elif message == 'Failed to open new tab - no browser is open': category = 'NO_BROWSER_WINDOW'
+        elif message == 'Failed to open a new tab': category = 'TAB_OPEN_FAILED'
+        elif message in ('No target with given id found','No target with given id'): category = 'TARGET_MISSING'
+        elif message == 'Not supported': category = 'UNSUPPORTED'
+        elif message in ('Not allowed','Not allowed in this target'): category = 'NOT_ALLOWED'
+    return {'method': method if method in known else 'unknown',
+            'code': code if type(code) is int and -32768 <= code <= 32767 else None,
+            'category': category}
+
+class SessionPage(DnsProof):
+    """One owner/reader; parent closes pipes only after owned process cleanup."""
+    @classmethod
+    def from_verified_dns(cls, proof, receipt, token):
+        if (type(proof) is not DnsProof or proof.closed or not proof.used or not proof.marker_seen or type(receipt) is not dict or
+            receipt.get('qualified') is not True or receipt.get('target_closed') is not True or
+            receipt.get('error') is not None or receipt.get('settings') !=
+            {'mode':'secure','quad9_template_exact':True,'managementMode':0} or
+            type(token) is not str or not re.fullmatch('[a-f0-9]{48}',token)):
+            raise ProofError('VERIFIED_OWNED_PIPE_REQUIRED')
+        page=cls.__new__(cls)
+        page.__dict__.update(proof.__dict__)
+        page.buffer=bytearray(proof.buffer)
+        page.target=page.session=None
+        page.fixture=ORIGIN+'/'+token+'/fixture'
+        page.start_url=ORIGIN+'/'+token+'/start'
+        page.navigations=0
+        page.started=False;page.navigation_attempted=False;page.snapshots=0
+        page._command_frames_start=page.frames
+        page._command_bytes_start=page.total
+        page.phase='new'
+        # A successful transfer leaves only this object allowed to close/read.
+        proof.closed=True;proof.buffer.clear()
+        return page
+
+    def _event(self, value):
+        pass  # No enabled page/network domain; discard any prior target event.
+
+    def _message(self):
+        # Bound each command, not the lifetime of an authenticated live session.
+        # The initial DNS proof retains its separate 64-frame/256KiB caps.
+        import select
+        while True:
+            end=self.buffer.find(0)
+            if end>=0:
+                if end>65536:raise ProofError('CDP_FRAME_SIZE')
+                raw=bytes(self.buffer[:end]);del self.buffer[:end+1]
+                self.frames+=1
+                if self.frames-self._command_frames_start>64:raise ProofError('CDP_FRAME_COUNT')
+                value=_json(raw)
+                if type(value) is not dict:raise ProofError('CDP_SHAPE')
+                return value
+            if len(self.buffer)>65536:raise ProofError('CDP_FRAME_SIZE')
+            if not select.select([self.read_fd],[],[],self._remaining())[0]:raise ProofError('CDP_TIMEOUT')
+            try:raw=os.read(self.read_fd,8192)
+            except BlockingIOError:continue
+            if not raw:raise ProofError('CDP_PIPE_CLOSED')
+            self.total+=len(raw)
+            if self.total-self._command_bytes_start>262144:raise ProofError('CDP_TOTAL_SIZE')
+            self.buffer.extend(raw)
+
+    def _call(self, method, params, session=False):
+        if method not in ('Target.getTargets','Target.attachToTarget','Target.activateTarget',
+                          'Page.navigate','Runtime.evaluate','Target.getTargetInfo',
+                          'Page.getNavigationHistory','Page.navigateToHistoryEntry','Page.reload') and not (
+            isinstance(self, TabSession) and method in ('Target.closeTarget','Page.resetNavigationHistory',
+                'Page.getFrameTree','Page.createIsolatedWorld','Input.insertText','Input.dispatchKeyEvent')):
+            raise ProofError('PAGE_METHOD_SCOPE')
+        self._command_frames_start=self.frames
+        self._command_bytes_start=self.total
+        self.sequence+=1
+        request={'id':self.sequence,'method':method,'params':params}
+        if session:request['sessionId']=self.session
+        diagnostic=hasattr(self,'_video_health_deadline')
+        if diagnostic:
+            self._remaining()  # No send attempted: an expired diagnostic is safely unavailable.
+            self._video_health_transport_clean=False
+        self._send(request)
+        while True:
+            try:value=self._message()
+            except ProofError as exc:
+                if diagnostic and str(exc)=='CDP_TIMEOUT':
+                    # The complete read-only request was sent. Remember only one
+                    # exact late response; suppress further diagnostics until it arrives.
+                    self._video_health_abandoned=(self.sequence,self.session if session else None)
+                    self._video_health_transport_clean=True
+                raise
+            if 'id' not in value:continue
+            abandoned=getattr(self,'_video_health_abandoned',None)
+            if abandoned is not None and type(value['id']) is int and value['id']==abandoned[0]:
+                if value.get('sessionId')!=abandoned[1]:raise ProofError('CDP_REPLY_SESSION')
+                if not (type(value.get('result')) is dict and 'error' not in value or
+                        type(value.get('error')) is dict and 'result' not in value):
+                    raise ProofError('CDP_REPLY_SHAPE')
+                del self._video_health_abandoned
+                continue
+            if type(value['id']) is not int or value['id']!=self.sequence:
+                raise ProofError('CDP_REPLY_ID')
+            if value.get('sessionId') != (self.session if session else None):
+                raise ProofError('CDP_REPLY_SESSION')
+            if diagnostic:self._video_health_transport_clean=True
+            if ('error' in value and method == 'Runtime.evaluate' and
+                type(value['error']) is dict and value['error'].get('code') == -32000 and
+                value['error'].get('message') in ('Cannot find context with specified id',
+                    'Execution context was destroyed.', 'Inspected target navigated or closed')):
+                raise ProofError('PAGE_CONTEXT_TRANSITION')
+            if 'error' in value:
+                self.last_cdp_error = cdp_error(method, value['error'], getattr(self, 'context', None))
+                raise ProofError('CDP_' + method.replace('.', '_').upper() + '_' + self.last_cdp_error['category'])
+            if type(value.get('result')) is not dict: raise ProofError('CDP_REPLY_SHAPE')
+            return value['result']
+
+    def _evaluate(self, expression):
+        value=self._call('Runtime.evaluate',{'expression':expression,'returnByValue':True,
+                         'timeout':1500},True)
+        remote=value.get('result')
+        if 'exceptionDetails' in value or type(remote) is not dict or 'value' not in remote:
+            raise ProofError('PAGE_EVALUATION')
+        return remote['value']
+
+    def start(self):
+        if self.started or self.closed:raise ProofError('PAGE_SINGLE_USE')
+        self.started=True;self.phase='selecting';self.deadline=time.monotonic()+6
+        # This pipe belongs solely to the newly launched disposable Chromium.
+        # Require one page and its exact nonce URL; never select a personal tab.
+        infos=self._call('Target.getTargets',{'filter':[{'type':'page','exclude':False}] }).get('targetInfos')
+        if type(infos) is not list or len(infos)!=1 or type(infos[0]) is not dict:
+            raise ProofError('PAGE_TARGET_COUNT')
+        info=infos[0]
+        if info.get('type')!='page' or info.get('url')!=self.fixture or not _id(info.get('targetId')):
+            raise ProofError('PAGE_TARGET_IDENTITY')
+        self.target=info['targetId'];self.initial_context=info.get('browserContextId');del infos,info
+        self.session=self._call('Target.attachToTarget',{'targetId':self.target,'flatten':True}).get('sessionId')
+        if not _id(self.session):raise ProofError('CDP_SESSION_ID')
+        original=self._evaluate('(()=>({same:location.href==='+json.dumps(self.fixture)+
+            ',width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visible:!document.hidden,focused:document.hasFocus()}))()')
+        if (original!={'same':True,'width':CSS_WIDTH,'height':CSS_HEIGHT,'dpr':DEVICE_SCALE,'visible':True,'focused':True} or
+            any(type(original[k]) is not bool for k in ('same','visible','focused')) or
+            any(type(original[k]) is not int for k in ('width','height')) or
+            type(original['dpr']) not in (int,float)):
+            raise ProofError('PAGE_FIXTURE_IDENTITY')
+        self._call('Target.activateTarget',{'targetId':self.target})
+        self.phase='navigating';self.navigation_attempted=True
+        value=self._call('Page.navigate',{'url':self.start_url},True)
+        if 'errorText' in value or value.get('isDownload') is True or not _id(value.get('frameId')):
+            raise ProofError('PAGE_NAVIGATION')
+        self.phase='navigated'
+
+    def snapshot(self):
+        if self.closed or self.phase!='navigated':
+            raise ProofError('PAGE_SNAPSHOT_BOUND')
+        self.snapshots+=1;self.deadline=time.monotonic()+2
+        expression='''(()=>{const vs=document.querySelectorAll('video');const n=Math.min(vs.length,33);const v=n===1?vs[0]:null;return {width:innerWidth,height:innerHeight,dpr:devicePixelRatio,visible:!document.hidden,focused:document.hasFocus(),documentReady:document.readyState,fixtureGone:location.href!==FIXTURE,httpsDocument:location.protocol==='https:',localStart:location.href===START_URL,videoCount:n,video:v?{width:v.videoWidth,height:v.videoHeight,paused:v.paused,readyState:v.readyState}:null};})()'''.replace('FIXTURE',json.dumps(self.fixture)).replace('START_URL',json.dumps(self.start_url))
+        return scalar_snapshot(self._evaluate(expression))
+
+    def _remaining(self):
+        remaining=super()._remaining()
+        bound=getattr(self,'_video_health_deadline',None)
+        if bound is not None:
+            remaining=min(remaining,bound-time.monotonic())
+            if remaining<=0:raise ProofError('CDP_TIMEOUT')
+        return remaining
+
+    def video_health(self):
+        """One two-second diagnostic budget; ambiguity never becomes healthy zero."""
+        if getattr(self,'_video_health_abandoned',None) is not None:
+            return unavailable_video_health()
+        previous=self.deadline
+        self._video_health_deadline=time.monotonic()+2
+        self._video_health_transport_clean=True
+        try:
+            self.assert_alive()
+            value=scalar_video_health(self._evaluate(VIDEO_HEALTH_EXPRESSION))
+            self.assert_alive()
+            self._remaining()
+            return value
+        except (ProofError,OSError):
+            if not self._video_health_transport_clean:raise
+            return unavailable_video_health()
+        finally:
+            self.deadline=previous
+            del self._video_health_deadline
+            del self._video_health_transport_clean
+
+    def assert_alive(self):
+        if self.closed or self.phase!='navigated':raise ProofError('PAGE_OWNER_LOST')
+        self.deadline=time.monotonic()+2
+        info=self._call('Target.getTargetInfo',{'targetId':self.target}).get('targetInfo')
+        if (type(info) is not dict or info.get('targetId')!=self.target or
+            info.get('type')!='page' or info.get('attached') is not True):
+            raise ProofError('PAGE_OWNER_LOST')
+        # Discard URL/title fields that Chromium includes; never export/store them.
+        return True
+
+    def navigate(self, value):
+        if (self.closed or self.phase!='navigated' or
+            not valid_navigation({'url':value})):
+            raise ProofError('PAGE_NAVIGATION_SCOPE')
+        self.navigations+=1;self.deadline=time.monotonic()+3
+        result=self._call('Page.navigate',{'url':value},True)
+        value=None
+        if 'errorText' in result or result.get('isDownload') is True:
+            # The owned Chrome error page or a canceled download is not ownership loss.
+            self.navigation_failures = getattr(self, 'navigation_failures', 0) + 1
+            return False
+        if not _id(result.get('frameId')): raise ProofError('PAGE_NAVIGATION')
+        return True
+
+    def history(self, action):
+        """Navigate the disposable tab's RAM-only history; never export it."""
+        if (self.closed or self.phase != 'navigated' or
+            not valid_history({'action': action})):
+            raise ProofError('PAGE_HISTORY_SCOPE')
+        self.navigations += 1
+        self.deadline = time.monotonic() + 3
+        if action == 'reload':
+            self._call('Page.reload', {}, True)
+            return True
+        result = self._call('Page.getNavigationHistory', {}, True)
+        entries, current = result.get('entries'), result.get('currentIndex')
+        if (type(entries) is not list or not 1 <= len(entries) <= 256 or
+            type(current) is not int or not 0 <= current < len(entries)):
+            raise ProofError('PAGE_HISTORY_SHAPE')
+        destination = current + (-1 if action == 'back' else 1)
+        if not 0 <= destination < len(entries):
+            return False
+        entry = entries[destination]
+        if (type(entry) is not dict or type(entry.get('id')) is not int or
+            not 0 <= entry['id'] <= 2147483647):
+            raise ProofError('PAGE_HISTORY_SHAPE')
+        # Do not return to the startup fixture, browser internals, or an HTTP page.
+        if entry.get('url') != self.start_url and not valid_navigation({'url': entry.get('url')}):
+            return False
+        entry_id = entry['id']
+        del result, entries, entry
+        self._call('Page.navigateToHistoryEntry', {'entryId': entry_id}, True)
+        return True
+
+    def evidence(self):
+        return {'navigationAttempted':self.navigation_attempted,'phase':self.phase,
+                'scalarSnapshots':self.snapshots,'navigations':self.navigations,'navigationFailures':getattr(self,'navigation_failures',0),'sameOwnedTarget':self.target is not None,
+                'cdpError':getattr(self,'last_cdp_error',None),'urlExported':False,'sitePrivateApiUsed':False,'qualityChanged':False}
+
+
+class TabSession(SessionPage):
+    """At most eight pages in the original explicit incognito context, one reader."""
+    def start(self):
+        super().start()
+        if not _id(self.initial_context):
+            raise ProofError('TAB_CONTEXT_UNAVAILABLE')
+        self.context = self.initial_context
+        self.popup_guard = PopupCensus()
+        if not hasattr(self, "popup_lock"): self.popup_lock = threading.RLock()
+        key = secrets.token_hex(8)
+        self.tabs = {key: {'target': self.target, 'session': self.session, 'label': 'New tab'}}
+        self.active = key
+        self.tab_revision = 0
+        self.tab_actions = 0
+        self.tab_preflight = False
+        self.pending_local_start = False
+        self.editor = None
+        self.editor_probes = self.editor_edits = 0
+        self.assert_alive()
+
+    def _label(self, value):
+        if type(value) is not str or len(value) > 8192 or value == self.start_url:
+            return 'New tab'
+        try:
+            parsed = urlsplit(value)
+            host = parsed.hostname
+            if parsed.scheme not in ('http', 'https') or not host or not host.isascii():
+                return 'New tab'
+            if not re.fullmatch('[A-Za-z0-9.:-]{1,253}', host):
+                return 'New tab'
+            return host[:64]
+        except ValueError:
+            return 'New tab'
+
+    def assert_alive(self, closing_target=None):
+        with self.popup_lock:
+            return self._assert_alive(closing_target)
+
+    def _assert_alive(self, closing_target=None):
+        if self.closed or self.phase != 'navigated' or self.active not in self.tabs:
+            raise ProofError('TAB_OWNER_LOST')
+        self.deadline = time.monotonic() + 2
+        infos = self._call('Target.getTargets', {'filter': [{'type': 'page', 'exclude': False}]}).get('targetInfos')
+        expected = {v['target']: v for v in self.tabs.values()}
+        # Video-health observation is strictly read-only, including its census.
+        # A normal owner heartbeat performs any later popup reconciliation.
+        if not hasattr(self, '_video_health_deadline'):
+            if type(infos) is list and any(type(i)is dict and i.get('targetId') not in expected and i.get('targetId')!=closing_target for i in infos):
+                if not callable(getattr(self,'popup_restored',None)):
+                    raise ProofError('POPUP_PRESENTATION_REQUIRED')
+            infos = self.popup_guard.reconcile(self._call,self.context,set(expected),infos,
+                selected=self.target,closing=closing_target)
+            if self.popup_guard.last_closed:
+                if self.popup_restored() is not True:raise ProofError('POPUP_PRESENTATION')
+        if type(infos) is not list or not 1 <= len(infos) <= 8:
+            raise ProofError('TAB_UNMANAGED_TARGET')
+        seen = set()
+        closing_seen = False
+        for info in infos:
+            if (type(info) is not dict or info.get('type') != 'page' or
+                info.get('browserContextId') != self.context or not _id(info.get('targetId'))):
+                raise ProofError('TAB_UNMANAGED_TARGET')
+            key = info['targetId']
+            if closing_target is not None and key == closing_target:
+                if closing_seen: raise ProofError('TAB_UNMANAGED_TARGET')
+                closing_seen = True
+                continue
+            if info.get('attached') is not True or key not in expected or key in seen:
+                raise ProofError('TAB_UNMANAGED_TARGET')
+            seen.add(key)
+            expected[key]['label'] = self._label(info.get('url'))
+        if seen != set(expected): raise ProofError('TAB_UNMANAGED_TARGET')
+        if self.target != self.tabs[self.active]['target'] or self.session != self.tabs[self.active]['session']:
+            raise ProofError('TAB_OWNER_LOST')
+        return not closing_seen
+
+    def voice_target_matches(self, expected):
+        """Compare only the selected owned page; discard URL/title immediately.
+
+        Runs on the existing CDP owner thread. This establishes a browser URL
+        observation, never that a frame was decoded or presented by the TV.
+        """
+        if type(expected) is not str:
+            return False
+        with self.popup_lock:
+            self._assert_alive()
+            selected = self.tabs.get(self.active)
+            if (selected is None or selected['target'] != self.target or
+                    selected['session'] != self.session):
+                return False
+            info = self._call('Target.getTargetInfo', {'targetId': self.target}).get('targetInfo')
+            if (type(info) is not dict or info.get('targetId') != self.target or
+                    info.get('browserContextId') != self.context or info.get('type') != 'page' or
+                    info.get('attached') is not True):
+                return False
+            actual = info.get('url')
+            roots = ('https://www.youtube.com', 'https://duckduckgo.com',
+                     'https://www.wikipedia.org', 'https://news.ycombinator.com')
+            return (actual == expected or
+                    expected in roots and actual == expected + '/')
+
+    def voice_surface_probe(self):
+        default = {'surfaceClass': 'browser_other', 'video': {'count': 0, 'paused': None}}
+        with self.popup_lock:
+            self._assert_alive()
+            selected = self.tabs.get(self.active)
+            if (selected is None or selected['target'] != self.target or
+                    selected['session'] != self.session):
+                return default
+            info = self._call('Target.getTargetInfo', {'targetId': self.target}).get('targetInfo')
+            if (type(info) is not dict or info.get('targetId') != self.target or
+                    info.get('browserContextId') != self.context or info.get('type') != 'page' or
+                    info.get('attached') is not True):
+                return default
+            actual = info.get('url')
+            del info
+            if type(actual) is not str:
+                return default
+            if actual == 'https://www.youtube.com/watch' or actual.startswith('https://www.youtube.com/watch?'):
+                surface = 'browser_youtube_watch'
+            elif actual == 'https://www.youtube.com' or actual.startswith('https://www.youtube.com/'):
+                surface = 'browser_youtube'
+            else:
+                surface = 'browser_other'
+            actual = None
+            if surface != 'browser_youtube_watch':
+                return {'surfaceClass': surface, 'video': {'count': 0, 'paused': None}}
+            self.deadline = time.monotonic() + 2
+            expr = ('(()=>{const v=[...document.querySelectorAll("video")];'
+                    'const n=Math.min(4,v.length);'
+                    'const p=n>0&&typeof v[0].paused==="boolean"?v[0].paused:null;'
+                    'return {count:n,paused:p}})()')
+            try:
+                reply = self._call('Runtime.evaluate', {'expression': expr, 'returnByValue': True, 'timeout': 1000}, True)
+                val = reply.get('result', {}).get('value') if type(reply.get('result')) is dict and 'exceptionDetails' not in reply else None
+            except ProofError:
+                val = None
+            if (type(val) is dict and set(val) == {'count', 'paused'} and
+                    type(val['count']) is int and 0 <= val['count'] <= 4 and
+                    (val['paused'] is None or type(val['paused']) is bool)):
+                return {'surfaceClass': surface, 'video': {'count': val['count'], 'paused': val['paused']}}
+            return {'surfaceClass': surface, 'video': {'count': 0, 'paused': None}}
+
+    def voice_media_key(self):
+        with self.popup_lock:
+            probe = self.voice_surface_probe()
+            if (probe['surfaceClass'] != 'browser_youtube_watch' or
+                    probe['video']['count'] < 1 or type(probe['video']['paused']) is not bool):
+                return False
+            self.deadline = time.monotonic() + 2
+            check = '(()=>{' + EDITOR_LOCATE + 'const r=locate();return !r.e&&!r.unavailable})()'
+            try:
+                reply = self._call('Runtime.evaluate', {'expression': check, 'returnByValue': True, 'timeout': 1000}, True)
+                safe = ('exceptionDetails' not in reply and type(reply.get('result')) is dict and
+                        reply['result'].get('value') is True)
+            except ProofError:
+                safe = False
+            if not safe:
+                return False
+            down = {'type': 'keyDown', 'key': 'k', 'code': 'KeyK', 'text': 'k', 'unmodifiedText': 'k',
+                    'windowsVirtualKeyCode': 75, 'nativeVirtualKeyCode': 75}
+            up = {'type': 'keyUp', 'key': 'k', 'code': 'KeyK',
+                  'windowsVirtualKeyCode': 75, 'nativeVirtualKeyCode': 75}
+            try:
+                self._call('Input.dispatchKeyEvent', down, True)
+            finally:
+                self._call('Input.dispatchKeyEvent', up, True)
+            return True
+
+    def invalidate_editor(self):
+        self.editor = None
+
+    def navigate(self, value):
+        self.invalidate_editor()
+        return super().navigate(value)
+
+    def history(self, action):
+        self.invalidate_editor()
+        return super().history(action)
+
+    def editor_probe(self, force=False):
+        if self.editor_probes >= 1024: return {'state':'unavailable','kind':None,'multiline':None,'focusId':None}
+        self.editor_probes += 1
+        self.assert_alive()
+        self.deadline = time.monotonic()+3
+        tree=self._call('Page.getFrameTree',{},True).get('frameTree')
+        frame=tree.get('frame') if type(tree) is dict else None
+        if type(frame) is not dict or not _id(frame.get('id')) or frame.get('parentId'): raise ProofError('EDITOR_ROOT_FRAME')
+        world=self._call('Page.createIsolatedWorld',{'frameId':frame['id'],'worldName':'r2d2-owned-editor','grantUniveralAccess':False},True).get('executionContextId')
+        del tree,frame
+        if type(world) is not int or not 1<=world<=2147483647: raise ProofError('EDITOR_WORLD')
+        candidate=secrets.token_hex(8)
+        old=self.editor
+        fresh=force or not old or old['target']!=self.target or old['session']!=self.session or old['world']!=world
+        expression='(()=>{'+EDITOR_LOCATE+'const r=locate();if(!r.e){globalThis.__r2d2Editor=null;return {state:r.unavailable?"unavailable":"none",kind:null,multiline:null,focusId:null}};if(r.kind==="password"){globalThis.__r2d2Editor=null;return {state:"unavailable",kind:"password",multiline:false,focusId:null}};let b=globalThis.__r2d2Editor;if('+json.dumps(bool(fresh))+'||!b||b.e!==r.e||b.doc!==r.e.ownerDocument||b.root!==document||b.kind!==r.kind||b.multiline!==r.multiline){b={e:r.e,doc:r.e.ownerDocument,root:document,kind:r.kind,multiline:r.multiline,id:'+json.dumps(candidate)+'};globalThis.__r2d2Editor=b}return {state:"editable",kind:r.kind,multiline:r.multiline,focusId:b.id}})()'
+        reply=self._call('Runtime.evaluate',{'expression':expression,'contextId':world,'returnByValue':True,'timeout':1500},True)
+        if 'exceptionDetails' in reply or type(reply.get('result')) is not dict: raise ProofError('EDITOR_PROJECTION')
+        value=reply['result'].get('value')
+        if type(value) is not dict or set(value)!={'state','kind','multiline','focusId'}: raise ProofError('EDITOR_PROJECTION')
+        if value['state']=='editable':
+            allowed={candidate}
+            if not fresh:allowed.add(old['id'])
+            if type(value['focusId']) is not str or value['focusId'] not in allowed or value['kind']!='text' or type(value['multiline']) is not bool:raise ProofError('EDITOR_PROJECTION')
+            self.editor={'id':value['focusId'],'target':self.target,'session':self.session,'world':world,'kind':value['kind'],'multiline':value['multiline']}
+        elif value=={'state':'unavailable','kind':'password','multiline':False,'focusId':None}:
+            self.editor=None
+        elif value['state'] in ('none','unavailable') and all(value[k] is None for k in ('kind','multiline','focusId')):
+            self.editor=None
+        else:raise ProofError('EDITOR_PROJECTION')
+        return value
+
+    def _editor_match(self,binding):
+        if binding['target']!=self.target or binding['session']!=self.session:return False
+        expression='(()=>{'+EDITOR_LOCATE+'const r=locate(),b=globalThis.__r2d2Editor;return !!(b&&r.e&&r.kind!=="password"&&b.id==='+json.dumps(binding['id'])+'&&b.e===r.e&&b.doc===r.e.ownerDocument&&b.root===document&&b.kind===r.kind&&b.multiline===r.multiline)})()'
+        reply=self._call('Runtime.evaluate',{'expression':expression,'contextId':binding['world'],'returnByValue':True,'timeout':1500},True)
+        return ('exceptionDetails' not in reply and type(reply.get('result')) is dict and reply['result'].get('value') is True)
+
+    def editor_apply(self, body):
+        binding=self.editor
+        self.editor=None  # Consume once, even if native admission fails.
+        if (not valid_text(body) or self.editor_edits>=128 or not binding or body['focusId']!=binding['id'] or
+            binding['target']!=self.target or binding['session']!=self.session or binding['kind']=='password'):return 'rejected'
+        if body['action'] in ('insert','insert-enter') and not binding['multiline'] and any(c in body['text'] for c in '\n\t'):return 'rejected'
+        self.editor_edits+=1
+        self.deadline=time.monotonic()+3
+        try:
+            if not self._editor_match(binding):return 'rejected'
+        except ProofError:return 'rejected'
+        try:
+            if body['action'] in ('insert','insert-enter'):
+                self._call('Input.insertText',{'text':body['text']},True)
+                if body['action']=='insert-enter' and not self._editor_match(binding):return 'unknown'
+            if body['action']!='insert':
+                key,code=('Backspace',8) if body['action']=='backspace' else ('Enter',13)
+                down={'type':'keyDown','key':key,'code':key,'windowsVirtualKeyCode':code,'nativeVirtualKeyCode':code}
+                if key=='Enter':down.update({'text':'\r','unmodifiedText':'\r'})
+                try:self._call('Input.dispatchKeyEvent',down,True)
+                finally:self._call('Input.dispatchKeyEvent',{'type':'keyUp','key':key,'code':key,'windowsVirtualKeyCode':code,'nativeVirtualKeyCode':code},True)
+                # Enter commonly submits a form, replaces the document or moves
+                # focus. Both native ACKs prove dispatch, not site acceptance;
+                # those expected effects must not make a completed command
+                # uncertain. Pre-insertion/intermediate focus checks remain.
+                if key=='Enter':return 'applied'
+            return 'applied' if self._editor_match(binding) else 'unknown'
+        except ProofError:return 'unknown'
+        finally:body=None;binding=None
+
+    def keyboard_preflight(self):
+        # Only our owned fixed local page may host this temporary sentinel form.
+        self.deadline=time.monotonic()+3
+        check=self._evaluate('location.href==='+json.dumps(self.start_url))
+        if check is not True:raise ProofError('KEYBOARD_PREFLIGHT_ORIGIN')
+        flags={'qualified':False,'text':False,'password':False,'multiline':False,'shadow':False,'keys':False,'cleared':False}
+        try:
+            for kind in ('text','password','multiline','shadow'):
+                script='(()=>{if(location.href!=='+json.dumps(self.start_url)+')return false;document.getElementById("r2d2-keyboard-proof")?.remove();const h=document.createElement("div");h.id="r2d2-keyboard-proof";document.body.appendChild(h);const e=document.createElement('+json.dumps('textarea' if kind=='multiline' else 'input')+');'+('e.type="password";' if kind=='password' else '')+('h.attachShadow({mode:"open"}).appendChild(e);' if kind=='shadow' else 'h.appendChild(e);')+'e.focus();return true})()'
+                if self._evaluate(script) is not True:raise ProofError('KEYBOARD_PREFLIGHT_FORM')
+                focus=self.editor_probe(force=True)
+                if kind=='password':
+                    if focus!={'state':'unavailable','kind':'password','multiline':False,'focusId':None} or self.editor is not None:raise ProofError('KEYBOARD_PASSWORD_GUARD')
+                    if self.editor_apply({'action':'insert','focusId':'0'*16,'id':secrets.token_hex(8),'text':'synthetic-only'})!='rejected':raise ProofError('KEYBOARD_PASSWORD_GUARD')
+                    if self._evaluate('document.getElementById("r2d2-keyboard-proof").firstElementChild.value===""') is not True:raise ProofError('KEYBOARD_PASSWORD_GUARD')
+                    flags['password']=True
+                    continue
+                expected='text'
+                if focus['state']!='editable' or focus['kind']!=expected or focus['multiline']!=(kind=='multiline'):raise ProofError('KEYBOARD_PREFLIGHT_FOCUS')
+                body={'action':'insert','focusId':focus['focusId'],'id':secrets.token_hex(8),'text':'R2'}
+                if self.editor_apply(body)!='applied':raise ProofError('KEYBOARD_PREFLIGHT_INSERT')
+                query='(()=>{const h=document.getElementById("r2d2-keyboard-proof");const e=h&&(h.shadowRoot?h.shadowRoot.firstElementChild:h.firstElementChild);return !!e&&e.value==="R2"})()'
+                if self._evaluate(query) is not True:raise ProofError('KEYBOARD_PREFLIGHT_READBACK')
+                flags[kind]=True
+                if kind=='multiline':
+                    focus=self.editor_probe(force=True)
+                    if self.editor_apply({'action':'backspace','focusId':focus['focusId'],'id':secrets.token_hex(8)})!='applied':raise ProofError('KEYBOARD_PREFLIGHT_KEYS')
+                    if self._evaluate(query.replace('e.value==="R2"','e.value==="R"')) is not True:raise ProofError('KEYBOARD_PREFLIGHT_KEYS')
+                    focus=self.editor_probe(force=True)
+                    if self.editor_apply({'action':'insert-enter','focusId':focus['focusId'],'id':secrets.token_hex(8),'text':'é水'})!='applied':raise ProofError('KEYBOARD_PREFLIGHT_KEYS')
+                    if self._evaluate(query.replace('e.value==="R2"','e.value==='+json.dumps('Ré水\n'))) is not True:raise ProofError('KEYBOARD_PREFLIGHT_KEYS')
+            # Prove the normal form case too: one native combined Enter submits
+            # our fixed form, removes its old input and moves focus elsewhere.
+            # Only fixed synthetic values/counters are inspected here.
+            script='(()=>{if(location.href!=='+json.dumps(self.start_url)+')return false;document.getElementById("r2d2-keyboard-proof")?.remove();const h=document.createElement("div");h.id="r2d2-keyboard-proof";const f=document.createElement("form"),e=document.createElement("input"),s=document.createElement("button"),n=document.createElement("button");s.type="submit";n.type="button";f.append(e,s);h.append(f,n);document.body.appendChild(h);f.addEventListener("submit",event=>{event.preventDefault();h.dataset.submits=String(Number(h.dataset.submits||0)+1);h.dataset.exact=String(e.value==="R2 form");e.remove();n.focus()});e.focus();return true})()'
+            if self._evaluate(script) is not True:raise ProofError('KEYBOARD_PREFLIGHT_FORM')
+            focus=self.editor_probe(force=True)
+            if focus['state']!='editable' or focus['kind']!='text' or focus['multiline'] is not False:raise ProofError('KEYBOARD_PREFLIGHT_FOCUS')
+            if self.editor_apply({'action':'insert-enter','focusId':focus['focusId'],'id':secrets.token_hex(8),'text':'R2 form'})!='applied':raise ProofError('KEYBOARD_PREFLIGHT_SUBMIT')
+            if self._evaluate('(()=>{const h=document.getElementById("r2d2-keyboard-proof");return !!h&&h.dataset.submits==="1"&&h.dataset.exact==="true"&&document.activeElement===h.lastElementChild&&!h.firstElementChild.querySelector("input")})()') is not True:raise ProofError('KEYBOARD_PREFLIGHT_SUBMIT')
+            self.assert_alive()
+            snapshot=self.snapshot()
+            if not presented(snapshot) or not snapshot['localStart']:raise ProofError('KEYBOARD_PREFLIGHT_HEALTH')
+            flags['keys']=True
+        finally:
+            self.invalidate_editor();self.deadline=time.monotonic()+2
+            flags['cleared']=self._evaluate('(()=>{if(location.href!=='+json.dumps(self.start_url)+')return false;document.getElementById("r2d2-keyboard-proof")?.remove();return document.getElementById("r2d2-keyboard-proof")===null})()') is True
+        flags['qualified']=all(flags[k] for k in ('text','password','multiline','shadow','keys','cleared'))
+        if not flags['qualified']:raise ProofError('KEYBOARD_PREFLIGHT_FAILED')
+        return flags
+
+    def state(self):
+        return {'tabs': [{'id': key, 'label': item['label']} for key, item in self.tabs.items()],
+                'active': self.active, 'revision': self.tab_revision}
+
+    def _select(self, key):
+        self.active = key
+        self.target, self.session = self.tabs[key]['target'], self.tabs[key]['session']
+        self._call('Target.activateTarget', {'targetId': self.target})
+
+    def tab_command(self, body, prove_selected, startup=False):
+        if (not valid_tabs(body) or self.closed or self.phase != 'navigated' or
+            (not startup and self.tab_actions >= 9007199254740991)):
+            raise ProofError('TAB_COMMAND_SCOPE')
+        action = body['action']
+        self.editor = None
+        reset_last = action == 'close' and len(self.tabs) == 1
+        closing_target = None
+        if action != 'new' and body['id'] not in self.tabs:
+            raise ProofError('TAB_UNKNOWN')
+        if action == 'new' and len(self.tabs) >= 8:
+            raise ProofError('TAB_LIMIT')
+        self.assert_alive()
+        self.deadline = time.monotonic() + 3
+        if not startup: self.tab_actions += 1
+        if action == 'new':
+            # The launch-created incognito context is not a DevTools-created
+            # context. Use a fixed native window.open in an isolated JS world;
+            # never evaluate window.open overridden by the website's main world.
+            previous = {v['target'] for v in self.tabs.values()}
+            tree = self._call('Page.getFrameTree', {}, True).get('frameTree')
+            frame = tree.get('frame') if type(tree) is dict else None
+            if type(frame) is not dict or not _id(frame.get('id')) or frame.get('parentId'):
+                raise ProofError('TAB_ROOT_FRAME')
+            frame_id = frame['id']
+            del tree, frame
+            world = self._call('Page.createIsolatedWorld', {'frameId': frame_id,
+                'worldName': 'r2d2-owned-tab-control', 'grantUniveralAccess': False}, True).get('executionContextId')
+            if type(world) is not int or not 1 <= world <= 2147483647:
+                raise ProofError('TAB_ISOLATED_WORLD')
+            expression = '(()=>{window.open(' + json.dumps(self.start_url) + ',"_blank","noopener,noreferrer");return true})()'
+            result = self._call('Runtime.evaluate', {'expression': expression, 'contextId': world,
+                'userGesture': True, 'returnByValue': True, 'timeout': 1500}, True)
+            if 'exceptionDetails' in result or type(result.get('result')) is not dict or result['result'].get('value') is not True:
+                raise ProofError('TAB_OPEN_EVALUATION')
+            del expression, result, frame_id, world
+            target = None
+            for attempt in range(5):
+                self.deadline = time.monotonic() + 2
+                infos = self._call('Target.getTargets', {'filter': [{'type': 'page', 'exclude': False}]}).get('targetInfos')
+                if type(infos) is not list or len(infos) not in (len(previous), len(previous)+1) or len(infos)>8:
+                    raise ProofError('TAB_NEW_CENSUS')
+                seen = set(); candidate = None
+                for info in infos:
+                    if (type(info) is not dict or info.get('type') != 'page' or
+                        info.get('browserContextId') != self.context or not _id(info.get('targetId')) or
+                        info['targetId'] in seen): raise ProofError('TAB_NEW_CENSUS')
+                    key = info['targetId']; seen.add(key)
+                    if key in previous:
+                        if info.get('attached') is not True: raise ProofError('TAB_NEW_CENSUS')
+                    elif candidate is not None or info.get('url') not in ('about:blank', self.start_url):
+                        raise ProofError('TAB_NEW_CENSUS')
+                    else: candidate = key
+                if not previous.issubset(seen): raise ProofError('TAB_NEW_CENSUS')
+                if candidate is not None: target = candidate; break
+                if attempt == 4: raise ProofError('TAB_OPEN_NOT_OBSERVED')
+                time.sleep(0.1)
+            session = self._call('Target.attachToTarget', {'targetId': target, 'flatten': True}).get('sessionId')
+            if not _id(session) or session in {v['session'] for v in self.tabs.values()}:
+                raise ProofError('TAB_ATTACH_ID')
+            key = secrets.token_hex(8)
+            if key in self.tabs: raise ProofError('TAB_PUBLIC_ID_COLLISION')
+            self.tabs[key] = {'target': target, 'session': session, 'label': 'New tab'}
+            self._select(key)
+            result = self._call('Page.navigate', {'url': self.start_url}, True)
+            if 'errorText' in result or result.get('isDownload') is True or not _id(result.get('frameId')):
+                raise ProofError('TAB_RESET')
+        elif action == 'switch':
+            self._select(body['id'])
+        elif len(self.tabs) == 1:
+            # Keep the sole pinned browser window; no last-window close/recreate.
+            result = self._call('Page.navigate', {'url': self.start_url}, True)
+            if 'errorText' in result or result.get('isDownload') is True or not _id(result.get('frameId')):
+                raise ProofError('TAB_RESET')
+        else:
+            key = body['id']
+            if key == self.active:
+                self._select(next(k for k in self.tabs if k != key))
+            closing_target = self.tabs[key]['target']
+            result = self._call('Target.closeTarget', {'targetId': closing_target})
+            if result.get('success') is not True: raise ProofError('TAB_CLOSE')
+            del self.tabs[key]
+        for attempt in range(3):
+            if self.assert_alive(closing_target): break
+            if attempt == 2: raise ProofError('TAB_CLOSE_PENDING')
+            time.sleep(0.1)
+        self.pending_local_start = action == 'new' or reset_last
+        if prove_selected() is not True: raise ProofError('TAB_PRESENTATION')
+        if action == 'close' and self.pending_local_start:
+            self._call('Page.resetNavigationHistory', {}, True)
+            history = self._call('Page.getNavigationHistory', {}, True)
+            entries = history.get('entries')
+            if (type(history.get('currentIndex')) is not int or history['currentIndex'] != 0 or
+                type(entries) is not list or len(entries) != 1 or type(entries[0]) is not dict or
+                entries[0].get('url') != self.start_url):
+                raise ProofError('TAB_RESET_HISTORY')
+        self.pending_local_start = False
+        # Commit only after native selection, census, exact Xwindow and presentation.
+        if not startup: self.tab_revision += 1
+        return self.state()
+
+    def preflight(self, prove_selected):
+        original = self.active
+        self.tab_command({'action': 'new'}, prove_selected, startup=True)
+        temporary = self.active
+        self.tab_command({'action': 'switch', 'id': original}, prove_selected, startup=True)
+        self.tab_command({'action': 'close', 'id': temporary}, prove_selected, startup=True)
+        if len(self.tabs) != 1 or self.active != original or self.tab_revision != 0:
+            raise ProofError('TAB_PREFLIGHT')
+        self.tab_preflight = True
+        return {'qualified': True, 'sameContext': True, 'createdSwitchedClosed': True,
+                'initialTabRestored': True, 'tabCount': 1}
+
+    def evidence(self):
+        result = super().evidence()
+        result.update({'tabPreflightQualified': getattr(self, 'tab_preflight', False),
+            'tabCount': len(getattr(self, 'tabs', {})), 'tabActions': getattr(self, 'tab_actions', 0),
+            'tabRevision': getattr(self, 'tab_revision', 0), 'tabLabelsExported': False,
+            'protection': getattr(self,'protection_preflight',None),
+            'popupPolicy': self.popup_guard.evidence() if hasattr(self,'popup_guard') else None})
+        return result
+
+    def close(self):
+        self.editor = None
+        self.tabs = {}
+        self.active = self.context = None
+        super().close()

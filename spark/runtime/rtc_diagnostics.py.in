@@ -1,0 +1,38 @@
+"""Closed startup diagnostics. Never exports error text, debug strings or paths."""
+import threading
+STAGES=frozenset(('new','source-setup','audio-clock-bind','worker-start','offer-ready','complete'))
+CODES=frozenset(('PIPELINE_START','RTC_AUDIO_CLOCK','RTC_AUDIO_OWNER','RTC_AUDIO_CLOCK_CHANGED','RTC_AUDIO_READINESS_CLOCK','RTC_AUDIO_READINESS_TIMEOUT','RTC_AUDIO_BUFFER_READBACK','RTC_AUDIO_STATE','RTC_AUDIO_PROPERTY','RTC_AUDIO_FACTORY','RTC_AUDIO_PARENT','RTC_AUDIO_LINK','RTC_AUDIO_PAD','RTC_AUDIO_PROBE','RTC_AUDIO_IDENTITY','RTC_AUDIO_REPLAY','RTC_SOURCE_SCOPE','RTC_XVFB_UNBOUND','OWNER_GUARD','MEDIA_GATE_CODECS','VIDEO_LINK','RTP_LINK','WEBRTC_SINK_PAD','TRANSCEIVER','GST_ELEMENT','OFFER_TIMEOUT','OFFER_UNAVAILABLE','OFFER_STOPPED','HANDSHAKE_TIMEOUT','OFFER_NOT_READY'))
+DOMAINS={'gst-core-error-quark':'core','gst-library-error-quark':'library','gst-resource-error-quark':'resource','gst-stream-error-quark':'stream'}
+SOURCES=frozenset(('owned-public-4k60-vp9','peer','video','vqueue','vpay','vcaps','private-monitor','private-convert','private-resample','private-audio-format','private-audio-queue','private-opus','private-opus-pay'))
+def enum(value,maximum):
+ if not isinstance(value,int)or isinstance(value,bool):return None
+ try:n=int(value)
+ except (TypeError,ValueError,OverflowError):return None
+ return n if type(value)is not bool and 0<=n<=maximum else None
+def number(value):return value if type(value)is int and -1<=value<=1000000000 else None
+class StartupDiagnostics:
+ def __init__(self):
+  self.lock=threading.Lock();self.stage='new';self.failure=None;self.pipeline=None;self.pulse=None;self.bus=None
+ def phase(self,stage):
+  if stage not in STAGES:raise ValueError('DIAGNOSTIC_SCOPE')
+  with self.lock:self.stage=stage
+ def failed(self,error):
+  code=error.args[0]if isinstance(error,(ValueError,RuntimeError))and len(error.args)==1 and type(error.args[0])is str else None
+  with self.lock:
+   if self.failure is None:self.failure={'stage':self.stage,'code':code if code in CODES else'UNCLASSIFIED','kind':'ValueError'if isinstance(error,ValueError)else'RuntimeError'if isinstance(error,RuntimeError)else'Other'}
+ def state(self,state,current,pending):
+  with self.lock:self.pipeline={'return':enum(state,3),'current':enum(current,4),'pending':enum(pending,4)}
+ def pulse_values(self,buffer,latency):
+  with self.lock:self.pulse={'actualBufferUs':number(buffer),'actualLatencyUs':number(latency)}
+ def message(self,message,Gst):
+  # parse_error returns a transient debug string, which is discarded immediately.
+  # Only known domain/source labels and an integer GError code are retained.
+  if message is None or message.type!=Gst.MessageType.ERROR:return
+  try:
+   error,debug=message.parse_error();debug=None;source=message.src.get_name()if message.src is not None else None
+   code=getattr(error,'code',None);domain=DOMAINS.get(getattr(error,'domain',None),'unknown');error=None
+  except BaseException:source=None;code=None;domain='unknown'
+  with self.lock:
+   if self.bus is None:self.bus={'domain':domain,'code':code if type(code)is int and -32768<=code<=32767 else None,'source':source if source in SOURCES else'unknown'}
+ def snapshot(self):
+  with self.lock:return {'schema':1,'stage':self.stage,'failure':None if self.failure is None else dict(self.failure),'pipeline':None if self.pipeline is None else dict(self.pipeline),'pulse':None if self.pulse is None else dict(self.pulse),'busError':None if self.bus is None else dict(self.bus)}

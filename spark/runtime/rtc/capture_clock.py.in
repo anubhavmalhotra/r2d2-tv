@@ -1,0 +1,48 @@
+"""Map x11grab acquisition-request CLOCK_REALTIME microseconds conservatively.
+
+Each realtime read is bracketed by CLOCK_MONOTONIC reads. Small clock slews
+may widen the mapping within a fixed envelope; larger steps are rejected.
+Acquisition timestamps are never rebased to arrival. No raw clock values are
+exported.
+"""
+import math,time
+MAX_BRACKET_NS=10_000_000
+MAX_MAPPING_ENVELOPE_NS=2*MAX_BRACKET_NS
+MAX_AGE_NS=1_500_000_000
+class ClockError(RuntimeError):pass
+def need(v,c):
+ if not v:raise ClockError(c)
+class ClockMap:
+ def __init__(self,mono=time.monotonic_ns,real=time.time_ns,real_quantum_ns=None,mono_quantum_ns=None,max_span_ns=40_000_000_000,max_samples=10000):
+  self.real_quantum_ns=math.ceil(time.get_clock_info('time').resolution*1e9)if real_quantum_ns is None else real_quantum_ns
+  self.mono_quantum_ns=math.ceil(time.get_clock_info('monotonic').resolution*1e9)if mono_quantum_ns is None else mono_quantum_ns
+  need(all(type(x)is int and 0<=x<=10000 for x in(self.real_quantum_ns,self.mono_quantum_ns)),'CAPTURE_CLOCK_UNCERTAINTY')
+  need(type(max_span_ns)is int and 1_000_000_000<=max_span_ns<=10**18 and type(max_samples)is int and 1<=max_samples<=10**15,'CAPTURE_CLOCK_BOUND')
+  self.quantum=self.real_quantum_ns+self.mono_quantum_ns;self.max_span_ns=max_span_ns;self.max_samples=max_samples
+  self.mono=mono;self.real=real;self.lo=None;self.hi=None;self.bound_lo=None;self.bound_hi=None;self.start_real=None;self.start_mono=None;self.last_mono=None;self.samples=0;self.max_bracket=0
+ def sample(self):return self.observe(self.mono(),self.real(),self.mono())
+ def observe(self,before,real,after):
+  need(all(type(x)is int and x>=0 for x in(before,real,after))and after>=before,'CAPTURE_CLOCK_SHAPE')
+  width=after-before;self.max_bracket=max(self.max_bracket,width)
+  need(width+2*self.quantum<=MAX_BRACKET_NS,'CAPTURE_CLOCK_UNCERTAINTY')
+  need(self.last_mono is None or before>=self.last_mono,'CAPTURE_CLOCK_ORDER')
+  lo=before-real-self.quantum;hi=after-real+self.quantum
+  if self.lo is None:self.lo,self.hi=lo,hi;self.bound_lo,self.bound_hi=lo,hi;self.start_real=real;self.start_mono=before
+  else:
+   bound_lo=min(lo,self.bound_lo);bound_hi=max(hi,self.bound_hi)
+   lo=max(lo,self.lo);hi=min(hi,self.hi)
+   if lo>hi and bound_hi-bound_lo<=MAX_MAPPING_ENVELOPE_NS:lo,hi=bound_lo,bound_hi
+   need(lo<=hi,'CAPTURE_CLOCK_STEP');self.lo,self.hi=lo,hi;self.bound_lo,self.bound_hi=bound_lo,bound_hi
+   need(self.bound_hi-self.bound_lo<=MAX_MAPPING_ENVELOPE_NS,'CAPTURE_CLOCK_UNCERTAINTY')
+  self.last_mono=after;self.samples+=1;need(self.samples<=self.max_samples,'CAPTURE_CLOCK_BOUND');return after
+ def ages(self,stamp_us,now):
+  need(self.lo is not None and type(stamp_us)is int and 0<stamp_us<2**63 and type(now)is int and now>=self.last_mono,'CAPTURE_CLOCK_UNREADY')
+  # av_gettime is microsecond-resolution; include the entire truncated bin.
+  captured_real=stamp_us*1000
+  need(captured_real+999>=self.start_real and captured_real-self.start_real<=self.max_span_ns,'CAPTURE_PTS_OUTSIDE_RUN')
+  earliest=captured_real+self.bound_lo;latest=captured_real+999+self.bound_hi
+  lower=now-latest;upper=now-earliest
+  need(0<=lower<=upper,'CAPTURE_PTS_FUTURE')
+  return lower,upper
+ def projection(self):
+  return {'realtimeResolutionNs':self.real_quantum_ns,'monotonicResolutionNs':self.mono_quantum_ns,'samples':self.samples,'maxBracketNs':self.max_bracket,'offsetIntersectionNs':None if self.lo is None else self.hi-self.lo,'mappingEnvelopeNs':None if self.bound_lo is None else self.bound_hi-self.bound_lo,'captureTimestampQuantumNs':1000,'maxAllowedAgeNs':MAX_AGE_NS,'rawEpochExported':False}

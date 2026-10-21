@@ -1,0 +1,683 @@
+"""Strict, RAM-only HEVC/AAC fragmented-MP4 ring. No I/O at import.
+
+Constrained FFmpeg empty_moov/default_base_moof dialect, not general MP4.
+A malformed/unsupported stream ends this ring epoch. No sample/box rewriting.
+"""
+from collections import deque
+from dataclasses import dataclass
+from fractions import Fraction
+import struct
+import threading
+import math
+import time
+
+MAX_INIT = 1024 * 1024
+MAX_PAIR = 8 * 1024 * 1024
+MAX_SAMPLES = 2048
+MAX_BOXES = 256
+MAX_TERMINAL_INDEX = 65536
+
+
+class MediaError(ValueError):
+    pass
+
+
+class Lagged(MediaError):
+    def __init__(self, oldest, latest):
+        super().__init__('CONSUMER_LAGGED')
+        self.oldest, self.latest = oldest, latest
+
+
+def require(ok, code):
+    if not ok:
+        raise MediaError(code)
+
+
+def integer(x, low, high, code):
+    require(type(x) is int and low <= x <= high, code)
+    return x
+
+
+def u32(b, p=0):
+    require(0 <= p <= len(b)-4, 'TRUNCATED_FIELD')
+    return struct.unpack_from('>I', b, p)[0]
+
+
+def boxes(data):
+    """Reject open-ended/extended sizes and unaccounted tail bytes."""
+    result, p = [], 0
+    while p < len(data):
+        require(len(result) < MAX_BOXES and p+8 <= len(data), 'BOX_BOUND')
+        size = u32(data, p)
+        require(8 <= size <= len(data)-p, 'BOX_SIZE')
+        result.append((bytes(data[p+4:p+8]), memoryview(data)[p+8:p+size]))
+        p += size
+    return result
+
+
+def one(rows, kind):
+    found = [b for k,b in rows if k == kind]
+    require(len(found) == 1, 'BOX_MULTIPLICITY')
+    return found[0]
+
+
+def allowed(rows, kinds):
+    require(all(k in kinds for k,_ in rows), 'UNSUPPORTED_BOX')
+
+
+def full(b, versions=(0,), flags=0):
+    require(len(b) >= 4 and b[0] in versions, 'FULLBOX_VERSION')
+    f = int.from_bytes(b[1:4], 'big')
+    require(f & ~flags == 0, 'UNKNOWN_FLAGS')
+    return b[0], f, b[4:]
+
+
+def plain_box(data, kind):
+    rows = boxes(data)
+    require(len(rows) == 1 and rows[0][0] == kind, 'BOX_KIND')
+    return rows[0][1]
+
+
+def descriptors(data):
+    result, p = [], 0
+    while p < len(data):
+        require(len(result) < 16, 'DESCRIPTOR_COUNT')
+        tag=data[p];p+=1;size=0
+        for _ in range(4):
+            require(p<len(data),'DESCRIPTOR_TRUNCATED')
+            byte=data[p];p+=1;size=(size<<7)|(byte&127)
+            if byte&128 == 0:break
+        else:raise MediaError('DESCRIPTOR_LENGTH')
+        require(p+size<=len(data),'DESCRIPTOR_TRUNCATED')
+        result.append((tag,data[p:p+size]));p+=size
+    return result
+
+
+def aac_config(data):
+    rows=descriptors(data)
+    require(len(rows)==1 and rows[0][0]==3,'ES_DESCRIPTOR')
+    es=rows[0][1]
+    require(len(es)>=3 and es[2]==0,'ES_DEPENDENCY_OR_URL')
+    children=descriptors(es[3:])
+    require(len(children)==2 and [t for t,_ in children]==[4,6],'ES_CHILDREN')
+    dc=children[0][1]
+    require(len(dc)>=13 and dc[0]==0x40 and dc[1]==0x15,'AAC_DECODER_CONFIG')
+    conf=descriptors(dc[13:])
+    require(len(conf)==1 and conf[0][0]==5 and bytes(conf[0][1]) in
+            (b'\x11\x90',b'\x11\x90\x56\xe5\x00'),'AAC_LC_48K_STEREO_CONFIG')
+    require(bytes(children[1][1])==b'\x02','SL_CONFIG')
+
+
+def hvcc(b, *, allowed_levels=(153,)):
+    require(len(b) >= 23 and b[0] == 1, 'HVCC_SCHEMA')
+    # Main profile, 4-byte NAL lengths, single-layer 8-bit 4:2:0 output.
+    require((b[1] & 31) == 1 and b[12] in allowed_levels and (b[21] & 3) == 3,
+            'HVCC_PROFILE')
+    require((b[16] & 3) == 1 and (b[17] & 7) == 0 and (b[18] & 7) == 0,
+            'HVCC_FORMAT')
+    p, seen = 23, set()
+    require(1 <= b[22] <= 16, 'HVCC_ARRAYS')
+    for _ in range(b[22]):
+        require(p+3 <= len(b), 'HVCC_TRUNCATED')
+        header, count = b[p], int.from_bytes(b[p+1:p+3], 'big'); p += 3
+        kind = header & 63
+        require(header & 64 == 0 and kind in (32,33,34,39,40) and kind not in seen,
+                'HVCC_ARRAY_KIND')
+        require(1 <= count <= 64, 'HVCC_ARRAY_COUNT')
+        if kind in (32,33,34):
+            require(header & 128, 'HVCC_INCOMPLETE_PARAMETER_SET')
+        seen.add(kind)
+        for _ in range(count):
+            require(p+2 <= len(b), 'HVCC_TRUNCATED')
+            size = int.from_bytes(b[p:p+2], 'big'); p += 2
+            require(size >= 2 and p+size <= len(b), 'HVCC_NAL_SIZE')
+            require((b[p] >> 1) & 63 == kind and b[p] & 129 == 0
+                    and b[p+1] & 248 == 0 and b[p+1] & 7 != 0, 'HVCC_NAL_HEADER')
+            p += size
+    require(p == len(b) and {32,33,34} <= seen, 'HVCC_PARAMETER_SETS')
+
+
+@dataclass(frozen=True)
+class Track:
+    ident: int
+    kind: str
+    scale: int
+    duration: int
+    size: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class Init:
+    data: bytes
+    tracks: tuple
+
+
+def parse_init(ftyp, moov, *, allowed_levels=(153,)):
+    require(type(ftyp) is bytes and type(moov) is bytes and
+            0 < len(ftyp)+len(moov) <= MAX_INIT, 'INIT_BOUND')
+    f = plain_box(ftyp, b'ftyp')
+    require(len(f) >= 12 and len(f) % 4 == 0, 'FTYP_SCHEMA')
+    brands = [bytes(f[:4])] + [bytes(f[p:p+4]) for p in range(8,len(f),4)]
+    require(all(x in (b'iso5',b'iso6',b'isom',b'mp41',b'dash') for x in brands), 'FTYP_BRAND')
+    rows = boxes(plain_box(moov, b'moov'))
+    allowed(rows, {b'mvhd',b'trak',b'mvex',b'udta'})
+    one(rows,b'mvhd')
+    tracks = [b for k,b in rows if k == b'trak']
+    require(len(tracks) == 2, 'TRACK_COUNT')
+    defaults = {}
+    mvex = boxes(one(rows,b'mvex')); allowed(mvex,{b'trex'})
+    require(len(mvex) == 2, 'TREX_COUNT')
+    for _, b in mvex:
+        _,_,v = full(b); require(len(v) == 20, 'TREX_SCHEMA')
+        ident, desc, dur, size, flags = struct.unpack('>IIIII',v)
+        require(ident > 0 and ident not in defaults and desc == 1, 'TREX_ID')
+        defaults[ident] = (dur,size,flags)
+    result = []
+    for raw in tracks:
+        t = boxes(raw); allowed(t,{b'tkhd',b'mdia'}) # edit lists unsupported
+        ver,tkflags,v = full(one(t,b'tkhd'),(0,1),7)
+        require(tkflags == 3,'TRACK_NOT_ENABLED_IN_MOVIE')
+        require(len(v) == (80 if ver == 0 else 92), 'TKHD_SCHEMA')
+        ident = u32(v,8 if ver == 0 else 16)
+        require(ident in defaults and ident not in [x.ident for x in result], 'TRACK_ID')
+        m = boxes(one(t,b'mdia')); allowed(m,{b'mdhd',b'hdlr',b'minf'})
+        ver,_,v = full(one(m,b'mdhd'),(0,1))
+        require(len(v) == (20 if ver == 0 else 32), 'MDHD_SCHEMA')
+        scale = u32(v,8 if ver == 0 else 16)
+        require(0 < scale <= 1000000000, 'TIMESCALE')
+        _,_,v = full(one(m,b'hdlr'))
+        require(len(v) >= 20, 'HANDLER_SCHEMA')
+        handler = bytes(v[4:8])
+        require(handler in (b'vide',b'soun'), 'HANDLER_KIND')
+        kind = 'video' if handler == b'vide' else 'audio'
+        mi = boxes(one(m,b'minf')); allowed(mi,{b'vmhd',b'smhd',b'dinf',b'stbl'})
+        one(mi, b'vmhd' if kind == 'video' else b'smhd')
+        di = boxes(one(mi,b'dinf')); allowed(di,{b'dref'})
+        _,_,v = full(one(di,b'dref')); require(u32(v) == 1, 'DATA_REFERENCE')
+        dr = boxes(v[4:]); require(len(dr) == 1 and dr[0][0] == b'url ', 'DATA_REFERENCE')
+        _,flags,v = full(dr[0][1],flags=1)
+        require(flags == 1 and len(v) == 0, 'EXTERNAL_DATA_REFERENCE')
+        st = boxes(one(mi,b'stbl'))
+        allowed(st,{b'stsd',b'stts',b'stsc',b'stsz',b'stco'})
+        for k in (b'stts',b'stsc',b'stco'):
+            _,_,v = full(one(st,k)); require(bytes(v) == b'\0'*4, 'NONEMPTY_SAMPLE_TABLE')
+        _,_,v = full(one(st,b'stsz')); require(bytes(v) == b'\0'*8, 'NONEMPTY_SAMPLE_TABLE')
+        _,_,v = full(one(st,b'stsd')); require(u32(v) == 1, 'SAMPLE_ENTRY_COUNT')
+        entries = boxes(v[4:]); require(len(entries) == 1, 'SAMPLE_ENTRY_COUNT')
+        codec, v = entries[0]
+        require(len(v) >= 8 and bytes(v[:6]) == b'\0'*6 and bytes(v[6:8]) == b'\0\1', 'SAMPLE_ENTRY_REF')
+        if kind == 'video':
+            require(codec == b'hvc1' and len(v) >= 78, 'VIDEO_CODEC')
+            require(struct.unpack_from('>HH',v,24) == (3840,2160), 'VIDEO_DIMENSIONS')
+            ch = boxes(v[78:]); allowed(ch,{b'hvcC',b'pasp',b'btrt',b'colr',b'fiel'})
+            # Optional field-order extension: support only progressive (one
+            # field, no ordering detail). Interlaced/unknown semantics are not
+            # silently treated as progressive; retain the original init bytes.
+            fields = [body for tag,body in ch if tag == b'fiel']
+            require(len(fields) <= 1, 'FIEL_MULTIPLICITY')
+            if fields:
+                require(bytes(fields[0]) == b'\x01\x00', 'FIEL_PROGRESSIVE_ONLY')
+            hvcc(one(ch,b'hvcC'), allowed_levels=allowed_levels)
+        else:
+            require(codec == b'mp4a' and len(v) >= 28 and bytes(v[8:16]) == b'\0'*8,
+                    'AUDIO_CODEC')
+            require(struct.unpack_from('>HH',v,16) == (2,16) and u32(v,24) == 48000<<16
+                    and scale == 48000, 'AUDIO_FORMAT')
+            ch = boxes(v[28:]); allowed(ch,{b'esds',b'btrt'})
+            # Parse descriptor identity/ASC, but never decode media or rewrite config.
+            _,_,es = full(one(ch,b'esds')); require(8 <= len(es) <= 4096, 'AUDIO_CONFIG')
+            aac_config(es)
+        result.append(Track(ident,kind,scale,*defaults[ident]))
+    require({t.kind for t in result} == {'video','audio'}, 'TRACK_KINDS')
+    return Init(ftyp+moov,tuple(result))
+
+
+def closed_idr(sample):
+    p, kinds, units = 0, set(), 0
+    while p < len(sample):
+        units += 1
+        require(units <= 256, 'NAL_COUNT')
+        size = u32(sample,p); p += 4
+        require(size >= 2 and p+size <= len(sample), 'NAL_LENGTH')
+        a,b = sample[p],sample[p+1]
+        require(a & 129 == 0 and b & 248 == 0 and b & 7 != 0, 'NAL_HEADER')
+        kind = (a>>1)&63
+        require(kind <= 40, 'NAL_KIND')
+        if kind <= 31:
+            require(kind in (1,19,20), 'OPEN_OR_UNKNOWN_VIDEO_PICTURE')
+            kinds.add(kind)
+        p += size
+    require(len(kinds) == 1, 'VIDEO_ACCESS_UNIT')
+    return next(iter(kinds)) in (19,20)
+
+
+@dataclass(frozen=True)
+class Fragment:
+    index: int
+    sequence: int
+    moof: bytes
+    mdat: bytes
+    start: Fraction
+    end: Fraction
+    access_point: bool
+    decode_ends: tuple
+    terminal_audio_trim: bool = False
+    initial_audio_trim: bool = False
+    track_spans: tuple = ()
+
+    @property
+    def size(self):
+        return len(self.moof)+len(self.mdat)
+
+
+def parse_fragment(init, moof, mdat, index, sequence, prior, *, _terminal_candidate=False, short_fragment=False):
+    require(type(_terminal_candidate) is bool, 'TERMINAL_CANDIDATE_TYPE')
+    require(type(short_fragment) is bool, 'SHORT_FRAGMENT_TYPE')
+    integer(index,0,2**53-1,'FRAGMENT_INDEX');integer(sequence,1,2**32-1,'FRAGMENT_SEQUENCE')
+    known={t.ident:t for t in init.tracks}
+    require(type(prior) is dict and all(k in known and type(k)is int and type(v)is int and 0<=v<2**64 for k,v in prior.items()),'PRIOR_CLOCK_SCOPE')
+    trimmed = False; initial_trimmed = False
+    require(type(moof) is bytes and type(mdat) is bytes and
+            0 < len(moof)+len(mdat) <= MAX_PAIR, 'PAIR_BOUND')
+    rows = boxes(plain_box(moof,b'moof')); allowed(rows,{b'mfhd',b'traf'})
+    _,_,v = full(one(rows,b'mfhd')); require(len(v) == 4 and u32(v) == sequence, 'FRAGMENT_SEQUENCE')
+    trafs = [b for k,b in rows if k == b'traf']; require(1 <= len(trafs) <= len(init.tracks), 'FRAGMENT_TRACK_COUNT')
+    payload = plain_box(mdat,b'mdat'); ranges=[]; starts=[]; ends=[]; decode_ends=dict(prior); seen=set();spans=[];rap=False
+    for raw in trafs:
+        ts = boxes(raw); allowed(ts,{b'tfhd',b'tfdt',b'trun'})
+        _,flags,v = full(one(ts,b'tfhd'),flags=0x02003a)
+        require(flags & 0x020000, 'MOOF_BASE_REQUIRED')
+        ident = u32(v); p=4
+        tr = next((t for t in init.tracks if t.ident == ident), None)
+        require(tr is not None and ident not in seen, 'FRAGMENT_TRACK_ID')
+        seen.add(ident)
+        vals = [tr.duration,tr.size,tr.flags]
+        if flags & 2:
+            require(u32(v,p) == 1, 'SAMPLE_DESCRIPTION'); p+=4
+        for j,flag in enumerate((8,16,32)):
+            if flags & flag: vals[j]=u32(v,p); p+=4
+        require(p == len(v), 'TFHD_SCHEMA')
+        tfhd_duration = bool(flags & 8) # this traf's own default-sample-duration, never trex
+        ver,_,v = full(one(ts,b'tfdt'),(0,1))
+        require(len(v) == (4 if ver == 0 else 8), 'TFDT_SCHEMA')
+        dts = int.from_bytes(v,'big')
+        if ident in prior:
+            require(dts == prior[ident], 'DECODE_GAP_OR_OVERLAP')
+        starts.append(Fraction(dts,tr.scale)); begin=dts
+        ver,flags,v = full(one(ts,b'trun'),(0,1),0xf05)
+        count=u32(v); p=4
+        require(1 <= count <= MAX_SAMPLES and flags & 1, 'TRUN_COUNT_OR_OFFSET')
+        require(not (flags & 4 and flags & 0x400), 'TRUN_FLAGS_CONFLICT')
+        require(p+4 <= len(v),'TRUNCATED_FIELD')
+        offset=struct.unpack_from('>i',v,p)[0]; p+=4
+        first=None
+        if flags & 4: first=u32(v,p); p+=4
+        for sample_index in range(count):
+            dur,size,sflags=vals
+            fields=[dur,size,sflags,0]
+            for j,flag in enumerate((0x100,0x200,0x400,0x800)):
+                if flags & flag: fields[j]=u32(v,p); p+=4
+            dur,size,sflags,cts=fields
+            if sample_index == 0 and first is not None:sflags=first
+            require(0 < dur <= tr.scale*2 and 0 < size <= MAX_PAIR and cts == 0, 'SAMPLE_FIELDS')
+            require(len(moof)+8 <= offset and offset+size <= len(moof)+len(mdat), 'SAMPLE_LOCATION')
+            ranges.append((offset,offset+size))
+            sample=payload[offset-len(moof)-8:offset-len(moof)-8+size]
+            if tr.kind == 'video':
+                require(sflags in (0x02000000,0x01010000), 'VIDEO_SAMPLE_FLAGS')
+                idr=closed_idr(sample)
+                require(idr == (sflags == 0x02000000), 'SYNC_FLAG_NAL_MISMATCH')
+                if sample_index == 0:rap=idr
+            else:
+                # FFmpeg's no-edit-list/make-zero boundary may shorten OR
+                # extend the first mux duration. Admit less than one AAC frame
+                # of correction around1024, explicitly at this track's original
+                # zero-DTS/no-prior first sample. This2047 maximum is our tight
+                # startup policy, not the general MP4/FFmpeg duration maximum.
+                # The duration is explicit per sample (trun 0x100) or as this
+                # traf's tfhd default: FFmpeg writes the first sample's duration
+                # there and omits 0x100 when no sample differs (e.g. one sample).
+                initial_max = 4801 if short_fragment else 2048
+                initial_boundary = (ident not in prior and begin == 0 and
+                               sample_index == 0 and tr.scale == 48000 and
+                               (flags & 0x100 or tfhd_duration) and 0 < dur < initial_max)
+                short_first = initial_boundary and dur < 1024
+                extended_first = initial_boundary and dur > 1024
+                short_last = (_terminal_candidate and not short_first and sample_index == count-1
+                              and flags & 0x100 and 0 < dur < 1024)
+                require(sflags == 0x02000000 and (dur == 1024 or short_first or extended_first or short_last),
+                        'AUDIO_SAMPLE_FLAGS_OR_DURATION')
+                if short_first:initial_trimmed = True
+                if short_last:trimmed = True
+            offset+=size; dts+=dur
+            require(dts < 2**64,'DECODE_TIME_OVERFLOW')
+        require(p == len(v) and Fraction(dts-begin,tr.scale) <= 2, 'TRUN_SCHEMA_OR_SPAN')
+        decode_ends[ident]=dts;spans.append((ident,begin,dts))
+    ends=[Fraction(value,known[ident].scale)for ident,value in decode_ends.items()]
+    ranges.sort(); expected=len(moof)+8
+    for start,stop in ranges:
+        require(start == expected,'SAMPLE_OVERLAP_OR_UNACCOUNTED_BYTES'); expected=stop
+    require(expected == len(moof)+len(mdat),'SAMPLE_OVERLAP_OR_UNACCOUNTED_BYTES')
+    # Per-track clocks are exact above. Cross-track packet endpoints may lead
+    # then catch up during valid mux output; MediaRing publishes only a bounded
+    # synchronized checkpoint, never a divergent intermediate packet batch.
+    return Fragment(index,sequence,moof,mdat,min(starts),max(ends),rap,tuple(sorted(decode_ends.items())),trimmed,initial_trimmed,tuple(sorted(spans)))
+
+
+@dataclass(frozen=True)
+class Cursor:
+    epoch: str
+    index: int
+
+
+@dataclass(frozen=True)
+class Resume:
+    cursor: Cursor
+    init: bytes
+    start: Fraction
+    # Original common timestamps retained. Consumer needs a NEW media pipeline.
+
+
+class MediaRing:
+    def __init__(self, epoch, *, max_bytes=16*1024*1024, max_seconds=6,
+                 max_fragments=512, max_groups=32, clock=time.monotonic, short_fragment=False, allow_level_156=False):
+        require(type(epoch) is str and len(epoch) == 32 and all(c in '0123456789abcdef' for c in epoch), 'EPOCH')
+        require(type(short_fragment) is bool, 'SHORT_FRAGMENT_TYPE')
+        require(type(allow_level_156) is bool, 'ALLOW_LEVEL_156_TYPE')
+        self.short_fragment = short_fragment
+        self.allowed_levels = (153, 156) if allow_level_156 else (153,)
+        self.max_bytes=integer(max_bytes,1024,64*1024*1024,'BYTE_CAP')
+        self.max_seconds=integer(max_seconds,1,60,'TIME_CAP')
+        self.max_fragments=integer(max_fragments,1,4096,'FRAGMENT_CAP')
+        self.max_groups=integer(max_groups,1,256,'GROUP_CAP')
+        self.epoch=epoch; self.init=None; self.groups=deque(); self.bytes=0; self.count=0
+        self.next_index=0; self.sequence=1; self.prior={}; self.failed=None; self.ended=False
+        self.pending=None;self.terminal_audio_trim=False;self.initial_audio_trim=False;self.bootstrap_seen=False
+        require(callable(clock),'AV_INTERLEAVE_CLOCK');self.clock=clock
+        self.unpublished=[];self.unpublished_bytes=0;self.unpublished_since=None
+        self.lock=threading.RLock()
+
+    def _live(self):
+        require(self.failed is None, 'EPOCH_FAILED')
+
+    def initialize(self, ftyp, moov):
+        with self.lock:
+            self._live(); require(self.init is None and not self.ended,'INIT_ALREADY_SET')
+            try:
+                init=parse_init(ftyp,moov,allowed_levels=self.allowed_levels)
+                require(len(init.data) < self.max_bytes,'INIT_OVERFLOW')
+            except MediaError as e:
+                self.failed=str(e); raise
+            self.init=init; self.bytes=len(init.data)
+
+    def _bootstrap(self, group):
+        # Per-track first timestamps are immutable raw mux values. An audio-only
+        # prefix is not independently resumable; the first video must be IDR.
+        known={t.ident:t for t in self.init.tracks};first={};last={};video=None;video_begin=None
+        for fragment in group:
+            for ident,begin,end in fragment.track_spans:
+                first.setdefault(ident,begin)
+                last[ident]=end
+                if known[ident].kind=='video' and video is None:video=fragment;video_begin=Fraction(begin,known[ident].scale)
+        start=min(Fraction(value,known[ident].scale)for ident,value in first.items())
+        audio=next(t for t in self.init.tracks if t.kind=='audio')
+        ready=(set(first)==set(known) and video is not None and video.access_point and
+               Fraction(first[audio.ident],audio.scale)<=video_begin+Fraction(1,10) and
+               Fraction(last[audio.ident],audio.scale)>=video_begin-Fraction(1,10))
+        return ready,start
+
+    def _groups_after(self, f, *, groups=None, size=None, count=None, index=None):
+        # Pure proposed state; never advance clocks/indexes or publish a candidate.
+        require((self.next_index if index is None else index) < 2**53-1,'INDEX_EXHAUSTED')
+        video=next(t.ident for t in self.init.tracks if t.kind=='video')
+        present={ident for ident,begin,end in f.track_spans}
+        groups=list(self.groups if groups is None else groups)
+        if not groups:
+            require(f.access_point or video not in present,'INITIAL_IDR_REQUIRED')
+            groups=[[f]]
+        elif f.access_point:
+            if not any(x.access_point for x in groups[-1]):groups[-1]=groups[-1]+[f]
+            else:groups.append([f])
+        else:
+            require(any(x.access_point for x in groups[-1]) or video not in present,'INITIAL_IDR_REQUIRED')
+            groups[-1]=groups[-1]+[f]
+        size=(self.bytes if size is None else size)+f.size;count=(self.count if count is None else count)+1
+        while (size > self.max_bytes or count > self.max_fragments or
+               len(groups) > self.max_groups or f.end-self._bootstrap(groups[0])[1] > self.max_seconds):
+            require(len(groups)>1,'ACCESS_GROUP_OVERFLOW')
+            removed=groups.pop(0);size-=sum(x.size for x in removed);count-=len(removed)
+        return groups,size,count
+
+    def _checkpoint(self, f):
+        known={t.ident:t for t in self.init.tracks};ends=dict(f.decode_ends)
+        return set(ends)==set(known) and max(Fraction(v,known[k].scale)for k,v in ends.items())-min(Fraction(v,known[k].scale)for k,v in ends.items())<=Fraction(1,10)
+
+    def _groups_publishable(self, groups):
+        for group in groups:
+            ready,start=self._bootstrap(group)
+            if not ready and not(len(group)<=64 and group[-1].end-start<=Fraction(1,10)):return False
+        return True
+
+    def _pending_deadline(self):
+        if self.unpublished_since is not None:
+            now=self.clock()
+            if not(type(now)in(int,float)and math.isfinite(now)and 0<=now-self.unpublished_since<1):
+                self.failed='AV_INTERLEAVE_TIMEOUT';self.unpublished=[];self.unpublished_bytes=0;self.unpublished_since=None;raise MediaError(self.failed)
+
+    def _pending_limits(self, batch):
+        require(len(batch)<=64 and sum(f.size for f in batch)<=MAX_PAIR,'AV_INTERLEAVE_BOUND')
+        known={t.ident:t for t in self.init.tracks};last=batch[-1]
+        ends=[Fraction(v,known[k].scale)for k,v in last.decode_ends]
+        first=min(Fraction(begin,known[k].scale)for f in batch for k,begin,end in f.track_spans)
+        require(max(ends)-(min(ends)if len(ends)==len(known)else first)<=1,'AV_INTERLEAVE_BOUND')
+        require(max(ends)-first<=1,'AV_INTERLEAVE_SPAN')
+
+    def _proposal(self, batch, *, checkpoint):
+        if not self.bootstrap_seen:
+            origins={}
+            for f in batch:
+                for k,begin,end in f.track_spans:origins.setdefault(k,begin)
+            known={t.ident:t for t in self.init.tracks}
+            if set(origins)==set(known):
+                require(max(Fraction(v,known[k].scale)for k,v in origins.items())-min(Fraction(v,known[k].scale)for k,v in origins.items())<=Fraction(1,10),'AV_CLOCK_SKEW')
+        groups=list(self.groups);size=self.bytes;count=self.count;index=self.next_index
+        for f in batch:
+            groups,size,count=self._groups_after(f,groups=groups,size=size,count=count,index=index);index+=1
+        if checkpoint:
+            require(self._checkpoint(batch[-1]),'AV_CHECKPOINT_REQUIRED')
+            for group in groups:
+                ready,start=self._bootstrap(group)
+                if not ready:require(len(group)<=64 and group[-1].end-start<=Fraction(1,10),'AV_BOOTSTRAP_BOUND')
+        return groups,size,count
+
+    def _publish(self, batch):
+        groups,size,count=self._proposal(batch,checkpoint=True)
+        self.groups=deque(groups);self.bytes=size;self.count=count
+        self.bootstrap_seen=self.bootstrap_seen or any(self._bootstrap(g)[0]for g in groups)
+        self.prior=dict(batch[-1].decode_ends);self.next_index+=len(batch);self.sequence+=len(batch)
+        self.terminal_audio_trim=batch[-1].terminal_audio_trim
+        self.initial_audio_trim=self.initial_audio_trim or any(f.initial_audio_trim for f in batch)
+        self.unpublished=[];self.unpublished_bytes=0;self.unpublished_since=None
+        return batch[-1].index
+
+    def _commit(self, f):
+        batch=self.unpublished+[f]
+        if self.unpublished:self._pending_limits(batch)
+        proposal=self._proposal(batch,checkpoint=False)
+        if self._checkpoint(f) and self._groups_publishable(proposal[0]):return self._publish(batch)
+        self._pending_limits(batch)
+        if self.unpublished_since is None:
+            now=self.clock();require(type(now)in(int,float)and math.isfinite(now),'AV_INTERLEAVE_CLOCK');self.unpublished_since=now
+        self.unpublished=batch;self.unpublished_bytes+=f.size
+        return f.index # Accepted privately; Producer's None means terminal EOF only.
+
+    def append(self, moof, mdat):
+        # Initial boundary is independently bounded. Only Producer
+        # can stage a candidate and reach the private clean-EOF completion path.
+        return self._append(moof,mdat,False)
+
+    def _append(self, moof, mdat, terminal_candidate):
+        with self.lock:
+            self._live();require(self.init is not None and not self.ended and self.pending is None,'NOT_WRITABLE')
+            try:
+                self._pending_deadline()
+                prior=dict(self.unpublished[-1].decode_ends)if self.unpublished else self.prior
+                f=parse_fragment(self.init,moof,mdat,self.next_index+len(self.unpublished),self.sequence+len(self.unpublished),prior,
+                                 _terminal_candidate=terminal_candidate,short_fragment=self.short_fragment)
+                if f.terminal_audio_trim:
+                    batch=self.unpublished+[f];self._pending_limits(batch);self._proposal(batch,checkpoint=True)
+                    require(f.size <= MAX_PAIR and self.bytes+self.unpublished_bytes+f.size <= self.max_bytes+MAX_PAIR,
+                            'PENDING_PAIR_BOUND')
+                    self.pending=f
+                    return None
+                return self._commit(f)
+            except MediaError as e:
+                self.failed=str(e);self.unpublished=[];self.unpublished_bytes=0;self.unpublished_since=None;raise
+
+    def _finish_eof(self):
+        # Producer calls only after a successful exact EOF read, never timeout
+        # or a short/partial header. Pending remains invisible until this commit.
+        with self.lock:
+            self._live()
+            self._pending_deadline()
+            if self.pending is not None:
+                f=self.pending;self._publish(self.unpublished+[f]);self.pending=None
+            elif self.unpublished:self._publish(self.unpublished)
+            require(self.bootstrap_seen,'AV_BOOTSTRAP_REQUIRED');self.ended=True
+
+    def resume(self, latest=True):
+        with self.lock:
+            self._live();self._pending_deadline();require(type(latest) is bool and self.groups,'NO_ACCESS_POINT')
+            ready=[(g,start)for g in self.groups for complete,start in [self._bootstrap(g)]if complete]
+            require(ready,'NO_ACCESS_POINT');g,start=ready[-1]if latest else ready[0]
+            return Resume(Cursor(self.epoch,g[0].index),self.init.data,start)
+
+    def read(self, cursor):
+        """One immutable fragment, None when caught up. Never auto-advances a lagged cursor."""
+        with self.lock:
+            self._live()
+            self._pending_deadline()
+            require(type(cursor) is Cursor and cursor.epoch==self.epoch,'CURSOR_EPOCH')
+            integer(cursor.index,0,self.next_index,'CURSOR_INDEX')
+            if self.groups and cursor.index < self.groups[0][0].index:
+                raise Lagged(self.groups[0][0].index,self.groups[-1][0].index)
+            if cursor.index == self.next_index:return None
+            for g in self.groups:
+                for f in g:
+                    if f.index==cursor.index:return f,Cursor(self.epoch,f.index+1)
+            raise MediaError('CURSOR_UNAVAILABLE')
+
+    def newest_end(self):
+        """Decode end (seconds, Fraction) of the newest published fragment, or None."""
+        with self.lock:
+            if self.failed is not None or not self.groups:
+                return None
+            return self.groups[-1][-1].end
+
+    def finish(self):
+        with self.lock:
+            self._live();self._pending_deadline();require(self.pending is None and not self.unpublished,'TERMINAL_EOF_REQUIRED');require(self.bootstrap_seen,'AV_BOOTSTRAP_REQUIRED');self.ended=True
+
+    def snapshot(self):
+        """Scalar diagnostics only; never samples, names, URLs or media content."""
+        with self.lock:
+            return dict(bytes=self.bytes,fragments=self.count,groups=len(self.groups),
+                        nextIndex=self.next_index,ended=self.ended,error=self.failed,
+                        pendingBytes=self.unpublished_bytes+(0 if self.pending is None else self.pending.size),
+                        terminalAudioTrim=self.terminal_audio_trim,initialAudioTrim=self.initial_audio_trim,avBootstrapSeen=self.bootstrap_seen)
+
+    def clear(self):
+        with self.lock:
+            self.groups.clear();self.init=None;self.bytes=0;self.count=0
+            self.unpublished=[];self.unpublished_bytes=0;self.unpublished_since=None
+            self.prior.clear();self.pending=None;self.failed='CLEARED';self.ended=True
+
+
+def read_exact(read, n, eof=False):
+    out=bytearray()
+    while len(out)<n:
+        chunk=read(min(n-len(out),65536))
+        require(type(chunk) is bytes and len(chunk)<=n-len(out),'READER_CONTRACT')
+        if not chunk:
+            if eof and not out:return None
+            raise MediaError('TRUNCATED_STREAM')
+        out.extend(chunk)
+    return bytes(out)
+
+
+def terminal_index(raw):
+    """Frame a discarded index; never use its offsets/times as media authority."""
+    require(type(raw) is bytes and 8 <= len(raw) <= MAX_TERMINAL_INDEX,'TERMINAL_INDEX_BOUND')
+    rows=boxes(plain_box(raw,b'mfra'))
+    require(1 <= len(rows) <= 3 and rows[-1][0] == b'mfro','TERMINAL_INDEX_SHAPE')
+    allowed(rows,{b'tfra',b'mfro'})
+    _,_,v=full(one(rows,b'mfro'))
+    require(len(v) == 4 and u32(v) == len(raw),'TERMINAL_INDEX_SIZE')
+    # tfra records are opaque/discarded. No offset, seek or random-access claim.
+
+
+class Producer:
+    """Caller owns timeouts/cancellation. One complete pair per step.
+
+    Short last AAC duration (explicit trun, 1..1023) remains pending until clean
+    EOF, optionally following one bounded mfra. No reader sees the pair sooner.
+    Pending media <=MAX_PAIR and index <=64KiB are separate bounded ingress;
+    retained+pending+index encoded bytes <=ring.max_bytes+MAX_PAIR+64KiB.
+    This is an encoded-storage bound, not a claim about Python allocation copies.
+    """
+    def __init__(self, ring, read):
+        self.ring,self.read,self.stage=ring,read,'init'
+        self.last_init=None;self.last_pair=None;self.last_box=None
+        self.terminal_index_seen=False;self.eof_seen=False
+
+    def _box(self, cap, eof=False, terminal_only=False):
+        h=read_exact(self.read,8,eof)
+        if h is None:return None
+        size=u32(h)
+        if terminal_only:require(h[4:8] == b'mfra','TERMINAL_AUDIO_NOT_LAST')
+        if h[4:8] == b'mfra':cap=min(cap,MAX_TERMINAL_INDEX)
+        require(8 <= size <= cap,'BOX_READ_BOUND')
+        return h+read_exact(self.read,size-8)
+
+    def _end(self, raw):
+        if raw is not None:
+            terminal_index(raw)
+            require(read_exact(self.read,1,True) is None,'AFTER_TERMINAL_INDEX')
+            self.terminal_index_seen=True
+        self.eof_seen=True
+        self.ring._finish_eof()
+
+    def step(self):
+        try:
+            if self.stage=='init':
+                f=self._box(MAX_INIT);self.last_init=(f,None)
+                m=self._box(MAX_INIT-len(f));self.last_init=(f,m)
+                self.ring.initialize(f,m);self.stage='pair';return 'init'
+            if self.stage=='last-fragment':
+                self.last_pair=None;self.last_box=None;self.stage='end';return 'end'
+            require(self.stage=='pair','PRODUCER_ENDED')
+            self.last_pair=None;self.last_box=None
+            m=self._box(MAX_PAIR,True);self.last_box=m
+            if m is None or m[4:8] == b'mfra':
+                self._end(m);self.stage='end';return 'end'
+            require(m[4:8] == b'moof','EXPECTED_MOOF')
+            d=self._box(MAX_PAIR-len(m));require(d[4:8] == b'mdat','EXPECTED_MDAT')
+            self.last_pair=(m,d)
+            index=self.ring._append(m,d,True)
+            if index is None:
+                # Following media/unknown box is refused after its header only.
+                tail=self._box(MAX_TERMINAL_INDEX,True,True)
+                self._end(tail);self.stage='last-fragment'
+            return 'fragment'
+        except MediaError as e:
+            with self.ring.lock:
+                self.ring.failed=str(e);self.ring.pending=None
+                self.ring.unpublished=[];self.ring.unpublished_bytes=0;self.ring.unpublished_since=None
+            self.stage='failed';raise
+        except Exception:
+            with self.ring.lock:
+                self.ring.failed='READER_FAILURE';self.ring.pending=None
+                self.ring.unpublished=[];self.ring.unpublished_bytes=0;self.ring.unpublished_since=None
+            self.stage='failed'
+            raise MediaError('READER_FAILURE') from None

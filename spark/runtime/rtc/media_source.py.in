@@ -1,0 +1,232 @@
+"""Latest raw queues and owned FFmpeg H264 NVENC generations; import is inert."""
+from collections import deque
+import math
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import subprocess
+import threading
+import time
+from .signal_protocol import need
+
+class Latest:
+    def __init__(self): self.items=deque(maxlen=2);self.lock=threading.Condition();self.closed=False;self.dropped=0
+    def put(self,item):
+        with self.lock:
+            if self.closed:return
+            if len(self.items)==2:self.dropped+=1
+            self.items.append(item);self.lock.notify()
+    def take(self):
+        with self.lock:
+            self.lock.wait_for(lambda:self.items or self.closed,timeout=.1)
+            if not self.items:return None
+            item=self.items.pop();self.dropped+=len(self.items);self.items.clear();return item
+    def close(self):
+        with self.lock:self.closed=True;self.items.clear();self.lock.notify_all()
+
+class AnnexB:
+    def __init__(self):self.pending=bytearray()
+    def feed(self,chunk):
+        self.pending.extend(chunk);need(len(self.pending)<=2097152,'ENCODED_AU_BOUND')
+        result=[]
+        while True:
+            marks=list(re.finditer(b'(?:\x00\x00\x00\x01|\x00\x00\x01)\x09',self.pending))
+            if len(marks)<2:break
+            split=marks[1].start();result.append(bytes(self.pending[:split]));del self.pending[:split]
+        return result
+    @staticmethod
+    def idr(data):
+        return any((data[m.end()]&31)==5 for m in re.finditer(b'\x00\x00(?:\x00)?\x01',data) if m.end()<len(data))
+
+def encoder_argv(width,height):
+    need((width,height) in ((1920,1080),(3840,2160)),'VIDEO_SIZE')
+    bitrate='8M' if width==1920 else '25M';level='4.2' if width==1920 else '5.2'
+    return ['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin',
+            '-f','rawvideo','-pixel_format','bgra','-video_size',str(width)+'x'+str(height),
+            '-framerate','60','-i','pipe:0','-an','-map_metadata','-1','-c:v','h264_nvenc',
+            '-preset','p1','-tune','ull','-profile:v','baseline','-level:v',level,'-pix_fmt','yuv420p',
+            '-rc','cbr','-b:v',bitrate,'-maxrate',bitrate,'-bufsize','1M','-g','30','-bf','0',
+            '-rc-lookahead','0','-zerolatency','1','-delay','0','-forced-idr','1',
+            '-bsf:v','h264_metadata=aud=insert','-flush_packets','1','-f','h264','pipe:1']
+
+class Synthetic:
+    """Public black/moving-square BGRA and 440Hz PCM; no screen or device capture."""
+    width=1920;height=1080
+    def __init__(self):
+        self.zero=time.monotonic_ns();self.frame=0;self.sample=0;self.closed=threading.Event()
+        self.picture=bytearray(b'\0\0\0\xff'*(self.width*self.height));self.previous=None
+    def start(self):self.zero=time.monotonic_ns();self.frame=0;self.sample=0
+    def video(self):
+        target=self.zero+self.frame*1_000_000_000//60
+        if self.closed.wait(max(0,(target-time.monotonic_ns())/1e9)):return None
+        x=(self.frame*8)%(self.width-64);y=self.height//2
+        for position,color in ((self.previous,b'\0\0\0\xff'),(x,b'\xff\xff\xff\xff')):
+            if position is not None:
+                row=color*64
+                for r in range(y,y+64):
+                    at=(r*self.width+position)*4;self.picture[at:at+256]=row
+        self.previous=x;self.frame+=1
+        return target,bytes(self.picture)
+    def audio(self):
+        target=self.zero+self.sample*1_000_000_000//48000
+        if self.closed.wait(max(0,(target-time.monotonic_ns())/1e9)):return None
+        data=b''.join(struct.pack('<hh',*(2*(int(1200*math.sin(2*math.pi*440*(self.sample+i)/48000)),)))for i in range(960))
+        self.sample+=960;return target,data
+    def close(self):self.closed.set()
+
+class Synthetic4K(Synthetic):
+    """Fixed 3840x2160@60 authored fixture. No automatic lower-resolution mode."""
+    width=3840;height=2160
+
+class OwnedPrivateCapture:
+    """Explicit adapter to the already-proved private display and Pulse monitor.
+    No default display/source. Parent must provide its current ownership guard.
+    Constructor starts nothing; start must be called by an admitted native worker.
+    """
+    def __init__(self,owner,display,audio,guard,width=3840,height=2160,env=None):
+        need(re.fullmatch(r':[0-9]{1,5}',display) and (width,height) in ((1920,1080),(3840,2160)),'PRIVATE_CAPTURE_SCOPE')
+        need(callable(guard),'PRIVATE_OWNER_GUARD');self.owner=owner;self.display=display;self.audio_state=audio
+        self.guard=guard;self.width=width;self.height=height;self.env=env;self.children=[];self.closed=False
+    def start(self):
+        need(self.guard() is True,'PRIVATE_OWNER_LOST');self.audio_state._identity()
+        need(type(self.env) is dict and self.env.get('DISPLAY')==self.display and
+             re.fullmatch(r'/home/[^/]+/snap/chromium/common/baaz-trial/run-[a-f0-9]{16}/Xauthority',self.env.get('XAUTHORITY','')),
+             'PRIVATE_XAUTHORITY_SCOPE')
+        authority=Path(self.env['XAUTHORITY']);info=authority.lstat()
+        need(authority.resolve()==authority and stat.S_ISREG(info.st_mode) and info.st_uid==os.getuid() and
+             stat.S_IMODE(info.st_mode)==0o600,'PRIVATE_XAUTHORITY_IDENTITY')
+        self.env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C','DISPLAY':self.display,'XAUTHORITY':str(authority)}
+        audio=self.audio_state
+        need(re.fullmatch(r'unix:/run/user/1000/snap\.chromium/r2d2-audio-[a-f0-9]{16}/pulse/native',audio.server) and
+             re.fullmatch(r'r2d2_[a-f0-9]{32}\.monitor',audio.monitor),'PRIVATE_AUDIO_SCOPE')
+        common=['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin']
+        video=common+['-thread_queue_size','2','-f','x11grab','-draw_mouse','0','-video_size','3840x2160',
+                      '-framerate','60','-i',self.display+'.0','-an','-vf',f'scale={self.width}:{self.height}:flags=fast_bilinear',
+                      '-pix_fmt','bgra','-f','rawvideo','pipe:1']
+        pcm=common+['-thread_queue_size','2','-f','pulse','-server',audio.server,'-sample_rate','48000','-channels','2',
+                    '-fragment_size','3840','-i',audio.monitor,'-vn','-f','s16le','-ac','2','-ar','48000','pipe:1']
+        try:
+            for argv in (video,pcm):self.children.append(self.owner.spawn(argv,env=self.env,stdout=subprocess.PIPE))
+        except BaseException:self.close();raise
+    def read(self,child,length,duration):
+        need(not self.closed and self.guard() is True,'PRIVATE_OWNER_LOST');data=bytearray()
+        while len(data)<length:
+            chunk=child.stdout.read(length-len(data));need(chunk,'PRIVATE_SOURCE_STOPPED');data.extend(chunk)
+        need(self.guard() is True,'PRIVATE_OWNER_LOST')
+        return time.monotonic_ns()-duration,bytes(data)
+    def video(self):return self.read(self.children[0],self.width*self.height*4,16_666_667)
+    def audio(self):return self.read(self.children[1],3840,20_000_000)
+    def close(self):
+        self.closed=True
+        for child in self.children:
+            self.owner.terminate(child)
+            if child.stdout:child.stdout.close()
+
+class StartupGrace:
+    """One 500ms grace from first complete AU; steady age remains <=150ms.
+    No encoded frame is skipped during grace. Each encoder generation owns one.
+    """
+    def __init__(self):self.first_ns=None
+    def admit(self,now_ns,stamp_ns):
+        need(type(now_ns)is int and type(stamp_ns)is int and now_ns>=stamp_ns,'ENCODER_TIMESTAMP')
+        if self.first_ns is None:self.first_ns=now_ns
+        need(now_ns>=self.first_ns,'ENCODER_TIMESTAMP')
+        return now_ns<self.first_ns+500_000_000 or now_ns-stamp_ns<=150_000_000
+
+class Nvenc:
+    """No encoded reference-frame dropping. PLI restarts only its owned encoder.
+    Restart preserves caller timestamps/RTP payloader; first new AU must be IDR.
+    This bounded fixture is not an unlimited encoder-lifecycle implementation.
+    """
+    def __init__(self,owner,width,height,guard,on_video,on_error,env=None,max_restarts=2,codec='H264'):
+        need(type(max_restarts)is int and 0<=max_restarts<=4,'RESTART_BOUND')
+        need(codec in ('H264','AV1'),'VIDEO_CODEC');self.codec=codec
+        if codec=='AV1':need((width,height)==(3840,2160),'AV1_4K_REQUIRED')
+        self.owner=owner;self.width=width;self.height=height;self.guard=guard;self.on_video=on_video;self.on_error=on_error
+        self.env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'};self.limit=max_restarts;self.raw=Latest();self.stop=threading.Event();self.restart=threading.Event()
+        self.can_feed=lambda:True;self.child=None;self.thread=None;self.restarts=0;self.frames=0;self.last_pts=-1
+        self.idr_lock=threading.Lock();self.awaiting_idr=True;self.last_idr_ns=None
+    def request_idr(self,force=False):
+        need(type(force)is bool,'RESTART_BOUND')
+        with self.idr_lock:
+            # A published IDR or the pending first IDR of a new generation
+            # coalesces key-unit bursts for one finite 30-frame GOP (500ms).
+            if self.restart.is_set():return False
+            now=time.monotonic_ns()
+            if not force and (self.awaiting_idr or self.last_idr_ns is not None and now-self.last_idr_ns<500_000_000):return False
+            self.restart.set();return True
+    def start(self):
+        need(self.thread is None,'ENCODER_REPLAY');self.thread=threading.Thread(target=self._manage,daemon=True);self.thread.start()
+    def _manage(self):
+        try:
+            for generation in range(self.limit+1):
+                if self.stop.is_set():return
+                need(self.guard() is True,'PRIVATE_OWNER_LOST')
+                with self.idr_lock:self.restart.clear();self.awaiting_idr=True
+                from media_av1 import encoder_argv as av1_argv,Ivf
+                command=av1_argv(self.width,self.height) if self.codec=='AV1' else encoder_argv(self.width,self.height)
+                child=self.owner.spawn(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,env=self.env)
+                self.child=child;pts=deque();condition=threading.Condition();done=threading.Event();errors=[]
+                def write():
+                    try:
+                        while not done.is_set() and not self.stop.is_set():
+                            if not self.can_feed():
+                                done.wait(.01);continue
+                            item=self.raw.take()
+                            if item is None:continue
+                            stamp,frame=item;need(len(frame)==self.width*self.height*4 and stamp>self.last_pts,'RAW_FRAME_SCOPE')
+                            need(self.guard() is True,'PRIVATE_OWNER_LOST')
+                            with condition:
+                                need(len(pts)<8,'ENCODER_PENDING_BOUND');pts.append(stamp);condition.notify_all()
+                            view=memoryview(frame)
+                            while view and not done.is_set():
+                                count=child.stdin.write(view);need(count and count>0,'ENCODER_STDIN');view=view[count:]
+                    except BaseException as exc:
+                        if not done.is_set() and not self.stop.is_set():errors.append(exc)
+                        done.set()
+                def read():
+                    try:
+                        parser=Ivf() if self.codec=='AV1' else AnnexB();first=True;freshness=StartupGrace()
+                        while not done.is_set() and not self.stop.is_set():
+                            chunk=os.read(child.stdout.fileno(),65536);need(chunk,'ENCODER_STDOUT')
+                            for au in parser.feed(chunk):
+                                with condition:
+                                    need(condition.wait_for(lambda:pts or done.is_set(),timeout=1),'ENCODER_TIMESTAMP')
+                                    if not pts:return
+                                    stamp=pts.popleft()
+                                need(stamp>self.last_pts,'ENCODER_TIMESTAMP_ORDER')
+                                keyframe=parser.idr(au)
+                                if first:need(keyframe,'ENCODER_INITIAL_IDR');first=False
+                                if not freshness.admit(time.monotonic_ns(),stamp):self.request_idr(force=True);return
+                                self.on_video(stamp,au,keyframe)
+                                if keyframe:
+                                    with self.idr_lock:self.awaiting_idr=False;self.last_idr_ns=time.monotonic_ns()
+                                self.last_pts=stamp;self.frames+=1
+                    except BaseException as exc:
+                        if not done.is_set() and not self.stop.is_set():errors.append(exc)
+                        done.set()
+                threads=[threading.Thread(target=write,daemon=True),threading.Thread(target=read,daemon=True)]
+                for thread in threads:thread.start()
+                try:
+                    while not self.stop.wait(.02) and not self.restart.is_set() and not done.is_set():
+                        need(self.guard() is True,'PRIVATE_OWNER_LOST')
+                finally:
+                    done.set();self.owner.terminate(child)
+                    if child.stdin:child.stdin.close()
+                    if child.stdout:child.stdout.close()
+                    with condition:condition.notify_all()
+                    for thread in threads:thread.join(timeout=2)
+                    need(not any(t.is_alive()for t in threads),'ENCODER_THREADS_UNRESOLVED')
+                if self.stop.is_set():return
+                if errors:raise errors[0]
+                need(self.restart.is_set() and generation<self.limit,'IDR_RESTART_LIMIT')
+                self.restarts+=1
+        except BaseException as exc:
+            if not self.stop.is_set():self.on_error(exc.args[0] if type(exc) is ValueError and len(exc.args)==1 and type(exc.args[0]) is str and re.fullmatch('[A-Z_]{1,64}',exc.args[0]) else 'ENCODER_STOPPED')
+    def close(self):
+        self.stop.set();self.raw.close()
+        if self.child:self.owner.terminate(self.child)
+        if self.thread:self.thread.join(timeout=3)
+        need(not self.thread or not self.thread.is_alive(),'ENCODER_OWNER_UNRESOLVED')

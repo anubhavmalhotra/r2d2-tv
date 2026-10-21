@@ -1,0 +1,697 @@
+"""Rendered weather module: IP-derived location, discovered stations, METAR
+primary, NWS backup, keep-last-good. No network; every fixture is synthetic."""
+import ast
+import datetime as dt
+import importlib.util
+import io
+import json
+from pathlib import Path
+import re
+import socket
+import ssl
+import threading
+import tokenize
+import unittest
+from unittest.mock import patch
+
+WEATHER = Path(__file__).resolve().parent.parent / 'weather.py'
+UTC = dt.timezone.utc
+STATIONS = ('KAAA', 'KBBB', 'KCCC')
+STATIONS_PATH = '/gridpoints/AAA/10,20/stations?limit=25'
+# Synthetic lookup fields that must never survive parsing.
+SENTINELS = ('192.0.2.1', 'sentinel.invalid', 'Sentinel City', 'Sentinel Region', 'POSTAL-SENTINEL', 'AS64496 Sentinel Org',
+             'Sentinel/Zone', 'Sentinel Place')
+
+
+def load(enabled=False):
+    spec = importlib.util.spec_from_file_location('candidate_weather', WEATHER)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.ENABLED = enabled
+    return module
+
+
+def now():
+    return dt.datetime.now(UTC).replace(microsecond=0)
+
+
+def raw(items):
+    return json.dumps(items).encode()
+
+
+def ipinfo(loc='40.0049,-100.0049', country='US', **extra):
+    body = dict(ip=SENTINELS[0], hostname=SENTINELS[1], city=SENTINELS[2], region=SENTINELS[3], country=country, loc=loc,
+                org=SENTINELS[5], postal=SENTINELS[4], timezone=SENTINELS[6], readme='https://ipinfo.io/missingauth')
+    body.update(extra)
+    return raw({key: value for key, value in body.items() if value is not None})
+
+
+def points(url='https://api.weather.gov/gridpoints/AAA/10,20/stations'):
+    return raw({'properties': {'gridId': 'AAA', 'gridX': 10, 'gridY': 20, 'observationStations': url,
+                               'relativeLocation': {'properties': {'city': SENTINELS[7], 'state': 'ZZ'}}}})
+
+
+def stations(*ids):
+    return raw({'type': 'FeatureCollection', 'features': [
+        {'id': 'https://api.weather.gov/stations/' + str(i), 'type': 'Feature',
+         'properties': {'stationIdentifier': i, 'name': SENTINELS[7], 'distance': {'value': n * 1000.0}}}
+        for n, i in enumerate(ids)]})
+
+
+def metar(station, age, when, temp=15, wx=None, cover='CLR', clouds=None, **extra):
+    item = dict(icaoId=station, receiptTime='2026-10-20T03:52:06.287Z', obsTime=int(when.timestamp()) - age,
+                reportTime='2026-10-20T04:00:00.000Z', temp=temp, dewp=8, wdir=250, wspd=8, visib='10+',
+                altim=1012.3, qcField=0, metarType='METAR', rawOb='METAR ' + station + ' 200356Z 25008KT 10SM CLR 15/09 A2989',
+                lat=40.0, lon=-100.0, elev=2, name='Synthetic, ZZ', cover=cover, clouds=clouds or [], fltCat='VFR')
+    if wx is not None:
+        item['wxString'] = wx
+    if temp is None:
+        del item['temp']
+    item.update(extra)
+    return item
+
+
+def nws(when, age, temp=20, text='Partly Cloudy', station='KAAA'):
+    stamp = (when - dt.timedelta(seconds=age)).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+    return json.dumps({'properties': {'station': 'https://api.weather.gov/stations/' + station,
+                                      'temperature': {'value': temp, 'unitCode': 'wmoUnit:degC'},
+                                      'textDescription': text, 'timestamp': stamp}}).encode()
+
+
+def reading(module, when, age, temp=59, condition='Clear', icon='clear'):
+    return dict(temperatureF=temp, condition=condition, icon=icon,
+                observedAt=(when - dt.timedelta(seconds=age)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+
+
+class Offline(unittest.TestCase):
+    """Any attempt to open a real socket fails the test."""
+    def setUp(self):
+        def refuse(*args, **kwargs):
+            raise AssertionError('NETWORK')
+        guard = patch.object(socket, 'create_connection', refuse)
+        guard.start(); self.addCleanup(guard.stop)
+        self.w = load(); self.now = now()
+
+
+class LocateTests(Offline):
+    def test_valid_reply_yields_only_rounded_coordinates(self):
+        self.assertEqual(self.w.parse_locate(ipinfo()), (40.0, -100.0))
+        self.assertEqual(self.w.parse_locate(ipinfo('40.1234,-100.5678')), (40.12, -100.57))
+        self.assertEqual(self.w.parse_locate(ipinfo('40,-100')), (40.0, -100.0))
+        value = self.w.parse_locate(ipinfo('0.0010,-0.0040'))
+        self.assertEqual(value, (0.0, 0.0)); self.assertEqual(repr(value), '(0.0, 0.0)')  # never "-0.0"
+        self.assertTrue(all(type(part) is float for part in value))
+        # Only "loc" and "country" are read; every other field is ignored and not returned.
+        bare = raw({'loc': '40.00,-100.00', 'country': 'US'})
+        self.assertEqual(self.w.parse_locate(bare), (40.0, -100.0))
+        self.assertEqual(self.w.parse_locate(ipinfo(extra_field={'nested': [1, 2]}, anycast=True)), (40.0, -100.0))
+
+    def test_non_us_or_missing_country_is_refused(self):
+        for country in ('CA', 'us', 'USA', '', None, 1, ['US']):
+            self.assertIsNone(self.w.parse_locate(ipinfo(country=country)), country)
+
+    def test_malformed_or_out_of_range_loc_is_refused(self):
+        for loc in ('', '40.0', '40.0,-100.0,1', '40.0;-100.0', ' 40.0,-100.0', '40.0,-100.0 ', '40.0, -100.0', '40.0,-100.0\n',
+                    'NaN,NaN', 'inf,-inf', '1e1,2e1', '+40.0,-100.0', '40.,-100.', '.5,-100.0', '40.123456789,-100.0',
+                    '91.0,-100.0', '-90.5,0', '40.0,-181.0', '40.0,180.01', '100,-100', None, 40.0, ['40.0', '-100.0'],
+                    {'lat': 40.0}):
+            self.assertIsNone(self.w.parse_locate(ipinfo(loc=loc)), loc)
+        self.assertEqual(self.w.parse_locate(ipinfo('90,180')), (90.0, 180.0))
+        self.assertEqual(self.w.parse_locate(ipinfo('-90,-180')), (-90.0, -180.0))
+
+    def test_bad_json_shapes_duplicates_and_size_are_refused(self):
+        for body in (b'', b'{', b'not json', b'NaN', b'[]', b'null', b'"US"', b'{"loc": NaN, "country": "US"}', None,
+                     ipinfo().decode(), b'\xff\xfe',
+                     b'{"loc":"40.0,-100.0","country":"US","loc":"41.0,-100.0"}',
+                     b'{"loc":"40.0,-100.0","country":"US","asn":{"a":1,"a":2}}'):
+            self.assertIsNone(self.w.parse_locate(body), body)
+        body = ipinfo()
+        self.assertEqual(self.w.parse_locate(body + b' ' * (self.w.LOCATE_BYTES - len(body))), (40.0, -100.0))
+        self.assertIsNone(self.w.parse_locate(body + b' ' * (self.w.LOCATE_BYTES - len(body) + 1)))
+
+    def test_points_path_uses_two_decimals_only(self):
+        self.assertEqual(self.w.points_path(40.0, -100.0), '/points/40.00,-100.00')
+        self.assertEqual(self.w.points_path(40.004, -99.996), '/points/40.00,-100.00')
+        self.assertEqual(self.w.points_path(-0.001, 0.001), '/points/0.00,0.00')
+        for lat, lon in ((float('nan'), 0.0), (0.0, float('inf')), (90.5, 0.0), (0.0, -180.5), (40, -100), ('40', '-100'), (None, None)):
+            with self.assertRaises(ValueError):self.w.points_path(lat, lon)
+
+
+class DiscoveryParseTests(Offline):
+    def test_points_reply_yields_only_a_validated_stations_path(self):
+        self.assertEqual(self.w.parse_points(points()), STATIONS_PATH)
+        self.assertEqual(self.w.parse_points(points('https://api.weather.gov/gridpoints/ZZZ/1,999/stations')),
+                         '/gridpoints/ZZZ/1,999/stations?limit=25')
+        for url in ('http://api.weather.gov/gridpoints/AAA/10,20/stations', 'https://api.weather.gov.invalid/gridpoints/AAA/10,20/stations',
+                    'https://example.invalid/gridpoints/AAA/10,20/stations', 'https://api.weather.gov/gridpoints/aaa/10,20/stations',
+                    'https://api.weather.gov/gridpoints/AAAA/10,20/stations', 'https://api.weather.gov/gridpoints/AAA/1000,20/stations',
+                    'https://api.weather.gov/gridpoints/AAA/10,20/stations/', 'https://api.weather.gov/gridpoints/AAA/10,20/stations?limit=500',
+                    'https://api.weather.gov/gridpoints/AAA/10,20/../stations', 'https://api.weather.gov/gridpoints/AAA/10,20/stations\n',
+                    'https://api.weather.gov/gridpoints/AAA/-1,20/stations', 'https://api.weather.gov/gridpoints/AAA/10,20/forecast',
+                    '', None, 7, ['https://api.weather.gov/gridpoints/AAA/10,20/stations']):
+            self.assertIsNone(self.w.parse_points(points(url)), url)
+        for body in (b'', b'{}', b'[]', b'{"properties": []}', raw({'properties': {}}), None,
+                     points().replace(b'"gridId"', b'"observationStations": "x", "gridId"'),
+                     points() + b' ' * self.w.MAX_BYTES):
+            self.assertIsNone(self.w.parse_points(body), body[:40] if body else body)
+
+    def test_station_ids_keep_reply_order_filter_and_limit(self):
+        self.assertEqual(self.w.parse_stations(stations('KAAA', 'KBBB', 'KCCC', 'KDDD')), STATIONS)
+        self.assertEqual(self.w.parse_stations(stations('AB123', 'kbbb', 'KAAA', 'K-CC', 'KAAA', 7, None, '', 'KBBB ', 'KBBB', 'KCCC', 'KDDD')),
+                         STATIONS)
+        self.assertEqual(self.w.parse_stations(stations('KCCC', 'KAAA')), ('KCCC', 'KAAA'))
+        self.assertEqual(self.w.parse_stations(stations('K12A')), ('K12A',))
+        mixed = raw({'features': [1, None, 'KAAA', {'properties': 'KAAA'}, {'properties': {'stationIdentifier': 'KBBB'}}, {}]})
+        self.assertEqual(self.w.parse_stations(mixed), ('KBBB',))
+        for body in (stations(), stations('AB123', 'kaaa'), raw({'features': {}}), raw({}), raw([]), b'', None, b'{',
+                     stations('KAAA').replace(b'"name"', b'"stationIdentifier": "KZZZ", "name"'),
+                     stations('KAAA') + b' ' * self.w.MAX_BYTES):
+            self.assertIsNone(self.w.parse_stations(body), body[:40] if body else body)
+
+    def test_locate_delay_backs_off_to_ten_minutes(self):
+        self.assertEqual([self.w.locate_delay(n) for n in range(0, 8)], [60, 60, 120, 240, 480, 600, 600, 600])
+        self.assertEqual(self.w.locate_delay(10 ** 6), 600)
+
+
+class DiscoverTests(Offline):
+    def discover(self, locate, point, station_list, stop=None):
+        calls = []
+        def fetch_locate(stop): calls.append(('locate',)); return locate
+        def fetch_points(stop, place): calls.append(('points', place)); return point
+        def fetch_stations(stop, path): calls.append(('stations', path)); return station_list
+        with patch.object(self.w, 'fetch_locate', fetch_locate), patch.object(self.w, 'fetch_points', fetch_points), \
+             patch.object(self.w, 'fetch_stations', fetch_stations):
+            return self.w.discover(stop or threading.Event()), calls
+
+    def test_chain_passes_only_rounded_coordinates_and_validated_path(self):
+        found, calls = self.discover(ipinfo('40.0049,-100.0049'), points(), stations('KAAA', 'KBBB', 'KCCC', 'KDDD'))
+        self.assertEqual(found, STATIONS)
+        self.assertEqual(calls, [('locate',), ('points', (40.0, -100.0)), ('stations', STATIONS_PATH)])
+
+    def test_each_failure_stops_the_chain(self):
+        for locate in (None, b'{', ipinfo(country='CA'), ipinfo(loc='x')):
+            found, calls = self.discover(locate, points(), stations(*STATIONS))
+            self.assertEqual((found, calls), (None, [('locate',)]))
+        found, calls = self.discover(ipinfo(), points('https://example.invalid/'), stations(*STATIONS))
+        self.assertEqual((found, len(calls)), (None, 2))
+        found, calls = self.discover(ipinfo(), points(), stations('AB123'))
+        self.assertEqual((found, len(calls)), (None, 3))
+        stop = threading.Event(); stop.set()
+        self.assertEqual(self.discover(ipinfo(), points(), stations(*STATIONS), stop), (None, [('locate',)]))
+
+
+class MetarParseTests(Offline):
+    def test_valid_response_maps_to_home_reading(self):
+        items = [metar('KBBB', 1200, self.now, temp=13, cover='BKN', clouds=[{'cover': 'BKN', 'base': 18000}]),
+                 metar('KAAA', 600, self.now, temp=15, cover='BKN', clouds=[{'cover': 'FEW', 'base': 2600}, {'cover': 'BKN', 'base': 20000}]),
+                 metar('KCCC', 4800, self.now, temp=-1.5, cover='CLR')]
+        value = self.w.parse_metar(raw(items), STATIONS, self.now)
+        observed = (self.now - dt.timedelta(seconds=600)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.assertEqual(value, dict(temperatureF=59, condition='Mostly Cloudy', icon='cloudy', observedAt=observed))
+        readings = self.w.metar_readings(raw(items), STATIONS, self.now)
+        self.assertEqual(set(readings), set(STATIONS))
+        self.assertEqual(readings['KCCC']['temperatureF'], 29)
+        self.assertEqual(readings['KBBB']['temperatureF'], 55)
+
+    def test_missing_or_invalid_temperature_is_never_filled(self):
+        self.assertNotIn('temp', metar('KAAA', 60, self.now, temp=None))
+        for temp in (None, 'warm', True, [15], {'v': 15}, 1e300, -1e300):
+            self.assertIsNone(self.w.parse_metar(raw([metar('KAAA', 60, self.now, temp=temp)]), STATIONS, self.now), temp)
+        self.assertIsNone(self.w.parse_metar(raw([dict(metar('KAAA', 60, self.now), temp=None)]), STATIONS, self.now))
+        stamp = str(int(self.now.timestamp()) - 60).encode()
+        for literal in (b'1e400', b'-1e400', b'NaN', b'Infinity', b'"15"'):
+            body = b'[{"icaoId":"KAAA","obsTime":' + stamp + b',"temp":' + literal + b',"cover":"CLR"}]'
+            self.assertIsNone(self.w.parse_metar(body, STATIONS, self.now), literal)
+        body = b'[{"icaoId":"KAAA","obsTime":' + stamp + b',"temp":-0.4,"cover":"CLR"}]'
+        self.assertEqual(self.w.parse_metar(body, STATIONS, self.now)['temperatureF'], 31)
+        # A station without a temperature yields to the next valid one.
+        items = [metar('KAAA', 60, self.now, temp=None), metar('KBBB', 300, self.now, temp=10)]
+        self.assertEqual(self.w.parse_metar(raw(items), STATIONS, self.now)['temperatureF'], 50)
+
+    def test_bad_json_and_shapes_are_rejected(self):
+        good = metar('KAAA', 60, self.now)
+        for body in (b'', b'[', b'not json', b'NaN', b'[NaN]', b'{}', b'null', b'"KAAA"', b'[1,2]',
+                     raw({'data': [good]}), raw([good] * 65), raw([good]).decode(), None,
+                     raw([good])[:-1], b'\xff\xfe'):
+            self.assertEqual(self.w.metar_readings(body, STATIONS, self.now), {}, body)
+            self.assertIsNone(self.w.parse_metar(body, STATIONS, self.now), body)
+        for field, value in (('obsTime', 1.5), ('obsTime', True), ('obsTime', '1792468020'), ('obsTime', -1),
+                             ('obsTime', 2 ** 40), ('icaoId', 'KZZZ'), ('icaoId', ['KAAA']), ('icaoId', None),
+                             ('wxString', 7), ('wxString', 'RA ' * 30)):
+            self.assertIsNone(self.w.parse_metar(raw([dict(good, **{field: value})]), STATIONS, self.now), (field, value))
+        self.assertIsNone(self.w.parse_metar(raw([dict(good, obsTime=int(self.now.timestamp()) + 301)]), STATIONS, self.now))
+        self.assertIsNotNone(self.w.parse_metar(raw([dict(good, obsTime=int(self.now.timestamp()) + 200)]), STATIONS, self.now))
+
+    def test_duplicate_keys_reject_the_whole_response(self):
+        body = raw([metar('KBBB', 60, self.now)])[:-2] + b',"temp":30}]'
+        self.assertEqual(body.count(b'"temp"'), 2)
+        self.assertEqual(self.w.metar_readings(body, STATIONS, self.now), {})
+        nested = raw([metar('KBBB', 60, self.now), metar('KAAA', 60, self.now)])
+        nested = nested.replace(b'"clouds": []', b'"clouds": [{"cover": "FEW", "cover": "OVC"}]', 1)
+        self.assertEqual(self.w.metar_readings(nested, STATIONS, self.now), {})
+
+    def test_oversize_body_is_rejected(self):
+        body = raw([metar('KAAA', 60, self.now)])
+        self.assertIsNotNone(self.w.parse_metar(body + b' ' * (self.w.MAX_BYTES - len(body)), STATIONS, self.now))
+        self.assertIsNone(self.w.parse_metar(body + b' ' * (self.w.MAX_BYTES - len(body) + 1), STATIONS, self.now))
+
+    def test_newest_report_per_station_is_used(self):
+        items = [metar('KAAA', 3000, self.now, temp=10), metar('KAAA', 120, self.now, temp=20), metar('KAAA', 9000, self.now, temp=0)]
+        self.assertEqual(self.w.parse_metar(raw(items), STATIONS, self.now)['temperatureF'], 68)
+
+
+class SelectionTests(Offline):
+    def pick(self, *items):
+        value = self.w.parse_metar(raw(list(items)), STATIONS, self.now)
+        return None if value is None else value['temperatureF']
+
+    def test_distance_order_wins_within_75_minutes(self):
+        self.assertEqual(self.pick(metar('KBBB', 300, self.now, temp=10), metar('KAAA', 1800, self.now, temp=20)), 68)
+        self.assertEqual(self.pick(metar('KAAA', 4500, self.now, temp=20), metar('KCCC', 60, self.now, temp=0)), 68)
+        self.assertEqual(self.pick(metar('KAAA', 4501, self.now, temp=20), metar('KBBB', 4400, self.now, temp=10),
+                                   metar('KCCC', 60, self.now, temp=0)), 50)
+        self.assertEqual(self.pick(metar('KAAA', 9000, self.now, temp=20), metar('KBBB', 4800, self.now, temp=10),
+                                   metar('KCCC', 660, self.now, temp=0)), 32)
+
+    def test_freshest_valid_when_none_is_within_75_minutes(self):
+        self.assertEqual(self.pick(metar('KAAA', 12000, self.now, temp=20), metar('KBBB', 5400, self.now, temp=10),
+                                   metar('KCCC', 7200, self.now, temp=0)), 50)
+        self.assertEqual(self.pick(metar('KAAA', 36000, self.now, temp=20)), 68)
+        self.assertIsNone(self.pick())
+
+    def test_request_paths_come_only_from_discovered_ids(self):
+        self.assertEqual(self.w.metar_path(STATIONS), '/api/data/metar?ids=KAAA,KBBB,KCCC&format=json')
+        self.assertEqual(self.w.metar_path(('KAAA',)), '/api/data/metar?ids=KAAA&format=json')
+        self.assertEqual(self.w.nws_path('KAAA'), '/stations/KAAA/observations/latest')
+        for bad in ((), ('',), ('kaaa',), ('KAAA', 'KAAA'), ('KAAA', 'K&AA'), ('KAAA', 'KBBB', 'KCCC', 'KDDD'),
+                    ('KAAA&x=1',), ['KAAA'], 'KAAA', None):
+            with self.assertRaises(ValueError):self.w.metar_path(bad)
+            self.assertIsNone(self.w.fetch_metar(threading.Event(), bad))
+            self.assertEqual(self.w.metar_readings(raw([metar('KAAA', 60, self.now)]), bad, self.now), {})
+            self.assertIsNone(self.w.parse_metar(raw([metar('KAAA', 60, self.now)]), bad, self.now))
+        for bad in ('', 'kaaa', 'KAAAA', 'K/AA', None, ('KAAA',)):
+            with self.assertRaises(ValueError):self.w.nws_path(bad)
+            self.assertIsNone(self.w.fetch_observation(threading.Event(), bad))
+            self.assertIsNone(self.w.parse_observation(nws(self.now, 60), bad, self.now))
+
+
+class ConditionTests(Offline):
+    TABLE = (
+        (None, 'CLR', [], 'Clear', 'clear'), (None, 'SKC', [], 'Clear', 'clear'), (None, 'CAVOK', [], 'Clear', 'clear'),
+        (None, 'FEW', [], 'Mostly Clear', 'partly-cloudy'), (None, 'SCT', [], 'Partly Cloudy', 'partly-cloudy'),
+        (None, 'BKN', [], 'Mostly Cloudy', 'cloudy'), (None, 'OVC', [], 'Cloudy', 'cloudy'), (None, 'OVX', [], 'Cloudy', 'cloudy'),
+        (None, None, [{'cover': 'FEW'}, {'cover': 'OVC'}], 'Cloudy', 'cloudy'), (None, 'ZZZ', [{'cover': 'SCT'}], 'Partly Cloudy', 'partly-cloudy'),
+        (None, None, [], 'Conditions unavailable', 'unknown'), (None, None, None, 'Conditions unavailable', 'unknown'),
+        ('TS', 'BKN', [], 'Thunderstorm', 'storm'), ('+TSRA', 'OVC', [], 'Heavy Thunderstorm', 'storm'),
+        ('VCTS', 'SCT', [], 'Thunderstorm Nearby', 'storm'), ('-RA TS', 'OVC', [], 'Thunderstorm', 'storm'),
+        ('+FC', 'OVC', [], 'Tornado', 'storm'),
+        ('-SN', 'OVC', [], 'Light Snow', 'snow'), ('SN BR', 'OVC', [], 'Snow', 'snow'), ('+SHSN', 'OVC', [], 'Heavy Snow Showers', 'snow'),
+        ('BLSN', 'CLR', [], 'Blowing Snow', 'snow'), ('-FZRA', 'OVC', [], 'Light Freezing Rain', 'snow'),
+        ('FZDZ', 'OVC', [], 'Freezing Drizzle', 'snow'), ('GR', 'OVC', [], 'Hail', 'snow'), ('RASN', 'OVC', [], 'Snow', 'snow'),
+        ('-RA BR', 'OVC', [], 'Light Rain', 'rain'), ('RA', 'CLR', [], 'Rain', 'rain'), ('+RA', 'OVC', [], 'Heavy Rain', 'rain'),
+        ('-DZ', 'OVC', [], 'Light Drizzle', 'rain'), ('SHRA', 'BKN', [], 'Rain Showers', 'rain'),
+        ('VCSH', 'SCT', [], 'Showers Nearby', 'rain'), ('UP', 'OVC', [], 'Precipitation', 'rain'),
+        ('SQ', 'BKN', [], 'Squalls', 'wind'), ('BLDU', 'CLR', [], 'Blowing Dust', 'wind'),
+        ('FG', 'OVX', [], 'Fog', 'fog'), ('BR', 'OVC', [], 'Mist', 'fog'), ('HZ', 'CLR', [], 'Haze', 'fog'),
+        ('FU', 'CLR', [], 'Smoke', 'fog'), ('FZFG', 'OVX', [], 'Freezing Fog', 'fog'), ('BCFG', 'CLR', [], 'Patches of Fog', 'fog'),
+        ('MIFG', 'CLR', [], 'Shallow Fog', 'fog'), ('VCFG', 'CLR', [], 'Fog Nearby', 'fog'),
+        ('NSW', 'FEW', [], 'Mostly Clear', 'partly-cloudy'), ('XX -', 'SCT', [], 'Partly Cloudy', 'partly-cloudy'),
+        ('', 'CLR', [], 'Clear', 'clear'),
+    )
+
+    def test_mapping_table(self):
+        for wx, cover, clouds, text, icon in self.TABLE:
+            self.assertEqual(self.w.metar_condition(wx, cover, clouds), (text, icon), wx)
+            value = self.w.parse_metar(raw([metar('KAAA', 60, self.now, wx=wx, cover=cover, clouds=clouds)]), STATIONS, self.now)
+            self.assertEqual((value['condition'], value['icon']), (text, icon), wx)
+            self.assertRegex(text, '^' + self.w.CONDITION + '$')
+            self.assertIn(icon, self.w.ICONS)
+        self.assertIsNone(self.w.metar_condition(5, 'CLR', []))
+
+
+class FakeSock:
+    def settimeout(self, value): pass
+    def shutdown(self, how): pass
+
+
+class FakeResponse:
+    def __init__(self, status=200, headers=None, body=b'[]'):
+        self.status, self.headers, self.body = status, headers or {}, body
+    def getheader(self, name, default=None):
+        return self.headers.get(name, default)
+    def read(self, size):
+        return self.body[:size]
+
+
+def connection(response, calls):
+    class Connection:
+        def __init__(self, host, timeout=None, context=None):
+            calls.append(('connect', host, timeout, context)); self.sock = None
+        def connect(self): self.sock = FakeSock()
+        def request(self, method, path, headers=None): calls.append(('request', method, path, headers))
+        def getresponse(self): return response
+        def set_tunnel(self, *args, **kwargs): raise AssertionError('PROXY')
+        def close(self): pass
+    return Connection
+
+
+class FetchTests(Offline):
+    def setUp(self):
+        super().setUp(); self.body = raw([metar('KAAA', 60, self.now)])
+
+    def fetch(self, fetcher, response, *args):
+        calls = []
+        with patch.object(self.w.http.client, 'HTTPSConnection', connection(response, calls)):
+            return fetcher(threading.Event(), *args), calls
+
+    def check(self, calls, host, path, accept):
+        (_, connected, timeout, context), (_, method, requested, headers) = calls
+        self.assertEqual((connected, timeout, method, requested), (host, 5, 'GET', path))
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED); self.assertTrue(context.check_hostname)
+        self.assertEqual(headers, {'User-Agent': 'R2D2-Home/1.0', 'Accept': accept, 'Accept-Encoding': 'identity'})
+
+    def test_every_request_is_fixed_and_verified(self):
+        body, calls = self.fetch(self.w.fetch_locate, FakeResponse(200, {'Content-Type': 'application/json; charset=utf-8'}, ipinfo()))
+        self.assertEqual(body, ipinfo()); self.check(calls, 'ipinfo.io', '/json', 'application/json')
+        body, calls = self.fetch(self.w.fetch_points, FakeResponse(200, {'Content-Type': 'application/geo+json'}, points()), (40.004, -99.996))
+        self.assertEqual(body, points()); self.check(calls, 'api.weather.gov', '/points/40.00,-100.00', 'application/geo+json')
+        body, calls = self.fetch(self.w.fetch_stations, FakeResponse(200, {'Content-Type': 'application/geo+json'}, b'{}'), STATIONS_PATH)
+        self.assertEqual(body, b'{}'); self.check(calls, 'api.weather.gov', STATIONS_PATH, 'application/geo+json')
+        body, calls = self.fetch(self.w.fetch_metar, FakeResponse(200, {'Content-Type': 'application/json; charset=utf-8',
+                                                                        'Content-Length': str(len(self.body))}, self.body), STATIONS)
+        self.assertEqual(body, self.body)
+        self.check(calls, 'aviationweather.gov', '/api/data/metar?ids=KAAA,KBBB,KCCC&format=json', 'application/json')
+        body, calls = self.fetch(self.w.fetch_observation, FakeResponse(200, {'Content-Type': 'application/geo+json'}, b'{}'), 'KAAA')
+        self.assertEqual(body, b'{}'); self.check(calls, 'api.weather.gov', '/stations/KAAA/observations/latest', 'application/geo+json')
+
+    def test_wrong_response_metadata_is_refused(self):
+        ok = {'Content-Type': 'application/json'}
+        for response in (FakeResponse(200, {'Content-Type': 'text/html'}, self.body),
+                         FakeResponse(200, {'Content-Type': 'application/geo+json'}, self.body),
+                         FakeResponse(200, {}, self.body),
+                         FakeResponse(301, dict(ok, Location='https://example.invalid/'), self.body),
+                         FakeResponse(204, ok, b''),
+                         FakeResponse(200, dict(ok, **{'Content-Encoding': 'gzip'}), self.body),
+                         FakeResponse(200, dict(ok, **{'Content-Length': str(self.w.MAX_BYTES + 1)}), self.body),
+                         FakeResponse(200, dict(ok, **{'Content-Length': '1e3'}), self.body),
+                         FakeResponse(200, ok, b' ' * (self.w.MAX_BYTES + 1))):
+            self.assertIsNone(self.fetch(self.w.fetch_metar, response, STATIONS)[0], response.headers)
+
+    def test_locate_reply_has_its_own_small_cap(self):
+        ok = {'Content-Type': 'application/json'}
+        self.assertIsNotNone(self.fetch(self.w.fetch_locate, FakeResponse(200, ok, b' ' * self.w.LOCATE_BYTES))[0])
+        for response in (FakeResponse(200, ok, b' ' * (self.w.LOCATE_BYTES + 1)),
+                         FakeResponse(200, dict(ok, **{'Content-Length': str(self.w.LOCATE_BYTES + 1)}), ipinfo()),
+                         FakeResponse(200, {'Content-Type': 'text/html'}, ipinfo()),
+                         FakeResponse(302, dict(ok, Location='https://example.invalid/'), ipinfo())):
+            self.assertIsNone(self.fetch(self.w.fetch_locate, response)[0], response.headers)
+
+    def test_unexpected_host_or_path_never_connects(self):
+        calls = []
+        with patch.object(self.w.http.client, 'HTTPSConnection', connection(FakeResponse(), calls)):
+            for host, path in (('example.invalid', '/json'), ('IPINFO.IO', '/json'), ('ipinfo.io', '/'), ('ipinfo.io', '/json?token=x'),
+                               ('ipinfo.io', '/192.0.2.1/json'), ('ipinfo.io', '/json\n'), ('ipinfo.io', None), (None, '/json'),
+                               ('ipinfo.io', self.w.metar_path(STATIONS)), ('api.weather.gov', '/json'),
+                               ('aviationweather.gov', '/api/data/metar?ids=KAAA,KBBB,KCCC,KDDD&format=json'),
+                               ('aviationweather.gov', '/api/data/metar?ids=KAAA&format=json&x=1'),
+                               ('api.weather.gov', self.w.metar_path(STATIONS)), ('aviationweather.gov', self.w.nws_path('KAAA')),
+                               ('api.weather.gov', '/points/40.0,-100.0'), ('api.weather.gov', '/points/40.000,-100.000'),
+                               ('api.weather.gov', '/points/40.00,-100.00?x=1'), ('aviationweather.gov', '/points/40.00,-100.00'),
+                               ('api.weather.gov', '/gridpoints/AAA/10,20/stations'), ('api.weather.gov', '/gridpoints/AAA/10,20/stations?limit=500'),
+                               ('api.weather.gov', '/gridpoints/AAA/10,20/forecast'), ('api.weather.gov', '/stations/KAAA/observations')):
+                self.assertIsNone(self.w._fetch(threading.Event(), host, path, 'application/json', ('application/json',)), (host, path))
+                self.assertFalse(self.w.allowed(host, path), (host, path))
+            for place in ((float('nan'), 0.0), (91.0, 0.0), ('40', '-100'), None, ()):
+                self.assertIsNone(self.w.fetch_points(threading.Event(), place))
+            self.assertIsNone(self.w.fetch_stations(threading.Event(), '/gridpoints/AAA/10,20/stations'))
+            stopped = threading.Event(); stopped.set()
+            self.assertIsNone(self.w.fetch_metar(stopped, STATIONS))
+            self.assertIsNone(self.w.fetch_locate(stopped))
+        self.assertEqual([call for call in calls if call[0] == 'request'], [])
+        for host, path in (('ipinfo.io', '/json'), ('api.weather.gov', '/points/40.00,-100.00'), ('api.weather.gov', '/points/-0.50,0.00'),
+                           ('api.weather.gov', STATIONS_PATH), ('api.weather.gov', '/stations/KAAA/observations/latest'),
+                           ('aviationweather.gov', '/api/data/metar?ids=KAAA&format=json')):
+            self.assertTrue(self.w.allowed(host, path), (host, path))
+
+
+class PollTests(Offline):
+    def setUp(self):
+        super().setUp(); self.calls = []
+
+    def poll(self, metar_body, nws_body, stop=None, ids=STATIONS):
+        def fetch_metar(stop, stations):
+            self.calls.append(('metar', stations))
+            if isinstance(metar_body, Exception):raise metar_body
+            return metar_body
+        def fetch_observation(stop, station):
+            self.calls.append(('nws', station))
+            if isinstance(nws_body, Exception):raise nws_body
+            return nws_body
+        with patch.object(self.w, 'fetch_metar', fetch_metar), patch.object(self.w, 'fetch_observation', fetch_observation):
+            return self.w.poll(stop or threading.Event(), ids, self.now)
+
+    def test_fresh_metar_skips_nws(self):
+        value = self.poll(raw([metar('KBBB', 600, self.now, temp=10)]), nws(self.now, 60))
+        self.assertEqual((value['temperatureF'], self.calls), (50, [('metar', STATIONS)]))
+
+    def test_nws_backup_of_nearest_station_when_metar_fails(self):
+        for failure in (None, b'[', raw([]), raw([metar('KAAA', 60, self.now, temp=None)]), RuntimeError('boom')):
+            self.calls.clear()
+            value = self.poll(failure, nws(self.now, 1800, temp=20))
+            self.assertEqual((value['temperatureF'], value['condition'], value['icon'], self.calls),
+                             (68, 'Partly Cloudy', 'partly-cloudy', [('metar', STATIONS), ('nws', 'KAAA')]), failure)
+
+    def test_newest_of_both_when_metar_is_not_fresh(self):
+        value = self.poll(raw([metar('KAAA', 10800, self.now, temp=10)]), nws(self.now, 3600, temp=20))
+        self.assertEqual(value['temperatureF'], 68)
+        value = self.poll(raw([metar('KAAA', 5400, self.now, temp=10)]), nws(self.now, 36000, temp=20))
+        self.assertEqual(value['temperatureF'], 50)
+        value = self.poll(raw([metar('KAAA', 5400, self.now, temp=10)]), None)
+        self.assertEqual(value['temperatureF'], 50)
+        self.assertEqual(self.calls, [('metar', STATIONS), ('nws', 'KAAA')] * 3)
+
+    def test_nws_station_and_shape_are_checked(self):
+        self.assertIsNone(self.poll(None, nws(self.now, 60, station='KBBB')))
+        self.assertIsNone(self.poll(None, nws(self.now, 60).replace(b'"textDescription"', b'"textDescription": "x", "textDescription"')))
+        self.assertIsNone(self.poll(None, RuntimeError('boom')))
+        self.assertIsNone(self.poll(None, None, ids=()))
+
+    def test_stop_between_sources_skips_nws(self):
+        stop = threading.Event(); stop.set()
+        self.assertIsNone(self.poll(None, nws(self.now, 60), stop))
+        self.assertEqual(self.calls, [('metar', STATIONS)])
+
+
+class FakeStop:
+    def __init__(self, waits): self.left, self.waits, self.done = waits, [], False
+    def is_set(self): return self.done
+    def set(self): self.done = True
+    def wait(self, delay):
+        self.waits.append(delay); self.left -= 1
+        self.done = self.left <= 0
+        return self.done
+
+
+class LoopTests(Offline):
+    """Weather._step with discovery and polls scripted and a virtual monotonic clock."""
+    def setUp(self):
+        super().setUp(); self.clock = [1000.0]; self.discovered = []; self.polled = []
+
+    def weather(self):
+        weather = self.w.Weather(); weather._clock = lambda: self.clock[0]
+        return weather
+
+    def steps(self, weather, results, found=STATIONS):
+        results, found = list(results), list(found) if isinstance(found, list) else found
+        def discover(stop):
+            self.discovered.append(self.clock[0])
+            return found.pop(0) if isinstance(found, list) else found
+        def poll(stop, stations, now=None):
+            self.polled.append(stations); return results.pop(0)
+        with patch.object(self.w, 'discover', discover), patch.object(self.w, 'poll', poll):
+            return [weather._step(self.now) for _ in range(len(results))]
+
+    def test_last_good_reading_survives_failed_polls_and_zip_is_empty(self):
+        weather = self.weather(); good = reading(self.w, self.now, 600)
+        self.steps(weather, [good, None, None])
+        self.assertEqual(weather._value, good)
+        self.assertEqual(weather.snapshot(), dict(state='live', zip='', **good))
+        self.assertEqual(self.polled, [STATIONS] * 3)
+
+    def test_never_steps_back_to_an_older_stale_reading(self):
+        weather = self.weather()
+        kept = reading(self.w, self.now, 1200, temp=60)
+        old = reading(self.w, self.now, 36000, temp=40)
+        newer = reading(self.w, self.now, 300, temp=61)
+        preferred = reading(self.w, self.now, 4400, temp=62)
+        self.steps(weather, [kept, old]); self.assertEqual(weather._value, kept)
+        self.steps(weather, [newer]); self.assertEqual(weather._value, newer)
+        self.steps(weather, [preferred]); self.assertEqual(weather._value, preferred)
+        self.assertIs(self.w.merge(None, None, self.now), None)
+        self.assertEqual(self.w.merge(old, None, self.now), old)
+
+    def test_retry_timing(self):
+        weather = self.weather()
+        fresh, aged, ancient = (reading(self.w, self.now, age) for age in (600, 4600, 36000))
+        self.assertEqual(self.steps(weather, [None]), [60])
+        self.assertEqual(self.steps(weather, [fresh]), [600])
+        self.assertEqual(self.steps(weather, [None]), [60])           # failed poll, kept reading
+        self.assertEqual(self.steps(weather, [ancient]), [600])       # valid poll, fresher reading kept
+        weather = self.weather()
+        self.assertEqual(self.steps(weather, [aged]), [60])           # best reading older than 75 min
+        weather._stop.set()
+        self.assertEqual(self.steps(weather, [fresh]), [None])
+
+    def test_stations_are_cached_for_a_day_then_re_resolved(self):
+        weather = self.weather(); good = reading(self.w, self.now, 600)
+        self.steps(weather, [good, good, good])
+        self.assertEqual(self.discovered, [1000.0])
+        self.clock[0] = 1000.0 + 86399
+        self.steps(weather, [good]); self.assertEqual(len(self.discovered), 1)
+        self.clock[0] = 1000.0 + 86400
+        self.steps(weather, [good]); self.assertEqual(self.discovered, [1000.0, 87400.0])
+        self.assertEqual(weather._value, good)                        # same stations: reading kept
+        # A move (or VPN) yields other stations: the old place's reading is dropped, new ids polled.
+        self.clock[0] += 86400
+        moved = ('KDDD', 'KEEE')
+        self.assertEqual(self.steps(weather, [None], found=moved), [60])
+        self.assertEqual((weather._stations, weather._value, self.polled[-1]), (moved, None, moved))
+        self.assertEqual(weather.snapshot()['state'], 'unavailable')
+
+    def test_failed_lookup_is_unavailable_and_backs_off_to_ten_minutes(self):
+        weather = self.weather(); delays = []
+        for _ in range(7):
+            with patch.object(self.w, 'discover', lambda stop: self.discovered.append(self.clock[0])), \
+                 patch.object(self.w, 'poll', lambda *a, **k: self.fail('POLLED_WITHOUT_STATIONS')):
+                delays.append(weather._step(self.now))
+            self.clock[0] += delays[-1]
+        self.assertEqual(delays, [60, 120, 240, 480, 600, 600, 600])
+        self.assertEqual(len(self.discovered), 7)
+        self.assertEqual(weather.snapshot(), dict(state='unavailable', zip='', temperatureF=None, condition=None, icon=None, observedAt=None))
+        self.assertEqual(weather._stations, ())
+        # Recovery resets the backoff and polls the discovered stations at once.
+        good = reading(self.w, self.now, 600)
+        self.assertEqual(self.steps(weather, [good]), [600])
+        self.assertEqual((weather._failures, weather._stations, weather.snapshot()['state']), (0, STATIONS, 'live'))
+
+    def test_failed_re_resolve_keeps_previous_stations_and_retries(self):
+        weather = self.weather(); good = reading(self.w, self.now, 600)
+        self.steps(weather, [good])
+        self.clock[0] += 86400
+        self.steps(weather, [good], found=None)                      # re-resolve fails: keep polling old ids
+        self.assertEqual((weather._stations, weather._failures, self.polled[-1], weather._value), (STATIONS, 1, STATIONS, good))
+        attempts = len(self.discovered)
+        self.clock[0] += 59
+        self.steps(weather, [good], found=None); self.assertEqual(len(self.discovered), attempts)
+        self.clock[0] += 1
+        self.steps(weather, [good], found=None); self.assertEqual(len(self.discovered), attempts + 1)
+        self.assertEqual(weather._failures, 2)
+        self.clock[0] += 120
+        self.steps(weather, [good]); self.assertEqual((weather._failures, len(self.discovered)), (0, attempts + 2))
+
+    def test_lookup_exceptions_never_escape(self):
+        weather = self.weather()
+        def boom(stop): raise RuntimeError('boom')
+        with patch.object(self.w, 'discover', boom):
+            self.assertEqual(weather._step(self.now), 60)
+        weather._stop.set()
+        with patch.object(self.w, 'discover', boom):
+            self.assertIsNone(weather._step(self.now))
+
+    def test_run_waits_the_computed_delay(self):
+        weather = self.w.Weather(); weather._stop = FakeStop(4)
+        ticks = iter(range(0, 10 ** 6, 1000)); weather._clock = lambda: next(ticks)  # each step is 1000 s later
+        results = [None, reading(self.w, now(), 5000), reading(self.w, now(), 60)]
+        found = [None, STATIONS]
+        def discover(stop): return found.pop(0)
+        with patch.object(self.w, 'discover', discover), patch.object(self.w, 'poll', lambda stop, stations, now=None: results.pop(0)):
+            weather._run()
+        self.assertEqual(weather._stop.waits, [60, 60, 60, 600])
+
+    def test_snapshot_contract_and_stale_after_two_hours(self):
+        weather = self.weather(); current = now()
+        keys = {'state', 'zip', 'temperatureF', 'condition', 'icon', 'observedAt'}
+        self.assertEqual(weather.snapshot(), dict(state='unavailable', zip='', temperatureF=None, condition=None, icon=None, observedAt=None))
+        self.assertEqual(self.w.unavailable()['zip'], '')
+        for age, state in ((60, 'live'), (4600, 'live'), (7100, 'live'), (7260, 'stale'), (86400 * 3, 'stale'), (-200, 'live'), (-400, 'unavailable')):
+            weather._value = reading(self.w, current, age)
+            snap = weather.snapshot()
+            self.assertEqual(set(snap), keys); self.assertEqual(snap['state'], state, age); self.assertEqual(snap['zip'], '')
+        weather._value = reading(self.w, current, 60); weather._stations = STATIONS
+        self.assertTrue(weather.close())
+        self.assertEqual((weather.snapshot()['state'], weather._stations), ('unavailable', ()))
+
+    def test_disabled_never_starts_and_enabled_closes_promptly(self):
+        self.assertFalse(self.w.Weather().start())
+        enabled = load(enabled=True); started = threading.Event()
+        def discover(stop):
+            started.set(); return None
+        with patch.object(enabled, 'discover', discover):
+            weather = enabled.Weather()
+            self.assertTrue(weather.start()); self.assertFalse(weather.start())
+            self.assertTrue(started.wait(5))
+            self.assertTrue(weather.close())
+        self.assertFalse(weather.start())
+
+
+class RetentionTests(Offline):
+    """Only discovered station ids (and timing) survive a full lookup and poll."""
+    def test_lookup_fields_are_not_retained(self):
+        bodies = {'locate': ipinfo('40.0049,-100.0049'), 'points': points(), 'stations': stations('KAAA', 'KBBB', 'KCCC', 'KDDD'),
+                  'metar': raw([metar('KAAA', 600, self.now)])}
+        seen = []
+        with patch.object(self.w, 'fetch_locate', lambda stop: bodies['locate']), \
+             patch.object(self.w, 'fetch_points', lambda stop, place: seen.append(place) or bodies['points']), \
+             patch.object(self.w, 'fetch_stations', lambda stop, path: bodies['stations']), \
+             patch.object(self.w, 'fetch_metar', lambda stop, ids: bodies['metar']), \
+             patch.object(self.w, 'fetch_observation', lambda stop, station: self.fail('NWS_NOT_NEEDED')):
+            names = set(vars(self.w))
+            weather = self.w.Weather()
+            self.assertEqual(weather._step(self.now), 600)
+        self.assertEqual(seen, [(40.0, -100.0)])
+        self.assertEqual(set(vars(weather)), {'_lock', '_stop', '_thread', '_started', '_value', '_stations', '_resolve_at', '_failures', '_clock'})
+        self.assertEqual(weather._stations, STATIONS)
+        self.assertEqual(set(weather._value), {'temperatureF', 'condition', 'icon', 'observedAt'})
+        state = repr(vars(weather))
+        for sentinel in SENTINELS + ('40.0', '-100.0', '40.00', 'AAA/10,20', 'gridpoints', 'ipinfo', 'postal'):
+            self.assertNotIn(sentinel, state, sentinel)
+        self.assertEqual(set(vars(self.w)), names)                   # no module-level state either
+        module_state = repr({k: v for k, v in vars(self.w).items() if not callable(v) and not k.startswith('__')})
+        for sentinel in SENTINELS:
+            self.assertNotIn(sentinel, module_state)
+        self.assertEqual(weather.snapshot()['zip'], '')
+
+
+class SourceTests(unittest.TestCase):
+    """No location is built into the module: no postal code, station id or coordinates."""
+    def test_no_hard_coded_location(self):
+        source = WEATHER.read_text()
+        module = load()
+        for name in ('ZIP', 'STATION', 'FALLBACK_STATIONS', 'LAT', 'LON', 'LOCATION', 'HOME'):
+            self.assertFalse(hasattr(module, name), name)
+        self.assertNotIn('{' * 2, source)  # fully rendered
+        five = re.compile(r'(?<!\d)\d{5}(?!\d)')
+        station = re.compile(r'\b[KPT][A-Z0-9]{3}\b')  # US observation station ids
+        pair = re.compile(r'-?\d{1,3}\.\d+\s*,\s*-?\d{1,3}\.\d+')
+        self.assertTrue(five.search('x 00000') and station.search('ids=KAAA,PBBB') and pair.search('40.00,-100.00'))  # not vacuous
+        numbers = []
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.STRING:
+                value = ast.literal_eval(token.string)
+                self.assertFalse(five.search(value), token.string)
+                self.assertFalse(station.search(value), token.string)
+                self.assertFalse(pair.search(value), token.string)
+            elif token.type == tokenize.COMMENT:
+                self.assertFalse(five.search(token.string), token.string)
+                self.assertFalse(pair.search(token.string), token.string)
+                self.assertFalse(station.search(token.string), token.string)
+            elif token.type == tokenize.NUMBER:
+                numbers.append(token.string)
+        # Decimal literals would be coordinates; the only ones are the socket timeout
+        # floor and the negative-zero normalization.
+        self.assertEqual({n for n in numbers if '.' in n}, {'.001', '0.0'})
+        self.assertEqual({n for n in numbers if five.fullmatch(n)}, {'65536', '86400'})  # byte cap, 24 h
+
+
+if __name__ == '__main__':
+    unittest.main()

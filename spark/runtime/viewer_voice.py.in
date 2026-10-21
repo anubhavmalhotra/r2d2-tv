@@ -1,0 +1,336 @@
+"""Bounded mic-button control; no hardware, voice secrets, audio or I/O at import.
+
+The mailbox becomes available only through the authenticated Manager channel
+carrying fresh signed TV-owner state. The native owner shares the physical-key
+capture lock and enforces power/provider limits. HTTP identity alone is not
+native-app authentication. This module never calls keyfilter APIs.
+"""
+import re
+import threading
+import time
+
+CAPTURE_SECONDS = 10  # preparation-inclusive; provider retains its shorter bound
+RESULT_SECONDS = 200
+CLEANUP_SECONDS = 2
+MAX_REQUESTS = 128
+TERMINAL = ('accepted', 'refused', 'unknown')
+
+
+def valid_command(body):
+    return (type(body) is dict and set(body) == {'schema', 'action', 'request'} and
+            type(body['schema']) is int and body['schema'] == 1 and
+            type(body['action']) is str and body['action'] in ('start', 'release', 'cancel') and
+            type(body['request']) is str and re.fullmatch('[a-f0-9]{16}', body['request']) is not None)
+
+
+def _timer(delay, callback):
+    timer = threading.Timer(delay, callback)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
+class ViewerVoice:
+    def __init__(self, allowed, *, continuing=None, adapter=None, clock=time.monotonic, later=_timer):
+        self.allowed, self.adapter, self.clock, self.later = allowed, adapter, clock, later
+        self.continuing = continuing or allowed
+        self.lock = threading.RLock()
+        self.current = None
+        self.used = set()
+        self.closed = self.poisoned = False
+        self.timer = None
+
+    def _context(self, binding):
+        # Trial/media admission may acquire their own locks or initiate stop.
+        # Evaluate it before taking our lock; never invert shutdown's lock order.
+        row = self.current
+        def allowed(value, continuation=False):
+            try: return (self.continuing if continuation else self.allowed)(value) is True
+            except Exception: return False
+        return row, allowed(binding), allowed(row['binding'], row['released']) if row else False
+
+    def _available(self, binding, allowed):
+        try:
+            return (not self.closed and not self.poisoned and self.adapter is not None and
+                    allowed and self.adapter.ready(binding) is True)
+        except Exception:
+            return False
+
+    def _view(self, binding, allowed):
+        row = self.current
+        available = self._available(binding, allowed)
+        return dict(schema=1, available=available,
+                    state=row['state'] if row else 'idle' if available else 'unavailable',
+                    request=row['id'] if row else None)
+
+    def _disarm(self):
+        if self.timer is not None:
+            self.timer.cancel()
+            self.timer = None
+
+    def _schedule(self):
+        self._disarm()
+        if self.current and self.current['state'] not in TERMINAL:
+            self.timer = self.later(.1, self._tick)
+
+    def _unknown(self, row):
+        row['state'] = 'unknown'
+        self.poisoned = True
+        self._disarm()
+
+    def _cancel(self, row):
+        if row['cancelled'] or row['state'] in TERMINAL:
+            return
+        row['cancelled'] = True  # revoke before invoking the adapter
+        row['state'] = 'finishing'
+        row['end'] = self.clock() + CLEANUP_SECONDS
+        try:
+            row['job'].cancel()
+        except Exception:
+            self._unknown(row)
+
+    def _refresh(self, allowed):
+        row = self.current
+        if row is None or row['state'] in TERMINAL:
+            return
+        now = self.clock()
+        if not row['cancelled'] and (not self._available(row['binding'], allowed) or now >= row['end']):
+            self._cancel(row)
+        if row['state'] in TERMINAL:
+            return
+        try:
+            value = row['job'].snapshot()
+            if (type(value) is not dict or set(value) != {'state', 'started', 'stopped', 'cleanupComplete'} or
+                    value['state'] not in ('preparing', 'listening', 'finishing', 'accepted', 'refused') or
+                    any(type(value[k]) is not bool for k in ('started', 'stopped', 'cleanupComplete'))):
+                raise ValueError()
+            state = value['state']
+            row['started'] = row['started'] or value['started']
+            # A failed START can still require and confirm protective STOP.
+            # Only a clean refusal may retire without an acknowledged START.
+            if (value['stopped'] and not row['started'] and
+                    not (state == 'refused' and value['cleanupComplete'])):
+                raise ValueError()
+            if state in ('accepted', 'refused'):
+                if not value['cleanupComplete'] or row['started'] and not value['stopped']:
+                    raise ValueError()
+                if state == 'accepted' and (not row['released'] or not value['started'] or not value['stopped']):
+                    raise ValueError()
+                if row['cancelled'] and row['released']:
+                    # Cleanup cannot undo a command already dispatched after
+                    # release. Do not turn uncertain completion into refusal.
+                    self._unknown(row)
+                else:
+                    row['state'] = 'refused' if row['cancelled'] else state
+                    self._disarm()
+            elif value['cleanupComplete'] or state == 'listening' and (not value['started'] or value['stopped']):
+                raise ValueError()
+            elif not row['cancelled'] and not row['released']:
+                if row['state'] == 'listening' and state == 'preparing':
+                    raise ValueError()
+                row['state'] = state
+            if row['state'] not in TERMINAL and row['cancelled'] and now >= row['end']:
+                self._unknown(row)
+        except Exception:
+            self._cancel(row)
+            self._unknown(row)
+
+    def _tick(self):
+        row, _, allowed = self._context(None)
+        with self.lock:
+            self.timer = None
+            if self.current is row:
+                self._refresh(allowed)
+            self._schedule()
+
+    def status(self, binding):
+        row, available, allowed = self._context(binding)
+        with self.lock:
+            if self.current is row:
+                self._refresh(allowed)
+            return self._view(binding, available and self.current is row)
+
+    def exchange(self, body):
+        # Only the inherited authenticated channel calls this. Keep context
+        # reads outside our lock, but serialize status ingestion and command
+        # delivery with HTTP begin/release/cancel. A newer row waits one poll.
+        row, _, allowed = self._context(None)
+        with self.lock:
+            if self.current is not row:
+                return dict(command=None)
+            self._refresh(allowed)  # stale state cannot be renewed by this poll
+            self.adapter.exchange(body, deliver=False)
+            self._refresh(allowed)  # incoming unavailability can revoke START
+            return dict(command=self.adapter.take_command())
+
+    def command(self, binding, body):
+        if not valid_command(body):
+            return 400, None
+        prior, available, allowed = self._context(binding)
+        with self.lock:
+            if self.current is not prior:
+                return 409, self._view(binding, False)
+            self._refresh(allowed)
+            action, identifier, row = body['action'], body['request'], self.current
+            if action == 'cancel' and row is not None and row['id'] == identifier:
+                # Exact owned cancellation remains possible during reconnect.
+                self._cancel(row)
+                self._refresh(allowed)
+                self._schedule()
+                return 202, self._view(binding, available)
+            if not self._available(binding, available):
+                return 503, self._view(binding, available)
+            if action == 'start':
+                if identifier in self.used or len(self.used) >= MAX_REQUESTS or row and row['state'] not in TERMINAL:
+                    return 409, self._view(binding, available)
+                self.used.add(identifier)
+                row = dict(id=identifier, binding=binding, state='preparing', released=False,
+                           cancelled=False, started=False, end=self.clock() + CAPTURE_SECONDS, job=None)
+                self.current = row
+                try:
+                    row['job'] = self.adapter.begin(binding, identifier, row['end'])
+                    if any(not callable(getattr(row['job'], method, None)) for method in ('snapshot', 'release', 'cancel')):
+                        raise ValueError()
+                except Exception:
+                    self._cancel(row)
+                    self._unknown(row)
+                    return 503, self._view(binding, available)
+            elif action == 'cancel' and (row is None or row['id'] != identifier):
+                # A cancellation may overtake its start on another HTTP worker.
+                if len(self.used) >= MAX_REQUESTS:
+                    return 409, self._view(binding, available)
+                self.used.add(identifier)
+                return 202, dict(schema=1, available=True, state='refused', request=identifier)
+            elif not row or row['id'] != identifier or row['binding'] != binding or row['state'] in TERMINAL:
+                return 409, self._view(binding, available)
+            elif action == 'release':
+                if row['state'] != 'listening' or row['cancelled'] or row['released']:
+                    self._cancel(row)
+                else:
+                    row['released'] = True
+                    row['state'] = 'finishing'
+                    row['end'] = self.clock() + RESULT_SECONDS
+                    try:
+                        row['job'].release()
+                    except Exception:
+                        self._cancel(row)
+            self._refresh(available)
+            self._schedule()
+            return 202, self._view(binding, available)
+
+    def close(self):
+        self.closed = True
+        with self.lock:
+            if self.current:
+                self._cancel(self.current)
+                self._refresh(False)
+                self._schedule()
+
+
+def valid_owner_status(value):
+    if (type(value) is not dict or set(value) != {'available', 'state', 'request', 'started', 'stopped', 'cleanupComplete'} or
+            any(type(value[k]) is not bool for k in ('available', 'started', 'stopped', 'cleanupComplete')) or
+            value['state'] not in ('unavailable', 'idle', 'preparing', 'listening', 'finishing', 'accepted', 'refused', 'unknown')):
+        return False
+    if value['request'] is None:
+        return (not value['started'] and not value['stopped'] and
+                (value['state'] == 'unavailable' and not value['available'] or
+                 value['state'] == 'idle' and value['available'] and value['cleanupComplete']))
+    return type(value['request']) is str and re.fullmatch('[a-f0-9]{16}', value['request']) is not None
+
+
+class NativeMailbox:
+    """Pure memory endpoint of the existing authenticated Manager/Trial channel.
+
+    No browser body can supply owner status. Only TrialControlHost calls exchange
+    after channel authentication; Manager verified the independently keyed TV
+    nonce/MAC first. Delivery consumes each command once, including lost replies.
+    """
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.lock = clock, threading.Lock()
+        self.session = self.status = None
+        self.seen = float('-inf')
+        self.job = self.pending = None
+        self.retired = False
+
+    def ready(self, binding):
+        with self.lock:
+            return (not self.retired and self.status is not None and self.status['available'] and
+                    0 <= self.clock()-self.seen < 2)
+
+    def begin(self, binding, identifier, deadline):
+        with self.lock:
+            if (self.retired or self.status is None or not self.status['available'] or
+                    not 0 <= self.clock()-self.seen < 2 or self.clock() >= deadline or
+                    self.job is not None and (self.job.value is None or not self.job.value['cleanupComplete'])):
+                raise ValueError('UI_CAPTURE_UNAVAILABLE')
+            self.job = _NativeJob(self, identifier)
+            self.pending = dict(request=identifier, action='start')
+            return self.job
+
+    def exchange(self, body, *, deliver=True):
+        if (type(body) is not dict or set(body) != {'session', 'status'} or
+                type(body['session']) is not str or re.fullmatch('[a-f0-9]{32}', body['session']) is None or
+                not valid_owner_status(body['status'])):
+            raise ValueError('UI_CAPTURE_FRAME')
+        with self.lock:
+            if self.retired or self.session is not None and self.session != body['session']:
+                raise ValueError('UI_CAPTURE_SESSION')
+            self.session = body['session']
+            self.status = dict(body['status'])
+            self.seen = self.clock()
+            if self.job is not None and self.status['request'] == self.job.identifier:
+                state = self.status['state']
+                if state not in ('preparing', 'listening', 'finishing', 'accepted', 'refused'):
+                    self.job.value = None
+                elif self.job.value is not None:
+                    self.job.value = {key: self.status[key] for key in ('state', 'started', 'stopped', 'cleanupComplete')}
+            return dict(command=self._take_command() if deliver else None)
+
+    def _take_command(self):
+        command = self.pending
+        self.pending = None
+        if command is not None and command['action'] == 'start':
+            self.job.delivered = True
+        return command
+
+    def take_command(self):
+        with self.lock:
+            return self._take_command()
+
+    def close(self):
+        with self.lock:
+            self.retired = True
+            self.status = None
+            self.pending = None
+
+
+class _NativeJob:
+    def __init__(self, mailbox, identifier):
+        self.mailbox, self.identifier = mailbox, identifier
+        self.delivered = self.released = self.cancelled = False
+        self.value = dict(state='preparing', started=False, stopped=False, cleanupComplete=False)
+
+    def snapshot(self):
+        with self.mailbox.lock:
+            return dict(self.value) if self.value is not None else None
+
+    def release(self):
+        with self.mailbox.lock:
+            if self.cancelled or self.released:
+                return
+            if not self.delivered:
+                raise ValueError('UI_CAPTURE_NOT_STARTED')
+            self.released = True
+            self.mailbox.pending = dict(request=self.identifier, action='release')
+
+    def cancel(self):
+        with self.mailbox.lock:
+            if self.cancelled:
+                return
+            self.cancelled = True
+            if not self.delivered:
+                self.mailbox.pending = None
+                self.value = dict(state='refused', started=False, stopped=False, cleanupComplete=True)
+            else:
+                self.mailbox.pending = dict(request=self.identifier, action='cancel')

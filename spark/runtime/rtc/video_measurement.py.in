@@ -1,0 +1,40 @@
+"""Exact bounded scalar windows from the authored receiver; no I/O on import."""
+import math
+from .signal_protocol import need
+COUNTERS=('framesDecoded','framesDropped','framesReceived','totalDecodeTime','jitterBufferDelay','jitterBufferEmittedCount')
+def number(v,limit):return type(v)in(int,float)and math.isfinite(v)and 0<=v<=limit
+def integer(v,limit):return type(v)is int and 0<=v<=limit
+def window(v):
+    if v is None:return
+    need(type(v)is dict and set(v)=={'elapsedMs',*COUNTERS}and integer(v['elapsedMs'],32000),'RESULT_VIDEO_MEASUREMENT')
+    for k in COUNTERS:
+        need(v[k]is None or (number(v[k],3600)if k in('totalDecodeTime','jitterBufferDelay')else integer(v[k],2147483647)),'RESULT_VIDEO_MEASUREMENT')
+def nullable(v,keys,limit,is_integer):
+    for k in keys:need(v[k]is None or (integer(v[k],limit)if is_integer else number(v[k],limit)),'RESULT_VIDEO_MEASUREMENT')
+def presentation_window(v,w,available):
+    if v is None:
+        need(w is None,'RESULT_VIDEO_MEASUREMENT');return
+    need(w is not None and type(v)is dict and set(v)=={'elapsedMs','callbacks','presentedFramesDelta','startObservationAgeMs','endObservationAgeMs','callbackGapCount','boundaryGapCount','minCallbackGapMs','maxCallbackGapMs','qualityTotalFramesDelta','qualityDroppedFramesDelta'},'RESULT_VIDEO_MEASUREMENT')
+    need(integer(v['elapsedMs'],32000)and v['elapsedMs']==w['elapsedMs']and integer(v['callbacks'],8192)and integer(v['callbackGapCount'],8191)and integer(v['boundaryGapCount'],1)and v['callbackGapCount']==max(0,v['callbacks']-1)and v['boundaryGapCount']==(1 if v['callbacks']>0 and v['startObservationAgeMs']is not None else 0),'RESULT_VIDEO_MEASUREMENT')
+    nullable(v,('presentedFramesDelta','qualityTotalFramesDelta','qualityDroppedFramesDelta'),2147483647,True)
+    nullable(v,('startObservationAgeMs','endObservationAgeMs'),60000,True)
+    nullable(v,('minCallbackGapMs','maxCallbackGapMs'),60000,False)
+    if v['callbackGapCount']==0:need(v['minCallbackGapMs']is None and v['maxCallbackGapMs']is None,'RESULT_VIDEO_MEASUREMENT')
+    else:need(v['minCallbackGapMs']is not None and v['maxCallbackGapMs']is not None and v['minCallbackGapMs']<=v['maxCallbackGapMs']<=v['elapsedMs']+1,'RESULT_VIDEO_MEASUREMENT')
+    need(available or(v['callbacks']==0 and v['presentedFramesDelta']is None and v['startObservationAgeMs']is None and v['endObservationAgeMs']is None),'RESULT_VIDEO_MEASUREMENT')
+def validate(v):
+    need(type(v)is dict and set(v)=={'samples','elapsedMs','dimensionsStable','startup','steady','presentation','presentationWindows'},'RESULT_VIDEO_MEASUREMENT')
+    need(integer(v['samples'],64)and integer(v['elapsedMs'],32000)and (v['dimensionsStable']is None or type(v['dimensionsStable'])is bool),'RESULT_VIDEO_MEASUREMENT')
+    window(v['startup']);window(v['steady']);p=v['presentation']
+    need(type(p)is dict and set(p)=={'rvfcAvailable','callbacks','presentedFramesDelta','firstCallbackMs','callbackSpanMs','minCallbackGapMs','maxCallbackGapMs','qualityTotalFramesDelta','qualityDroppedFramesDelta'},'RESULT_VIDEO_MEASUREMENT')
+    need(type(p['rvfcAvailable'])is bool and integer(p['callbacks'],8192),'RESULT_VIDEO_MEASUREMENT')
+    nullable(p,('presentedFramesDelta','qualityTotalFramesDelta','qualityDroppedFramesDelta'),2147483647,True)
+    nullable(p,('firstCallbackMs','callbackSpanMs'),60000,True)
+    nullable(p,('minCallbackGapMs','maxCallbackGapMs'),60000,False)
+    windows=v['presentationWindows'];need(type(windows)is dict and set(windows)=={'startup','steady'},'RESULT_VIDEO_MEASUREMENT')
+    presentation_window(windows['startup'],v['startup'],p['rvfcAvailable']);presentation_window(windows['steady'],v['steady'],p['rvfcAvailable'])
+    if windows['startup']is not None and windows['steady']is not None:need(windows['startup']['callbacks']+windows['steady']['callbacks']<=p['callbacks'],'RESULT_VIDEO_MEASUREMENT')
+    return dict(v)
+def completed(v):
+    validate(v)
+    return bool(v['dimensionsStable']is True and 30000<=v['elapsedMs']<=32000 and v['startup']is not None and v['startup']['elapsedMs']>=5000 and v['steady']is not None and v['steady']['elapsedMs']>=24000 and v['steady']['framesDecoded']is not None and v['steady']['framesDecoded']>0)

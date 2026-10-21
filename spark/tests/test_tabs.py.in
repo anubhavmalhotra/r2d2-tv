@@ -1,0 +1,249 @@
+"""Bounded in-memory native tab model and actual runtime queue/route integration."""
+import copy
+import json
+import re
+import unittest
+from unittest.mock import Mock,patch
+import protocol as q
+import session_page as p
+import trial as t
+from test_session import scalars
+from test_trial import headers
+
+TOKEN='a'*48
+class Model:
+    def __init__(self):
+        self.context='private-context';self.calls=[];self.counter=0;self.active='original'
+        self.pages={'original':{'url':q.ORIGIN+'/'+TOKEN+'/fixture','context':self.context,'attached':False}}
+        self.bad_context=False;self.close_ok=True;self.blank_create=False;self.history_cleared=False;self.nav_error=False;self.delayed_close=0;self.closing=None;self.open_mode='ok';self.world=41;self.root_frame='root-owned';self.open_url=None
+    def call(self,method,params,session=False):
+        self.calls.append((method,copy.deepcopy(params),session))
+        if method=='Target.getTargets' and self.closing:
+            if self.delayed_close:self.delayed_close-=1
+            else:del self.pages[self.closing];self.closing=None
+        if method=='Target.getTargets':return {'targetInfos':[{'type':'page','targetId':key,'browserContextId':v['context'],'attached':v['attached'],'url':v['url'],'title':'SECRET_TITLE'}for key,v in self.pages.items()]}
+        if method=='Target.getTargetInfo':
+            key=params['targetId'];v=self.pages[key]
+            return {'targetInfo':{'type':'page','targetId':key,'browserContextId':v['context'],'url':v['url'],'attached':v['attached']}}
+        if method=='Target.attachToTarget':self.pages[params['targetId']]['attached']=True;return {'sessionId':'session-'+params['targetId']}
+        if method=='Target.activateTarget':self.active=params['targetId'];return {}
+        if method=='Page.navigate':
+            if self.nav_error:return {'frameId':'frame','errorText':'SECRET URL'}
+            self.pages[self.active]['url']=params['url'];return {'frameId':'frame'}
+        if method=='Page.getFrameTree':return {'frameTree':{'frame':{'id':self.root_frame,'url':'https://private.example/SECRET'}}}
+        if method=='Page.createIsolatedWorld':
+            assert params=={'frameId':'root-owned','worldName':'r2d2-owned-tab-control','grantUniveralAccess':False}
+            return {'executionContextId':self.world}
+        if method=='Runtime.evaluate':
+            assert params=={'expression':'(()=>{window.open("'+q.ORIGIN+'/'+TOKEN+'/start","_blank","noopener,noreferrer");return true})()',
+                'contextId':41,'userGesture':True,'returnByValue':True,'timeout':1500}
+            if self.open_mode!='blocked':
+                self.counter+=1;key='new'+str(self.counter)
+                self.pages[key]={'url':self.open_url or ('about:blank'if self.blank_create else q.ORIGIN+'/'+TOKEN+'/start'),'context':'other'if self.bad_context else self.context,'attached':False}
+                if self.open_mode=='two':self.pages['extra']=dict(self.pages[key])
+            return {'result':{'value':True}}
+        if method=='Target.closeTarget':
+            if self.close_ok:
+                if self.delayed_close:self.closing=params['targetId']
+                else:del self.pages[params['targetId']]
+            return {'success':self.close_ok}
+        if method=='Page.resetNavigationHistory':self.history_cleared=True;return {}
+        if method=='Page.getNavigationHistory' and self.history_cleared:return {'currentIndex':0,'entries':[{'id':10,'url':self.pages[self.active]['url'] }]}
+        if method=='Page.getNavigationHistory':return {'currentIndex':1,'entries':[{'id':8,'url':'https://example.com/SECRET_HISTORY'},{'id':9,'url':self.pages[self.active]['url']}]}
+        if method in ('Page.navigateToHistoryEntry','Page.reload'):return {}
+        raise AssertionError(method)
+    def page(self):
+        page=p.TabSession.__new__(p.TabSession)
+        page.closed=False;page.started=False;page.phase='new';page.navigations=0;page.snapshots=0;page.navigation_attempted=False
+        page.fixture=q.ORIGIN+'/'+TOKEN+'/fixture';page.start_url=q.ORIGIN+'/'+TOKEN+'/start';page.target=page.session=None
+        page._call=self.call
+        def evaluate(exp):
+            if 'same:location.href===' in exp:return {'same':True,'width':1920,'height':1080,'dpr':2,'visible':True,'focused':True}
+            return scalars()
+        page._evaluate=evaluate
+        return page
+
+class Tabs(unittest.TestCase):
+    def started(self):
+        model=Model();page=model.page();page.start();return model,page
+    def proof(self,model,page):
+        self.assertEqual(model.active,page.target);self.assertEqual(model.pages[page.target]['context'],model.context);return True
+    def test_startup_preflight_same_context_one_tab_revision_zero(self):
+        m,p=self.started();original=p.active
+        result=p.preflight(lambda:self.proof(m,p))
+        self.assertEqual(result,{'qualified':True,'sameContext':True,'createdSwitchedClosed':True,'initialTabRestored':True,'tabCount':1})
+        self.assertEqual(p.active,original);self.assertEqual(p.tab_revision,0);self.assertEqual(len(m.pages),1)
+        create=[v for v in m.calls if v[0]=='Page.createIsolatedWorld'];self.assertEqual(len(create),1);self.assertIs(create[0][1]['grantUniveralAccess'],False)
+        self.assertFalse(any(v[0]=='Target.createTarget' for v in m.calls))
+    def test_missing_original_context_never_creates_target(self):
+        m=Model();m.pages['original']['context']=None;p=m.page()
+        with self.assertRaisesRegex(Exception,'TAB_CONTEXT_UNAVAILABLE'):p.start()
+        self.assertFalse(any(v[0]=='Target.createTarget'for v in m.calls))
+    def test_new_switch_close_and_last_reset_keep_exact_owned_target(self):
+        m,p=self.started();old=p.active;p.tab_command({'action':'new'},lambda:self.proof(m,p));new=p.active
+        self.assertNotEqual(new,old);self.assertRegex(new,'^[a-f0-9]{16}$')
+        p.tab_command({'action':'switch','id':old},lambda:self.proof(m,p))
+        p.tab_command({'action':'close','id':old},lambda:self.proof(m,p));self.assertEqual(p.active,new)
+        before=len([v for v in m.calls if v[0]=='Target.closeTarget'])
+        p.tab_command({'action':'close','id':new},lambda:self.proof(m,p));self.assertEqual(p.active,new);self.assertEqual(p.tab_revision,4)
+        self.assertEqual(len([v for v in m.calls if v[0]=='Target.closeTarget']),before);self.assertEqual(p.state()['tabs'][0]['label'],'New tab')
+    def test_known_blank_creation_then_explicit_local_navigation(self):
+        m,p=self.started();m.blank_create=True
+        p.tab_command({'action':'new'},lambda:self.proof(m,p))
+        self.assertEqual(m.pages[p.target]['url'],p.start_url)
+        self.assertEqual([v[0] for v in m.calls if v[0] in ('Target.attachToTarget','Page.navigate')][-2:],['Target.attachToTarget','Page.navigate'])
+    def test_last_reset_history_cannot_restore_closed_page(self):
+        m,p=self.started();m.pages[p.target]['url']='https://example.com/old'
+        def proof():
+            self.assertFalse(m.history_cleared);self.assertEqual(m.pages[p.target]['url'],p.start_url);return True
+        p.tab_command({'action':'close','id':p.active},proof)
+        self.assertTrue(m.history_cleared);self.assertFalse(p.history('back'))
+        self.assertFalse(any(c[0]=='Page.navigateToHistoryEntry' for c in m.calls))
+    def test_exact_closing_target_may_disappear_after_first_census(self):
+        m,p=self.started();old=p.active;p.tab_command({'action':'new'},lambda:True);m.delayed_close=1
+        with patch.object(__import__('session_page').time,'sleep'):p.tab_command({'action':'close','id':old},lambda:True)
+        self.assertEqual(len(p.tabs),1);self.assertEqual(len(m.pages),1);self.assertEqual(p.tab_revision,2)
+    def test_stuck_closing_target_not_committed_and_foreign_not_tolerated(self):
+        for foreign in (False,True):
+            m,p=self.started();old=p.active;p.tab_command({'action':'new'},lambda:True);m.delayed_close=9
+            if foreign:m.pages[p.tabs[old]['target']]['context']='foreign'
+            with patch.object(__import__('session_page').time,'sleep'):
+                with self.assertRaisesRegex(Exception,'TAB_UNMANAGED_TARGET|POPUP_FOREIGN' if foreign else 'TAB_CLOSE_PENDING'):
+                    p.tab_command({'action':'close','id':old},lambda:True)
+            self.assertEqual(p.tab_revision,1)
+    def test_website_rejection_does_not_end_owned_session_or_export_error(self):
+        m,p=self.started();m.nav_error=True
+        self.assertFalse(p.navigate('https://example.com/fail'));self.assertTrue(p.assert_alive())
+        self.assertEqual(p.evidence()['navigationFailures'],1);self.assertNotIn('SECRET',json.dumps(p.evidence()))
+    def test_revision_only_commits_after_selected_proof(self):
+        m,p=self.started()
+        def failed():self.assertEqual(p.tab_revision,0);return False
+        with self.assertRaisesRegex(Exception,'TAB_PRESENTATION'):p.tab_command({'action':'new'},failed)
+        self.assertEqual(p.tab_revision,0)
+    def test_open_requires_one_exact_local_new_page_no_world_or_context_fallback(self):
+        for mode,code in [('blocked','TAB_OPEN_NOT_OBSERVED'),('two','TAB_NEW_CENSUS'),('foreignurl','TAB_NEW_CENSUS')]:
+            m,p=self.started();m.open_mode=mode
+            if mode=='foreignurl':m.open_url='https://foreign.example/SECRET'
+            with patch.object(__import__('session_page').time,'sleep'):
+                with self.assertRaisesRegex(Exception,code):p.tab_command({'action':'new'},lambda:True)
+            self.assertEqual(len(p.tabs),1);self.assertEqual(p.tab_revision,0)
+            self.assertEqual(len([x for x in m.calls if x[0]=='Runtime.evaluate']),1)
+            self.assertFalse(any(x[0]=='Target.createTarget' for x in m.calls))
+    def test_bad_world_id_never_executes_script(self):
+        for value in (None,True,0,-1,'41',2147483648):
+            m,p=self.started();m.world=value
+            with self.assertRaisesRegex(Exception,'TAB_ISOLATED_WORLD'):p.tab_command({'action':'new'},lambda:True)
+            self.assertFalse(any(x[0]=='Runtime.evaluate' for x in m.calls))
+    def test_sanitized_cdp_diagnostics_keep_only_fixed_method_code_class(self):
+        page=p.TabSession.__new__(p.TabSession);page.context='PRIVATE-CONTEXT';page.sequence=0;page.session='SECRET-SESSION';page._send=Mock()
+        page.frames=page.total=0
+        page._message=Mock(return_value={'id':1,'error':{'code':-32000,'message':'Failed to find browser context with id PRIVATE-CONTEXT','data':'https://private/secret'}})
+        # The removed creation operation is no longer callable, even as fallback.
+        with self.assertRaisesRegex(Exception,'PAGE_METHOD_SCOPE'):page._call('Target.createTarget',{})
+        self.assertEqual(page.sequence,0)
+        page._message.return_value={'id':1,'sessionId':page.session,'error':{'code':-32000,'message':'PRIVATE PAGE URL'}}
+        with self.assertRaisesRegex(Exception,'CDP_PAGE_CREATEISOLATEDWORLD_UNCLASSIFIED'):page._call('Page.createIsolatedWorld',{},True)
+        self.assertEqual(page.last_cdp_error,{'method':'Page.createIsolatedWorld','code':-32000,'category':'UNCLASSIFIED'})
+        self.assertNotIn('PRIVATE',json.dumps(page.last_cdp_error))
+        projected=p.cdp_error('Target.createTarget',{'code':-32000,'message':'Failed to find browser context with id PRIVATE-CONTEXT'},'PRIVATE-CONTEXT')
+        self.assertEqual(projected['category'],'CONTEXT_UNREGISTERED');self.assertNotIn('PRIVATE',json.dumps(projected))
+    def test_cap_and_unknown_ids_do_not_dispatch(self):
+        m,p=self.started()
+        for _ in range(7):p.tab_command({'action':'new'},lambda:True)
+        count=len(m.calls)
+        with self.assertRaisesRegex(Exception,'TAB_LIMIT'):p.tab_command({'action':'new'},lambda:True)
+        with self.assertRaisesRegex(Exception,'TAB_UNKNOWN'):p.tab_command({'action':'switch','id':'f'*16},lambda:True)
+        self.assertEqual(len(m.calls),count);self.assertLess(len(json.dumps(p.state())),2048)
+    def test_foreign_context_creation_refused_without_adoption(self):
+        m,p=self.started();m.bad_context=True
+        with self.assertRaisesRegex(Exception,'TAB_NEW_CENSUS'):p.tab_command({'action':'new'},lambda:True)
+        self.assertEqual(len(p.tabs),1);self.assertEqual(p.tab_revision,0)
+    def test_unmanaged_popup_and_context_change_fail_before_next_command(self):
+        for mode in ('popup','context','detach'):
+            m,p=self.started()
+            if mode=='popup':m.pages['popup']={'url':'https://example.com/private','context':m.context,'attached':False}
+            elif mode=='context':m.pages['original']['context']='other'
+            else:m.pages['original']['attached']=False
+            before=len(m.calls)
+            with self.assertRaisesRegex(Exception,'TAB_UNMANAGED_TARGET|POPUP_'):p.tab_command({'action':'new'},lambda:True)
+            self.assertEqual(len(m.calls),before+1)
+    def test_close_rejection_not_committed(self):
+        m,p=self.started();old=p.active;p.tab_command({'action':'new'},lambda:True);m.close_ok=False
+        with self.assertRaisesRegex(Exception,'TAB_CLOSE'):p.tab_command({'action':'close','id':old},lambda:True)
+        self.assertEqual(len(p.tabs),2);self.assertEqual(p.tab_revision,1)
+    def test_labels_and_evidence_exclude_url_title_and_context(self):
+        m,p=self.started();m.pages['original']['url']='https://example.com/PRIVATE_QUERY?secret=value';p.assert_alive()
+        self.assertEqual(p.state()['tabs'][0]['label'],'example.com')
+        raw=json.dumps(p.evidence());self.assertNotIn('example.com',raw);self.assertNotIn('PRIVATE',raw);self.assertNotIn(m.context,raw)
+        p.tabs[p.active]['label']=p._label('https://'+'a'*65+'.com/x');self.assertEqual(len(p.state()['tabs'][0]['label']),64)
+    def test_history_session_follows_selected_tab(self):
+        m,p=self.started();p.tab_command({'action':'new'},lambda:True);session=p.session
+        p.history('back');self.assertEqual(m.calls[-1][0],'Page.navigateToHistoryEntry');self.assertEqual(p.session,session)
+    def test_worst_tab_action_count_frame_bound(self):
+        m,p=self.started();p.preflight(lambda:True)
+        for _ in range(1800):p.assert_alive()
+        for _ in range(512):p.snapshot()
+        for _ in range(32):
+            old=p.active;p.tab_command({'action':'new'},lambda:True)
+            p.tab_command({'action':'close','id':old},lambda:True)
+        # snapshot's Runtime.evaluate is represented by the direct fixture callback.
+        self.assertLess(len(m.calls)+512+64,4096)
+        p.tab_command({'action':'new'},lambda:True)
+        self.assertEqual(p.tab_revision,65);self.assertEqual(len(p.tabs),2)
+        p.tab_actions=9007199254740991
+        with self.assertRaisesRegex(Exception,'TAB_COMMAND_SCOPE'):p.tab_command({'action':'new'},lambda:True)
+
+class Integration(unittest.TestCase):
+    def trial(self):
+        v=t.Trial(None,TOKEN,Mock());v.page_ready=True;v.owner_verified_at=t.time.monotonic();v.ready_at=t.time.monotonic();v.input=Mock();v.input.poll.return_value=None;v.input_preflight={'qualified':True}
+        v.tab_state={'tabs':[{'id':'1'*16,'label':'New tab'}],'active':'1'*16,'revision':0};return v
+    def test_exact_route_peer_shapes_and_separate_get_budget(self):
+        for method in ('GET','POST'):
+            self.assertEqual(q.route_request(q.TV,method,'/'+TOKEN+'/tabs',headers(),TOKEN),'tabs')
+            self.assertIsNone(q.route_request(q.SPARK,method,'/'+TOKEN+'/tabs',headers(),TOKEN))
+        for body in ({'action':'new','url':'https://example.com'},{'action':'switch','id':'not-id'},{'action':'eval'},{}):self.assertFalse(q.valid_tabs(body))
+        tr=self.trial();self.assertEqual(tr.tab_get_budget.total,10**9);self.assertEqual(tr.get_budget.total,10**9);self.assertIsNot(tr.tab_get_budget,tr.get_budget)
+    def test_tabs_get_handler_does_not_charge_generic_budget(self):
+        tr=self.trial();tr.get_budget.take=Mock(return_value=False)
+        cls=t.handler_for(tr);handler=cls.__new__(cls);handler.route=lambda:'tabs';handler.reply=Mock()
+        handler.do_GET()
+        tr.get_budget.take.assert_not_called()
+        self.assertEqual(handler.reply.call_args.args[0],200)
+        self.assertEqual(json.loads(handler.reply.call_args.args[1]),tr.tab_state)
+    def test_queue_drops_old_input_and_unknown_command(self):
+        tr=self.trial();tr.queue_input({'kind':'key','key':'Enter'});epoch=tr.input_epoch
+        self.assertTrue(tr.queue_tabs({'action':'new'}));self.assertEqual(len(tr.input_actions),0)
+        tr.worker_command=Mock();self.assertIsNone(tr.apply_input({'kind':'key','key':'Enter'},expected_epoch=epoch));tr.worker_command.assert_not_called()
+        self.assertFalse(tr.queue_tabs({'action':'switch','id':'f'*16}));self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+    def test_each_live_input_rechecks_exact_window_before_dispatch(self):
+        tr=self.trial();good={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}}
+        tr.worker_command=Mock(side_effect=[good,{'applied':'key'}]);self.assertEqual(tr.apply_input({'kind':'key','key':'Enter'},expected_epoch=0),'key')
+        self.assertEqual(tr.worker_command.call_args_list[0].args[0],{'kind':'focus-fixture'})
+        tr.worker_command=Mock(return_value=dict(good,pin_valid=False))
+        with self.assertRaisesRegex(Exception,'TAB_INPUT_WINDOW'):tr.apply_input({'kind':'key','key':'Enter'},expected_epoch=0)
+        self.assertEqual(tr.worker_command.call_count,1)
+    def test_commit_proof_window_viewport_census_sandbox(self):
+        tr=self.trial();page=Mock(unsafe=True);page.snapshot.return_value=scalars();owner=Mock();owner.sandbox.return_value={'passed':True}
+        pin={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}}
+        tr.worker_command=Mock(return_value=pin);self.assertTrue(t.prove_selected_tab(tr,page,owner,strict_local=True));page.assert_alive.assert_called_once()
+        owner.sandbox.return_value={'passed':False}
+        with self.assertRaisesRegex(Exception,'TAB_SANDBOX'):t.prove_selected_tab(tr,page,owner)
+    def test_local_presentation_waits_for_commit_but_not_wrong_geometry(self):
+        tr=self.trial();page=Mock(unsafe=True);owner=Mock();owner.sandbox.return_value={'passed':True}
+        tr.worker_command=Mock(return_value={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}})
+        page.snapshot.side_effect=[p.ProofError('PAGE_CONTEXT_TRANSITION'),scalars(localStart=False,documentReady='loading'),scalars()]
+        with patch.object(t.time,'sleep'):self.assertTrue(t.prove_selected_tab(tr,page,owner,strict_local=True))
+        self.assertEqual(page.snapshot.call_count,3)
+        page.snapshot.side_effect=None;page.snapshot.return_value=scalars(width=100)
+        with patch.object(t.time,'sleep'):
+            with self.assertRaisesRegex(RuntimeError,'TAB_PRESENTATION'):t.prove_selected_tab(tr,page,owner,strict_local=True)
+    def test_normal_loading_tab_does_not_require_document_context_or_ready_state(self):
+        tr=self.trial();page=Mock(unsafe=True);page.snapshot.side_effect=RuntimeError('context is transitioning')
+        tr.worker_command=Mock(return_value={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}})
+        owner=Mock();owner.sandbox.return_value={'passed':True}
+        self.assertTrue(t.prove_selected_tab(tr,page,owner));page.snapshot.assert_not_called()
+        page.assert_alive.assert_called_once()
+    def test_stop_clears_tab_cache_and_pending_action(self):
+        tr=self.trial();tr.queue_tabs({'action':'new'});tr.request_stop('viewer-ended');self.assertIsNone(tr.tab_state);self.assertIsNone(tr.navigation_pending);self.assertIsNone(tr.tabs_snapshot())
+
+if __name__=='__main__':unittest.main(verbosity=2)

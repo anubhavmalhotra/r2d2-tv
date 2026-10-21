@@ -1,0 +1,235 @@
+"""Finite private-browser DNS config read. No socket, network events or page content logs."""
+import json
+import os
+import select
+import stat
+import time
+
+SETTINGS_URL = 'chrome://settings/security'
+EXPECTED = {'mode': 'secure', 'config': 'https://dns.quad9.net/dns-query', 'managementMode': 0}
+EXPRESSION = """(async()=>{if(location.href!=='chrome://settings/security')throw new Error('DNS_SETTINGS_ORIGIN');const m=await import('chrome://resources/js/cr.js');const v=await m.sendWithPromise('getSecureDnsSetting');return {mode:v.mode,config:v.config,managementMode:v.managementMode};})()"""
+MARKER = b'\x1eBAAZ_DNS_PIPE_V1\x1f'
+SHELL_PREFIX = "printf '\\036BAAZ_DNS_PIPE_V1\\037'\nexec 3<&0 4>&1\nexec 0</dev/null 1>/dev/null\n"
+MAX_FRAME = 65536
+MAX_TOTAL = 262144
+
+class ProofError(RuntimeError):
+    pass
+
+def _json(raw):
+    def pairs(items):
+        out = {}
+        for key, value in items:
+            if key in out:
+                raise ProofError('CDP_DUPLICATE_KEY')
+            out[key] = value
+        return out
+    try:
+        return json.loads(raw, object_pairs_hook=pairs,
+                          parse_constant=lambda _: (_ for _ in ()).throw(ProofError('CDP_NONFINITE')))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ProofError('CDP_JSON') from exc
+
+def _id(value):
+    return type(value) is str and 1 <= len(value) <= 128 and all(32 < ord(c) < 127 for c in value)
+
+class DnsProof:
+    """Keep parent pipe open until owned browser cleanup; disconnect can exit Chromium."""
+    def __init__(self, stdin, stdout):
+        self.stdin, self.stdout = stdin, stdout
+        self.write_fd, self.read_fd = stdin.fileno(), stdout.fileno()
+        if self.write_fd == self.read_fd or any(not stat.S_ISFIFO(os.fstat(fd).st_mode)
+                                              for fd in (self.write_fd, self.read_fd)):
+            raise ProofError('CDP_PIPE_SCOPE')
+        os.set_blocking(self.read_fd, False)
+        os.set_blocking(self.write_fd, False)
+        self.buffer = bytearray()
+        self.total = self.frames = self.sequence = self.preamble_bytes = 0
+        self.deadline = 0.0
+        self.session = self.target = None
+        self.navigated = self.loaded = False
+        self.used = self.closed = self.marker_seen = False
+
+    def _marker(self):
+        while True:
+            end = self.buffer.find(MARKER)
+            if end >= 0:
+                self.preamble_bytes += end
+                if self.preamble_bytes > 8192:
+                    raise ProofError('CDP_PREAMBLE_SIZE')
+                del self.buffer[:end + len(MARKER)]
+                self.marker_seen = True
+                return
+            keep = len(MARKER) - 1
+            if len(self.buffer) > keep:
+                discard = len(self.buffer) - keep
+                self.preamble_bytes += discard
+                del self.buffer[:discard]
+            if self.preamble_bytes > 8192:
+                raise ProofError('CDP_PREAMBLE_SIZE')
+            if not select.select([self.read_fd], [], [], self._remaining())[0]:
+                raise ProofError('CDP_TIMEOUT')
+            try:
+                block = os.read(self.read_fd, 8192)
+            except BlockingIOError:
+                continue
+            if not block:
+                raise ProofError('CDP_PIPE_CLOSED')
+            self.buffer.extend(block)
+
+    def _remaining(self):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise ProofError('CDP_TIMEOUT')
+        return left
+
+    def _send(self, value):
+        raw = json.dumps(value, separators=(',', ':'), allow_nan=False).encode() + b'\0'
+        if len(raw) > 4096:
+            raise ProofError('CDP_REQUEST_SIZE')
+        while raw:
+            if not select.select([], [self.write_fd], [], self._remaining())[1]:
+                raise ProofError('CDP_TIMEOUT')
+            try:
+                n = os.write(self.write_fd, raw)
+            except BlockingIOError:
+                continue
+            if n <= 0:
+                raise ProofError('CDP_PIPE_CLOSED')
+            raw = raw[n:]
+
+    def _message(self):
+        while True:
+            end = self.buffer.find(0)
+            if end >= 0:
+                if end > MAX_FRAME:
+                    raise ProofError('CDP_FRAME_SIZE')
+                raw = bytes(self.buffer[:end]); del self.buffer[:end + 1]
+                self.frames += 1
+                if self.frames > 64:
+                    raise ProofError('CDP_FRAME_COUNT')
+                result = _json(raw)
+                if type(result) is not dict:
+                    raise ProofError('CDP_SHAPE')
+                return result
+            if len(self.buffer) > MAX_FRAME:
+                raise ProofError('CDP_FRAME_SIZE')
+            if not select.select([self.read_fd], [], [], self._remaining())[0]:
+                raise ProofError('CDP_TIMEOUT')
+            try:
+                block = os.read(self.read_fd, 8192)
+            except BlockingIOError:
+                continue
+            if not block:
+                raise ProofError('CDP_PIPE_CLOSED')
+            self.total += len(block)
+            if self.total > MAX_TOTAL:
+                raise ProofError('CDP_TOTAL_SIZE')
+            self.buffer.extend(block)
+
+    def _event(self, value):
+        # Drop all contents; only record the two owned-settings navigation predicates.
+        if value.get('sessionId') != self.session or self.session is None:
+            return
+        if value.get('method') == 'Page.frameNavigated':
+            params = value.get('params', {})
+            if type(params) is not dict:
+                raise ProofError('CDP_EVENT_SHAPE')
+            frame = params.get('frame', {})
+            if type(frame) is dict and not frame.get('parentId') and frame.get('url') == SETTINGS_URL:
+                self.navigated = True
+        elif value.get('method') == 'Page.loadEventFired' and self.navigated:
+            self.loaded = True
+
+    def _call(self, method, params, session=False):
+        if method not in ('Target.createTarget', 'Target.attachToTarget', 'Page.enable',
+                          'Page.navigate', 'Runtime.evaluate', 'Target.closeTarget'):
+            raise ProofError('CDP_METHOD_SCOPE')
+        self.sequence += 1
+        request = {'id': self.sequence, 'method': method, 'params': params}
+        if session:
+            request['sessionId'] = self.session
+        self._send(request)
+        while True:
+            value = self._message()
+            if 'id' not in value:
+                self._event(value)
+                continue
+            if type(value['id']) is not int or value['id'] != self.sequence:
+                raise ProofError('CDP_REPLY_ID')
+            if (value.get('sessionId') if session else None) != (self.session if session else None):
+                raise ProofError('CDP_REPLY_SESSION')
+            if 'error' in value or type(value.get('result')) is not dict:
+                raise ProofError('CDP_METHOD_ERROR')
+            return value['result']
+
+    def prove(self):
+        if self.used or self.closed:
+            raise ProofError('CDP_LIFECYCLE')
+        self.used = True
+        self.deadline = time.monotonic() + 10.0
+        result = {'qualified': False, 'settings': None, 'target_closed': False,
+                  'error': None, 'source': 'owned-settings-WebUI-effective-resolver',
+                  'browser_wire_behavior_proved': False}
+        try:
+            self._marker()
+            value = self._call('Target.createTarget', {'url': 'about:blank', 'background': True})
+            self.target = value.get('targetId')
+            if not _id(self.target):
+                raise ProofError('CDP_TARGET_ID')
+            value = self._call('Target.attachToTarget', {'targetId': self.target, 'flatten': True})
+            self.session = value.get('sessionId')
+            if not _id(self.session):
+                raise ProofError('CDP_SESSION_ID')
+            self._call('Page.enable', {}, True)
+            self._call('Page.navigate', {'url': SETTINGS_URL}, True)
+            while not self.loaded:
+                value = self._message()
+                if 'id' in value:
+                    raise ProofError('CDP_UNEXPECTED_REPLY')
+                self._event(value)
+            value = self._call('Runtime.evaluate', {'expression': EXPRESSION, 'awaitPromise': True,
+                                                   'returnByValue': True, 'timeout': 3000}, True)
+            remote = value.get('result', {})
+            settings = remote.get('value') if type(remote) is dict else None
+            if 'exceptionDetails' in value or type(settings) is not dict or set(settings) != set(EXPECTED):
+                raise ProofError('DNS_GETTER_SHAPE')
+            if (type(settings['mode']) is not str or len(settings['mode']) > 16 or
+                type(settings['config']) is not str or len(settings['config']) > 256 or
+                type(settings['managementMode']) is not int):
+                raise ProofError('DNS_GETTER_TYPES')
+            # Export only enum/expected resolver identity, never arbitrary configured resolver strings.
+            result['settings'] = {'mode': settings['mode'] if settings['mode'] in ('off','automatic','secure') else 'other',
+                                  'quad9_template_exact': settings['config'] == EXPECTED['config'],
+                                  'managementMode': settings['managementMode'] if 0 <= settings['managementMode'] <= 3 else -1}
+            if settings != EXPECTED:
+                raise ProofError('DNS_EFFECTIVE_MISMATCH')
+        except (ProofError, OSError) as exc:
+            result['error'] = str(exc) if isinstance(exc, ProofError) else 'CDP_IO'
+        finally:
+            if _id(self.target):
+                try:
+                    # One bounded cleanup command; owned process cleanup still covers uncertain close.
+                    self.deadline = max(self.deadline, time.monotonic() + 1.0)
+                    reply = self._call('Target.closeTarget', {'targetId': self.target})
+                    result['target_closed'] = reply.get('success') is True
+                except (ProofError, OSError):
+                    pass
+            if not result['target_closed'] and result['error'] is None:
+                result['error'] = 'CDP_TARGET_CLOSE_UNPROVED'
+            result['qualified'] = result['error'] is None and result['target_closed']
+            result['pipe_marker_seen'] = self.marker_seen
+            result['preamble_discarded_bytes'] = self.preamble_bytes
+            self.buffer.clear()
+        return result
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for stream in (self.stdin, self.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        self.buffer.clear()

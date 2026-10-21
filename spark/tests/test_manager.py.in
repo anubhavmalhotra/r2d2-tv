@@ -1,0 +1,221 @@
+"""Read-only source review; fake worker/processes and own temporary journals only."""
+import ast
+import errno
+import hashlib
+import importlib.util
+import json
+import os
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+ROOT = Path(__file__).resolve().parent
+MANAGER = ROOT.parent / 'manager.py'
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+new = load('candidate_manager', MANAGER)
+BRANCH = """                except FileExistsError:
+                    # A different owner holds the journal. No session or child
+                    # belongs to this idle manager yet. Keep the reservation
+                    # intact and retry O_EXCL only on a later explicit start.
+                    return 503, {'state': 'idle', 'busy': True}
+"""
+current = MANAGER.read_text()
+assert current.count(BRANCH) == 1
+previous = current.replace(BRANCH, '')
+old = types.ModuleType('pre_fix_manager')
+old.__file__ = str(MANAGER)
+exec(compile(previous, '<inert pre-fix manager>', 'exec'), old.__dict__)
+class ReservationTests(unittest.TestCase):
+    def test_baseline_is_exact_and_only_start_changes(self):
+        before=ast.parse(previous)
+        after=ast.parse(current)
+        for tree in (before, after):
+            cls=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='Manager')
+            cls.body=[n for n in cls.body if not(isinstance(n,ast.FunctionDef) and n.name=='start')]
+        self.assertEqual(ast.dump(before,include_attributes=False),ast.dump(after,include_attributes=False))
+    def test_current_manager_poisoning_is_reproduced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';spawn=Mock(side_effect=AssertionError('no spawn'))
+            manager=old.Manager(spawn=spawn,journal=journal)
+            journal.write_bytes(b'a'*32)
+            self.assertEqual(manager.start(),(503,{'state':'error'}))
+            journal.unlink()
+            self.assertEqual(manager.start(),(409,{'state':'error'}))
+            spawn.assert_not_called()
+    def test_live_external_reservation_has_bounded_refusal_and_is_never_touched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';spawn=Mock(side_effect=AssertionError('no spawn'))
+            manager=new.Manager(spawn=spawn,journal=journal)
+            journal.write_bytes(b'a'*32);original=journal.stat()
+            actual_open=new.os.open
+            with patch.object(new.os,'open',wraps=actual_open) as opened, patch.object(manager,'clear_pending',side_effect=AssertionError('foreign cleanup')) as cleared, patch.object(new.threading,'Thread',side_effect=AssertionError('no worker')) as thread:
+                for _ in range(3):
+                    self.assertEqual(manager.start(),(503,{'state':'idle','busy':True}))
+                    self.assertIsNone(manager.session)
+                    self.assertEqual(manager.status(),{'state':'idle'})
+                self.assertEqual(opened.call_count,3)
+                for call in opened.call_args_list:
+                    self.assertEqual(call.args[0],journal)
+                    self.assertTrue(call.args[1]&os.O_EXCL)
+                cleared.assert_not_called();thread.assert_not_called()
+            now=journal.stat();self.assertEqual((now.st_dev,now.st_ino,now.st_mtime_ns,now.st_ctime_ns,now.st_size),(original.st_dev,original.st_ino,original.st_mtime_ns,original.st_ctime_ns,original.st_size))
+            self.assertEqual(journal.read_bytes(),b'a'*32);spawn.assert_not_called()
+    def test_removal_by_external_owner_allows_next_explicit_start(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';spawn=Mock(side_effect=AssertionError('no spawn'))
+            manager=new.Manager(spawn=spawn,journal=journal)
+            journal.write_bytes(b'a'*32)
+            self.assertEqual(manager.start(),(503,{'state':'idle','busy':True}))
+            journal.unlink()  # Our fixture acts as the external owner; manager does not.
+            worker=Mock()
+            with patch.object(new.threading,'Thread',return_value=worker) as thread:
+                code,body=manager.start()
+            self.assertEqual(code,202);self.assertEqual(body['state'],'starting')
+            self.assertEqual(journal.read_text(),body['id']);self.assertNotEqual(body['id'],'a'*32)
+            self.assertEqual(manager.session['id'],body['id']);worker.start.assert_called_once()
+            self.assertEqual(thread.call_args.kwargs['target'],manager.work)
+            spawn.assert_not_called()
+    def test_existing_journal_at_process_start_remains_terminal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';journal.write_bytes(b'a'*32)
+            spawn=Mock(side_effect=AssertionError('no spawn'));manager=new.Manager(spawn=spawn,journal=journal)
+            self.assertEqual(manager.start(),(409,{'state':'error'}))
+            journal.unlink()
+            self.assertEqual(manager.start(),(409,{'state':'error'}));spawn.assert_not_called()
+    def test_non_collision_os_error_remains_terminal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';spawn=Mock(side_effect=AssertionError('no spawn'));manager=new.Manager(spawn=spawn,journal=journal)
+            with patch.object(new.os,'open',side_effect=PermissionError(errno.EACCES,'not exported')):
+                self.assertEqual(manager.start(),(503,{'state':'error'}))
+            self.assertEqual(manager.start(),(409,{'state':'error'}));spawn.assert_not_called()
+    def test_symlink_collision_is_not_followed_or_deleted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target=Path(temp)/'foreign';target.write_bytes(b'foreign')
+            journal=Path(temp)/'pending';spawn=Mock(side_effect=AssertionError('no spawn'));manager=new.Manager(spawn=spawn,journal=journal)
+            journal.symlink_to(target)
+            self.assertEqual(manager.start(),(503,{'state':'idle','busy':True}))
+            self.assertTrue(journal.is_symlink());self.assertEqual(target.read_bytes(),b'foreign');spawn.assert_not_called()
+    def test_owned_unclean_child_remains_terminal_even_if_journal_is_externally_removed(self):
+        self.owned_result(False)
+    def test_owned_clean_child_returns_idle_and_can_start_again(self):
+        self.owned_result(True)
+    def owned_result(self,clean):
+        with tempfile.TemporaryDirectory() as temp:
+            journal=Path(temp)/'pending';proc=Mock();proc.poll.return_value=0;proc.wait.return_value=0
+            manager=new.Manager(spawn=Mock(return_value=proc),journal=journal)
+            with patch.object(new.threading,'Thread',return_value=Mock()):code,body=manager.start()
+            self.assertEqual(code,202);session=manager.session;session['run']=Path(temp)/'run'
+            result={'cleanup':{'verified':clean},'privacy':{'owned_profile_cache_config_removed':True},'audio_cleanup':{'ownedAbsent':True,'defaultsUnchanged':True,'privateDaemonsExited':True}}
+            with patch.object(new.threading,'Thread',return_value=Mock()),patch.object(new,'private_json',return_value=result):manager.work(session)
+            manager.spawn.assert_called_once()
+            if clean:
+                self.assertFalse(journal.exists());self.assertEqual(manager.status(),{'state':'idle'})
+                with patch.object(new.threading,'Thread',return_value=Mock()):self.assertEqual(manager.start()[0],202)
+            else:
+                self.assertTrue(journal.exists());self.assertEqual(manager.status(),{'state':'error'})
+                journal.unlink()  # External deletion must not erase remembered owned-child failure.
+                self.assertEqual(manager.start(),(409,{'state':'error'}))
+    def test_closed_and_non_idle_managers_do_not_retry_reservation(self):
+        for state in ('starting','ready','stopping','error'):
+            manager=new.Manager(journal=None);manager.state=state
+            with patch.object(new.os,'open',side_effect=AssertionError('no open')):
+                self.assertEqual(manager.start(),(409,{'state':state}))
+        manager=new.Manager(journal=None);manager.closed=True
+        self.assertEqual(manager.start(),(409,{'state':'idle'}))
+    def test_default_and_explicit_display_transport_launch_argv(self):
+        calls=[]
+        def no_spawn(argv,**kw):calls.append(argv);raise OSError('inert boundary')
+        m=new.Manager(spawn=no_spawn,journal=None);self.assertEqual(m.display_transport,'webrtc')
+        self.assertIsNotNone(m.control_spawn);self.assertIs(m.spawn,m.control_spawn)
+        self.assertIsNone(new.Manager(spawn=no_spawn,journal=None,voice_control=False).control_spawn)
+        m.work({'cancel':new.threading.Event()})
+        self.assertEqual(calls[-1][-3:],['--run','--display-transport','webrtc'])
+        m_mse=new.Manager(spawn=no_spawn,journal=None,display_transport='mse');self.assertEqual(m_mse.display_transport,'mse')
+        m_mse.work({'cancel':new.threading.Event()})
+        self.assertEqual(calls[-1][-3:],['--run','--display-transport','mse'])
+        with self.assertRaisesRegex(ValueError,'DISPLAY_TRANSPORT_OPTION'):
+            new.Manager(spawn=no_spawn,journal=None,display_transport='invalid')
+    def test_assemble_voice_owner_and_main_lifecycle(self):
+        import ssl
+        import sys
+        mgr=new.Manager(journal=None)
+        ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version=ctx.maximum_version=ssl.TLSVersion.TLSv1_3
+        ctx.verify_mode=ssl.CERT_REQUIRED
+        cfg={
+            'enabled':True,
+            'python':str(Path(sys.executable).resolve()),
+            'asr_path':'/synthetic/asr',
+            'intent_path':'/synthetic/intent',
+            'certificate_sha256':'a'*64,
+            'device_key':'11'*32,
+            'context':ctx,
+        }
+        owner=new.assemble_voice_owner(
+            mgr,'b'*64,cfg,launch=lambda *args,**kwargs:{'returnValue':True},power_read_fn=lambda:{'returnValue':True,'state':'Active'},warm=False)
+        self.assertIs(owner.manager,mgr)
+        self.assertIsNotNone(owner.pool)
+        self.assertIsNotNone(owner.tv_power_reader)
+        self.assertIsNotNone(owner.warm_hook)
+        self.assertTrue(owner.close())
+        self.assertTrue(owner.cleanup_complete)
+        mgr.close()
+class VoiceFeedRouteTests(unittest.TestCase):
+    KEY='b'*64
+    def headers(self,**values):
+        from email.message import Message
+        message=Message();message['Host']=new.SPARK+':4181'
+        for name,value in values.items():message[name.replace('_','-')]=value
+        return message
+    def test_voice_feed_is_a_path_positioned_get_for_null_or_no_origin(self):
+        path='/'+self.KEY+'/voice/'
+        for since in ('0','1','4294967295','9999999999'):
+            for origin in ({},{'Origin':'null'}):
+                self.assertEqual(new.route(new.TV,'GET',path+since,self.headers(**origin),self.KEY),'voice')
+        for bad in ('01','-1','','1?x','1/','10000000000','a','1#x'):
+            self.assertIsNone(new.route(new.TV,'GET',path+bad,self.headers(),self.KEY),bad)
+        for headers in (self.headers(Origin=new.ORIGIN),self.headers(Origin='http://foreign'),
+                        self.headers(Content_Length='1'),self.headers(Transfer_Encoding='chunked')):
+            self.assertIsNone(new.route(new.TV,'GET',path+'1',headers,self.KEY))
+        self.assertIsNone(new.route(new.TV,'POST',path+'1',self.headers(Origin=new.ORIGIN,Content_Type='application/json'),self.KEY))
+        self.assertIsNone(new.route('127.0.0.1','GET',path+'1',self.headers(),self.KEY))
+        self.assertIsNone(new.route(new.TV,'GET','/'+'c'*64+'/voice/1',self.headers(),self.KEY))
+        self.assertEqual(new.route(new.TV,'GET','/'+self.KEY+'/status',self.headers(Origin='null'),self.KEY),'status')
+    def call(self,handler,since,origin='null'):
+        import socket,threading
+        server,client=socket.socketpair();client.settimeout(2)
+        thread=threading.Thread(target=lambda:(handler(server,(new.TV,1),None),server.close()));thread.start()
+        try:
+            client.sendall(('GET /'+self.KEY+'/voice/'+str(since)+' HTTP/1.1\r\nHost: '+new.SPARK+':4181\r\n'
+                            +('Origin: '+origin+'\r\n' if origin else '')+'\r\n').encode())
+            out=bytearray()
+            while True:
+                piece=client.recv(4096)
+                if not piece:break
+                out.extend(piece)
+            return bytes(out)
+        finally:
+            client.close();thread.join(2);self.assertFalse(thread.is_alive())
+    def test_handler_hook_default_404_override_cors_and_silent_gone(self):
+        manager=types.SimpleNamespace(status=lambda:{'state':'idle'},weather=None)
+        base=new.handler_for(manager,self.KEY)
+        self.assertIn(b' 404 ',self.call(base,0).split(b'\r\n',1)[0])
+        seen=[]
+        class Feed(base):
+            def voice_feed(self,since):
+                seen.append(since)
+                return {'v':1,'seq':since+1} if since<5 else False
+        raw=self.call(Feed,3)
+        self.assertTrue(raw.startswith(b'HTTP/1.1 200 '));self.assertIn(b'Access-Control-Allow-Origin: null',raw)
+        self.assertTrue(raw.endswith(b'{"v":1,"seq":4}'))
+        self.assertNotIn(b'Access-Control-Allow-Origin',self.call(Feed,3,origin=None))
+        self.assertEqual(self.call(Feed,9),b'')
+        self.assertEqual(seen,[3,3,9])
+
+
+if __name__=='__main__':unittest.main()

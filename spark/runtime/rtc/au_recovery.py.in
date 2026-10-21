@@ -1,0 +1,136 @@
+"""Finite whole-VP9-AU recovery. No native work or threads on import.
+
+Only the serial gate immediately before the payloader can clear a missing-frame
+watermark. Source lookahead may record future gaps, never make an old queued key
+resolve them. Private audio and original acquisition timestamps are untouched.
+"""
+import threading,time
+from .signal_protocol import need
+from .vp9_public import keyframe
+from .capture_clock import MAX_AGE_NS
+MAX_AU=2*1024*1024
+MAX_DISCARD_AU=8*1024*1024
+MAX_WAIT_NS=15_000_000_000
+MAX_SKIPS=900
+MAX_EPISODES=10**9
+# Admission estimate, not a guaranteed native scheduler deadline. Actual packet
+# age is still checked at every push, with whole-AU abandonment on overrun.
+RATE=150_000_000
+PAYLOAD_ESTIMATE=1200
+PER_PACKET_OVERHEAD=200
+SCHEDULER_RESERVE_NS=10_000_000
+REASONS=frozenset(('AU_TOO_LARGE','AU_TOO_OLD','AU_WIRE_BUDGET','RTP_PACER_AGE'))
+CODES=frozenset(('AU_RECOVERY_BOUND','AU_RECOVERY_WAIT','AU_RECOVERY_PROTOCOL','AU_RECOVERY_OWNER','AU_GATE_FLOW'))
+class Recovery:
+ def __init__(self,guard,*,clock=time.monotonic_ns):
+  self.guard=guard;self.clock=clock;self.lock=threading.RLock();self.first_gap=None;self.last_gap=None;self.since=None;self.active=None
+  self.episodes=0;self.skips=0;self.maximum_skips=0;self.max_wait=0;self.wait_observed=0;self.total_wait=0;self.source_dropped=0;self.gate_dropped=0;self.partial_abandoned=0;self.completed=0;self.resumed=0;self.last_reason=None
+ def _check(self):
+  need(self.guard()is True,'AU_RECOVERY_OWNER')
+  if self.since is not None:
+   elapsed=self.clock()-self.since;need(self.wait_observed<=elapsed<=MAX_WAIT_NS,'AU_RECOVERY_WAIT');self.max_wait=max(self.max_wait,elapsed);self.total_wait+=elapsed-self.wait_observed;self.wait_observed=elapsed
+ def check(self):
+  with self.lock:self._check()
+ def _gap(self,stamp,reason):
+  need(type(stamp)is int and stamp>=0 and reason in REASONS,'AU_RECOVERY_PROTOCOL');self._check()
+  if self.first_gap is None:
+   self.episodes+=1;need(self.episodes<=MAX_EPISODES,'AU_RECOVERY_BOUND');self.since=self.clock();self.first_gap=stamp;self.last_gap=stamp;self.skips=0;self.wait_observed=0
+  else:self.first_gap=min(self.first_gap,stamp);self.last_gap=max(self.last_gap,stamp)
+  self.last_reason=reason
+ def invalidate(self,stamp,reason):
+  with self.lock:self._gap(stamp,reason)
+ def _skip(self,which):
+  self.skips+=1;self.maximum_skips=max(self.maximum_skips,self.skips);need(self.skips<=MAX_SKIPS,'AU_RECOVERY_BOUND')
+  if which=='source':self.source_dropped+=1
+  elif which=='gate':self.gate_dropped+=1
+  else:self.partial_abandoned+=1
+ def source_drop(self,stamp,reason):
+  with self.lock:self._gap(stamp,reason);self._skip('source')
+ def _fits(self,stamp,size):
+  age=self.clock()-stamp;need(age>=0,'AU_RECOVERY_PROTOCOL')
+  if size>MAX_AU:return 'AU_TOO_LARGE'
+  if age>MAX_AGE_NS:return 'AU_TOO_OLD'
+  packets=(size+PAYLOAD_ESTIMATE-1)//PAYLOAD_ESTIMATE
+  wire_ns=((size+packets*PER_PACKET_OVERHEAD)*8*1_000_000_000+RATE-1)//RATE
+  return 'AU_WIRE_BUDGET'if age+wire_ns+SCHEDULER_RESERVE_NS>MAX_AGE_NS else None
+ def begin(self,stamp,size,key):
+  with self.lock:
+   self._check();need(self.active is None and type(stamp)is int and stamp>=0 and type(size)is int and 1<=size<=MAX_AU and type(key)is bool,'AU_RECOVERY_PROTOCOL')
+   reason=self._fits(stamp,size)
+   if reason is not None:self._gap(stamp,reason);self._skip('gate');return False
+   resumed=False
+   if self.first_gap is not None and stamp>=self.first_gap:
+    if not key or stamp<=self.last_gap:self._skip('gate');return False
+    self._check();self.first_gap=None;self.last_gap=None;self.since=None;self.skips=0;resumed=True
+   self.active={'stamp':stamp,'abandoned':False,'resumed':resumed};return True
+ def packet_allowed(self,stamp):
+  with self.lock:
+   self._check();need(self.active is not None and self.active['stamp']==stamp,'AU_RECOVERY_PROTOCOL');return not self.active['abandoned']
+ def abandon(self,stamp):
+  with self.lock:
+   self._check();need(self.active is not None and self.active['stamp']==stamp,'AU_RECOVERY_PROTOCOL')
+   if not self.active['abandoned']:
+    self.active['abandoned']=True;self._gap(stamp,'RTP_PACER_AGE');self._skip('partial')
+ def end(self,stamp,flow_ok):
+  with self.lock:
+   need(self.active is not None and self.active['stamp']==stamp and type(flow_ok)is bool,'AU_RECOVERY_PROTOCOL')
+   active=self.active;self.active=None
+   if flow_ok and not active['abandoned']:self.completed+=1;self.resumed+=int(active['resumed'])
+ def snapshot(self):
+  with self.lock:
+   # Raw timestamps and stream identity never leave this state.
+   return dict(schema=1,episodes=self.episodes,sourceDroppedAUs=self.source_dropped,gateDroppedAUs=self.gate_dropped,abandonedAUs=self.partial_abandoned,completedAUs=self.completed,resumedKeys=self.resumed,waitingForKey=self.first_gap is not None,activeAU=self.active is not None,maxWaitNs=self.max_wait,observedRecoveryWaitNs=self.total_wait,maxSkippedInEpisode=self.maximum_skips,lastReason=self.last_reason,maxEpisodes=MAX_EPISODES,maxWaitAllowedNs=MAX_WAIT_NS,maxSkipsAllowed=MAX_SKIPS)
+
+def validate(value):
+ """Closed scalar projection; admits the one rejected boundary attempt too."""
+ fields={'schema','episodes','sourceDroppedAUs','gateDroppedAUs','abandonedAUs','completedAUs','resumedKeys','waitingForKey','activeAU','maxWaitNs','observedRecoveryWaitNs','maxSkippedInEpisode','lastReason','maxEpisodes','maxWaitAllowedNs','maxSkipsAllowed'}
+ need(type(value)is dict and set(value)==fields,'AU_RECOVERY_PROJECTION')
+ for name,expected in [('schema',1),('maxEpisodes',MAX_EPISODES),('maxWaitAllowedNs',MAX_WAIT_NS),('maxSkipsAllowed',MAX_SKIPS)]:need(type(value[name])is int and value[name]==expected,'AU_RECOVERY_PROJECTION')
+ for name,maximum in [('episodes',MAX_EPISODES+1),('maxSkippedInEpisode',MAX_SKIPS+1),('maxWaitNs',MAX_WAIT_NS),('observedRecoveryWaitNs',(MAX_EPISODES+1)*MAX_WAIT_NS)]+[(k,10**12)for k in('sourceDroppedAUs','gateDroppedAUs','abandonedAUs','completedAUs','resumedKeys')]:need(type(value[name])is int and 0<=value[name]<=maximum,'AU_RECOVERY_PROJECTION')
+ need(type(value['waitingForKey'])is bool and type(value['activeAU'])is bool and(value['lastReason']is None or type(value['lastReason'])is str and value['lastReason']in REASONS),'AU_RECOVERY_PROJECTION')
+ need(value['resumedKeys']<=value['completedAUs']and value['maxWaitNs']<=value['observedRecoveryWaitNs'],'AU_RECOVERY_PROJECTION');return dict(value)
+
+_ELEMENT=None
+_BASE=None
+def make_gate(Gst,recovery,origin,fail):
+ """One synchronous complete-AU boundary after vqueue and before rtpvp9pay."""
+ global _ELEMENT,_BASE
+ if _ELEMENT is None:
+  class Gate(Gst.Element):__gtype_name__='R2D2WholeAuRecoveryV8'
+  _ELEMENT=Gate;_BASE=Gst.Element
+ need(_BASE is Gst.Element,'AU_RECOVERY_PROTOCOL')
+ element=_ELEMENT(name='whole-au-gate');serial=threading.Lock()
+ caps=Gst.Caps.from_string('video/x-vp9')
+ sink=Gst.Pad.new_from_template(Gst.PadTemplate.new('sink',Gst.PadDirection.SINK,Gst.PadPresence.ALWAYS,caps),'sink')
+ src=Gst.Pad.new_from_template(Gst.PadTemplate.new('src',Gst.PadDirection.SRC,Gst.PadPresence.ALWAYS,caps),'src')
+ element.add_pad(sink);element.add_pad(src)
+ need(sink.get_parent()==element and src.get_parent()==element,'AU_RECOVERY_PROTOCOL')
+ def refused(error):
+  code=error.args[0]if type(error)is ValueError and len(error.args)==1 and error.args[0]in CODES else'AU_RECOVERY_PROTOCOL';fail(code);return Gst.FlowReturn.ERROR
+ def chain(pad,parent,item):
+  acquired=False;began=False;stamp=None;flow=False
+  try:
+   acquired=serial.acquire(blocking=False);need(acquired,'AU_RECOVERY_PROTOCOL')
+   need(item is not None and type(item.get_size())is int and 1<=item.get_size()<=MAX_AU,'AU_RECOVERY_PROTOCOL')
+   stamp=origin(item);need(type(stamp)is int and stamp>=0,'AU_RECOVERY_PROTOCOL')
+   key=keyframe(bytes(item.extract_dup(0,min(64,item.get_size()))))
+   need(key is(not bool(item.has_flags(Gst.BufferFlags.DELTA_UNIT))),'AU_RECOVERY_PROTOCOL')
+   if not recovery.begin(stamp,item.get_size(),key):return Gst.FlowReturn.OK
+   began=True;flow=src.push(item.copy())==Gst.FlowReturn.OK;need(flow,'AU_GATE_FLOW');return Gst.FlowReturn.OK
+  except BaseException as error:return refused(error)
+  finally:
+   if began:
+    try:recovery.end(stamp,flow)
+    except BaseException as error:fail('AU_RECOVERY_PROTOCOL')
+   if acquired:serial.release()
+ def chain_list(pad,parent,group):
+  # appsrc emits complete single-AU buffers. Do not guess AU ownership of an
+  # unexpected list at this boundary; fail closed before forwarding anything.
+  fail('AU_RECOVERY_PROTOCOL');return Gst.FlowReturn.ERROR
+ def downstream(pad,parent,event):return src.push_event(event)
+ def upstream(pad,parent,event):return sink.push_event(event)
+ def qs(pad,parent,query):return src.peer_query(query)if src.is_linked()else pad.query_default(parent,query)
+ def qo(pad,parent,query):return sink.peer_query(query)if sink.is_linked()else pad.query_default(parent,query)
+ sink.set_chain_function_full(chain);sink.set_chain_list_function_full(chain_list)
+ sink.set_event_function_full(downstream);src.set_event_function_full(upstream);sink.set_query_function_full(qs);src.set_query_function_full(qo)
+ element._recovery_callbacks=(chain,chain_list,downstream,upstream,qs,qo);return element

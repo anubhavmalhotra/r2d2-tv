@@ -1,0 +1,6 @@
+{
+  "name": "local.owner.r2d2mic",
+  "version": "1.0.0",
+  "main": "bootstrap_entry.js",
+  "private": true
+}

@@ -1,0 +1,124 @@
+"""Owned direct Xvfb capture; acquisition timestamps survive bounded live queues."""
+import os,select,struct,subprocess,threading,time
+from . import vp9_capture as capture
+from .capture_clock import ClockMap,MAX_MAPPING_ENVELOPE_NS,MAX_AGE_NS
+from .vp9_public import keyframe,decode_ivf_header
+from .au_recovery import MAX_DISCARD_AU
+MAX_FRAME=2*1024*1024
+MAX_BYTES=10**15
+DEFAULT_DURATION=315360000
+STARTUP_MAX_FRAMES=60
+class OwnedLive4K:
+ width=3840;height=2160
+ def __init__(self,trial,xvfb,*,duration=DEFAULT_DURATION,max_frames=None,max_bytes=MAX_BYTES,ns=time.monotonic_ns,clock=time.monotonic,mapping=None,recovery=None):
+  capture.need(type(duration)is int and 10<=duration<=DEFAULT_DURATION,'LIVE_CAPTURE_ADMISSION')
+  frames=(None if duration==DEFAULT_DURATION else duration*60)if max_frames is None else max_frames
+  capture.need((frames is None or type(frames)is int and 1<=frames<=capture.MAX_FRAMES)and type(max_bytes)is int and 1<=max_bytes<=MAX_BYTES,'LIVE_CAPTURE_ADMISSION')
+  self.trial=trial;self.owner=trial.owner;self.xvfb=xvfb;self.duration=duration;self.max_frames=frames;self.max_bytes=max_bytes;self.child=None;self.stop=threading.Event();self.lock=threading.Lock();self.origin=None;self.deadline=None;self.last=None;self.first=None;self.frames=0;self.duplicates=0;self.max_gap=0;self.bytes=0;self.max_frame=0;self.last_key=None;self.dropped_to_key=0;self.pending=bytearray();self.cleaned=False;self.first_age=None;self.max_age=None;self.max_transport_age=None;self.max_appsrc_age=None;self.started_transmission=False;self.startup_discarded=0;self.startup_stale=0;self.startup_keywait=0;self.startup_first=None;self.startup_last=None;self.startup_max_gap=0;self.startup_max_age=None;self.accepted_first=None;self.accepted_first_age=None;self.accepted_first_transport_age=None;self.accepted_frames=0;self.accepted_last=None;self.max_accepted_age=None;self.pli_requests=0
+  self.recovery=recovery;self.oversized_discarded=0;self.stale_discarded=0
+  self.ns=ns;self.clock=clock;self.mapping=ClockMap(mono=ns,max_span_ns=self.duration*1_000_000_000,max_samples=(10**15 if self.max_frames is None else min(10**15,max(10000,self.max_frames*4))))if mapping is None else mapping;self.transport_offset=None
+  self.env,self.authority=capture.authority(trial)
+ def admitted(self):return self.child is None and not self.stop.is_set()and self.trial.capture_allowed()and capture.authority(self.trial)[1]==self.authority and self.owner.live(self.xvfb.pid)
+ def start(self):
+  with self.lock:
+   capture.need(self.admitted(),'LIVE_CAPTURE_ADMISSION')
+   self.deadline=min(self.clock()+self.duration,self.trial.ready_at+self.duration,self.trial.deadline)
+   self.mapping.sample();self.origin=self.mapping.start_mono
+   # ClockMap permits a small slew over its complete mapping envelope. Reserve
+   # that same envelope here: one sampling bracket is no longer a sufficient
+   # lower bound. This changes timestamp accounting, not queueing or buffering.
+   self.transport_offset=self.mapping.bound_lo-MAX_MAPPING_ENVELOPE_NS
+   self.child=self.trial.spawn(capture.command(self.trial.display,frames=self.max_frames),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,env=self.env);self.trial.encoder=self.child
+   os.set_blocking(self.child.stdout.fileno(),False)
+ def allowed(self):return not self.stop.is_set()and self.trial.capture_allowed()and self.clock()<self.deadline
+ def exact(self,n):
+  capture.need(1<=n<=MAX_FRAME,'LIVE_READ_BOUND');data=bytearray()
+  while len(data)<n:
+   capture.need(self.allowed(),'LIVE_SOURCE_STOPPED')
+   if self.recovery is not None:self.recovery.check()
+   fd=self.child.stdout.fileno()
+   if not select.select([fd],[],[],.025)[0]:continue
+   try:b=os.read(fd,min(65536,n-len(data)))
+   except BlockingIOError:continue
+   capture.need(b,'LIVE_SOURCE_EOF');data.extend(b);self.bytes+=len(b);capture.need(self.bytes<=self.max_bytes,'LIVE_TOTAL_BOUND');self.mapping.sample()
+  return data
+ def units(self):
+  capture.validate_header(decode_ivf_header(self.exact(32)),self.max_frames)
+  while self.max_frames is None or self.frames<self.max_frames:
+   size,stamp=struct.unpack('<IQ',self.exact(12));capture.need(1<=size<=(MAX_DISCARD_AU if self.recovery is not None else MAX_FRAME)and 0<stamp<2**63,'LIVE_FRAME_BOUND')
+   if self.last is not None:
+    self.duplicates+=int(stamp==self.last);capture.need(stamp>self.last,'LIVE_TIMESTAMP')
+   oversized=size>MAX_FRAME
+   if oversized:
+    # Discard-only ceiling is distinct from accepted AU/allocation limits.
+    # Charge every byte to original cumulative/deadline checks, retain only the
+    # small VP9 header required to reject malformed/profile-changing input.
+    self.pending=bytearray();remaining=size
+    try:
+     while remaining:
+      block=self.exact(min(65536,remaining));remaining-=len(block)
+      self.pending.extend(block[:max(0,64-len(self.pending))]);block[:]=b'\0'*len(block);block.clear()
+    except BaseException:
+     self.pending[:]=b'\0'*len(self.pending);self.pending.clear();raise
+    self.oversized_discarded+=1
+   else:self.pending=self.exact(size)
+   self.max_frame=max(self.max_frame,size);key=keyframe(self.pending[:64])
+   if key:self.last_key=self.frames
+   capture.need(self.last_key is not None and self.frames-self.last_key<capture.GOP,'LIVE_KEY_INTERVAL')
+   if self.last is None:self.first=stamp
+   else:self.max_gap=max(self.max_gap,stamp-self.last)
+   self.last=stamp;self.frames+=1
+   now=self.ns();low,high=self.mapping.ages(stamp,now)
+   if self.first_age is None:self.first_age=high
+   self.max_age=high if self.max_age is None else max(high,self.max_age)
+   capture.need(self.mapping.bound_lo>=self.transport_offset,'LIVE_CLOCK_BOUND')
+   transport=stamp*1000+self.transport_offset
+   try:
+    if not self.started_transmission:
+     # No AU has entered the predictive stream. A new complete GOP may safely
+     # begin at a fresh keyframe, within the original lease and first 60 AUs.
+     capture.need(self.frames<=STARTUP_MAX_FRAMES,'LIVE_STARTUP_NO_FRESH_KEY')
+     transport_age=now-transport
+     if not(key and not oversized and high<=MAX_AGE_NS and 0<=transport_age<=MAX_AGE_NS):
+      self.startup_discarded+=1
+      self.startup_stale+=int(high>MAX_AGE_NS or transport_age>MAX_AGE_NS)
+      self.startup_keywait+=int(not key)
+      if self.startup_first is None:self.startup_first=stamp
+      if self.startup_last is not None:self.startup_max_gap=max(self.startup_max_gap,stamp-self.startup_last)
+      self.startup_last=stamp
+      self.startup_max_age=high if self.startup_max_age is None else max(high,self.startup_max_age)
+      capture.need(self.frames<STARTUP_MAX_FRAMES,'LIVE_STARTUP_NO_FRESH_KEY')
+      continue
+     self.started_transmission=True;self.accepted_first=stamp;self.accepted_first_age=high;self.accepted_first_transport_age=transport_age
+    if self.recovery is not None:
+     if oversized:self.recovery.source_drop(transport,'AU_TOO_LARGE');continue
+     if high>MAX_AGE_NS or self.ns()-transport>MAX_AGE_NS:
+      self.recovery.source_drop(transport,'AU_TOO_OLD');self.stale_discarded+=1;continue
+    capture.need(high<=MAX_AGE_NS,'LIVE_CAPTURE_STALE')
+    value=self.age(transport)
+    if self.recovery is not None and value>MAX_AGE_NS:
+     self.recovery.source_drop(transport,'AU_TOO_OLD');self.stale_discarded+=1;continue
+    self.accepted_frames+=1;self.accepted_last=stamp;self.max_accepted_age=high if self.max_accepted_age is None else max(high,self.max_accepted_age)
+    yield transport,self.pending,key
+   finally:self.pending[:]=b'\0'*len(self.pending);self.pending.clear()
+ def age(self,stamp,*,after_push=False):
+  value=self.ns()-stamp
+  if after_push:self.max_appsrc_age=value if self.max_appsrc_age is None else max(value,self.max_appsrc_age)
+  self.max_transport_age=value if self.max_transport_age is None else max(value,self.max_transport_age)
+  capture.need(value>=0,'LIVE_CAPTURE_STALE')
+  if value>MAX_AGE_NS and self.recovery is not None:
+   # Gate/pacer own delivery admission after appsrc. A slow return may follow
+   # successful delivery, so it cannot create a new missing-frame watermark.
+   if not after_push:self.recovery.invalidate(stamp,'AU_TOO_OLD')
+   return value
+  capture.need(value<=MAX_AGE_NS,'LIVE_APPSRC_STALE'if after_push else'LIVE_CAPTURE_STALE');return value
+ def close(self):
+  self.stop.set()
+  with self.lock:
+   if self.child is not None:self.owner.terminate(self.child)
+ def finish(self):
+  # Called only after sender feed threads have actually joined.
+  if self.child is not None:self.child.wait(timeout=2);self.child.stdout.close()
+  self.pending[:]=b'\0'*len(self.pending);self.pending.clear();self.cleaned=True
+ def counters(self):
+  return {'auRecovery':self.recovery.snapshot()if self.recovery is not None else None,'oversizedDiscardedAUs':self.oversized_discarded,'staleDiscardedAUs':self.stale_discarded,'sourceFrames':self.frames,'sourceElapsedUs':None if self.first is None else self.last-self.first,'firstAcquisitionOffsetUs':None if self.first is None else(self.first*1000-self.mapping.start_real)//1000,'maxSourceGapUs':self.max_gap,'sourceDuplicateTimestamps':self.duplicates,'encodedBytes':self.bytes,'maxFrameBytes':self.max_frame,'skippedThroughKeyframe':self.dropped_to_key,'startup':{'maxFrames':STARTUP_MAX_FRAMES,'discardedFrames':self.startup_discarded,'staleFrames':self.startup_stale,'nonKeyFrames':self.startup_keywait,'sourceElapsedUs':None if self.startup_first is None else self.startup_last-self.startup_first,'maxSourceGapUs':self.startup_max_gap,'maxAgeUpperNs':self.startup_max_age},'accepted':{'frames':self.accepted_frames,'firstSourceIndex':None if self.accepted_first is None else self.startup_discarded,'firstSourceOffsetUs':None if self.accepted_first is None else self.accepted_first-self.first,'sourceElapsedUs':None if self.accepted_first is None else self.accepted_last-self.accepted_first,'firstKeyframeAgeUpperNs':self.accepted_first_age,'firstKeyframeTransportAgeUpperNs':self.accepted_first_transport_age,'maxAgeUpperNs':self.max_accepted_age},'pliRequestsObserved':self.pli_requests,'clockAnchoredBeforeSpawn':self.origin is not None,'cleaned':self.cleaned,'firstEncodedAgeUpperNs':self.first_age,'maxEncodedAgeUpperNs':self.max_age,'maxTransportAgeUpperNs':self.max_transport_age,'maxAppsrcReturnAgeUpperNs':self.max_appsrc_age,'transportClockReserveNs':MAX_MAPPING_ENVELOPE_NS,'acquisitionClock':self.mapping.projection()}

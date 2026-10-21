@@ -1,0 +1,36 @@
+"""Opt-in finite Linux-only child-supervision test. No browser/display/network access."""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from process_owner import ProcessOwner
+
+def main():
+    if sys.platform != 'linux' or os.getuid() == 0:
+        raise SystemExit('ordinary Linux user required')
+    owner = ProcessOwner()
+    result = None
+    try:
+        # Session detachment and launcher exit emulate the relevant Snap lifecycle.
+        source = ('import os,time\n'
+            'pid=os.fork()\n'
+            'if pid: os._exit(0)\n'
+            'os.setsid()\n'
+            'time.sleep(30)\n')
+        launcher = owner.spawn([sys.executable, '-c', source], stdout=subprocess.DEVNULL)
+        launcher.wait(timeout=2)
+        end = time.monotonic() + 2
+        while time.monotonic() < end:
+            owner.discover()
+            if any(pid != launcher.pid and owner.live(pid) for pid in owner.handles):
+                break
+            time.sleep(.02)
+        assert any(pid != launcher.pid and owner.live(pid) for pid in owner.handles), 'detached descendant not tracked'
+    finally:
+        result = owner.cleanup()
+    assert result['verified'], result
+    print(json.dumps({'detached_descendant_test': True, 'cleanup': result}))
+
+if __name__ == '__main__':main()

@@ -1,0 +1,295 @@
+"""Inert constructed BMFF fixtures; never codec/native/network execution."""
+import io
+import struct
+import unittest
+from fractions import Fraction
+import media_ring as m
+
+
+def box(k,b=b''):
+    return struct.pack('>I4s',8+len(b),k)+b
+
+
+def full(k,b=b'',flags=0,version=0):
+    return box(k,bytes([version])+flags.to_bytes(3,'big')+b)
+
+
+def words(*values):return struct.pack('>'+'I'*len(values),*values)
+
+
+def nal(kind=1,payload=b'x'):
+    n=bytes([kind<<1,1])+payload
+    return words(len(n))+n
+
+
+def init_bytes(*,video_id=1,audio_id=2,entry=b'hvc1',external=False,edits=False,
+               hvcc_change=None,track_count=2,empty_tables=True,codec_config=None,video_children=b'',audio_children=b''):
+    f=box(b'ftyp',b'iso5'+words(512)+b'iso6mp41')
+    h=bytearray(23);h[0]=1;h[1]=1;h[12]=153;h[16]=0xfd;h[17]=0xf8;h[18]=0xf8;h[21]=3;h[22]=3
+    for kind in (32,33,34):
+        h+=bytes([128|kind])+b'\0\1\0\3'+bytes([kind<<1,1,0])
+    if hvcc_change:hvcc_change(h)
+    tracks=[]
+    for ident,typ in ((video_id,b'vide'),(audio_id,b'soun'))[:track_count]:
+        tk=bytearray(80);tk[8:12]=words(ident)
+        md=bytearray(20);md[8:12]=words(60000 if typ==b'vide' else 48000)
+        hd=words(0)+typ+b'\0'*12
+        if typ==b'vide':
+            se=bytearray(78);se[6:8]=b'\0\1';se[24:28]=struct.pack('>HH',3840,2160)
+            se=box(entry,bytes(se)+box(b'hvcC',h)+video_children);hdr=full(b'vmhd',b'\0'*8,1)
+        else:
+            se=bytearray(28);se[6:8]=b'\0\1';se[16:20]=struct.pack('>HH',2,16);se[24:28]=words(48000<<16)
+            # ES -> DecoderConfig(mp4a audio) -> ASC(AAC-LC 48k stereo) + SL.
+            asc=b'\x05\x02\x11\x90'
+            dc=b'\x04'+bytes([13+len(asc)])+b'\x40\x15'+b'\0'*11+asc
+            es=b'\x03'+bytes([3+len(dc)+3])+b'\0\x02\0'+dc+b'\x06\x01\x02'
+            if codec_config is not None:es=codec_config
+            se=box(b'mp4a',bytes(se)+full(b'esds',es)+audio_children);hdr=full(b'smhd',b'\0'*4)
+        st=full(b'stsd',words(1)+se)
+        st+=full(b'stts',words(0 if empty_tables else 1))+full(b'stsc',words(0))+full(b'stsz',words(0,0))+full(b'stco',words(0))
+        dr=full(b'dref',words(1)+full(b'url ',b'x' if external else b'',0 if external else 1))
+        mi=box(b'minf',hdr+box(b'dinf',dr)+box(b'stbl',st))
+        tracks.append(box(b'trak',full(b'tkhd',tk,3)+ (box(b'edts') if edits else b'') +box(b'mdia',full(b'mdhd',md)+full(b'hdlr',hd)+mi)))
+    trex=b''.join(full(b'trex',words(i,1,0,0,0)) for i in (video_id,audio_id))
+    return f,box(b'moov',full(b'mvhd',b'\0'*96)+b''.join(tracks)+box(b'mvex',trex))
+
+
+def pair(seq=1,vd=0,ad=0,*,sync=True,vs=16,ac=12,kind=None,vflags=None,
+         tfhd_flags=0x20000,trun_flags=0x701,cts=0,duplicate_track=False,
+         offset_adjust=0,tail=b'',first_flags=None,default_flags=False):
+    videos=[nal((19 if sync and i==0 else 1) if kind is None else kind) for i in range(vs)]
+    audio=[b'aa']*ac
+    def traf(ident,start,data,is_video,offset):
+        flags=tfhd_flags;tfh=words(ident)
+        if default_flags:
+            flags|=32;tfh+=words(0x01010000 if is_video else 0x02000000)
+        tfh=full(b'tfhd',tfh,flags)
+        tfdt=full(b'tfdt',struct.pack('>Q',start),version=1)
+        tflags=trun_flags
+        ff=first_flags
+        if default_flags:
+            tflags=0x301
+            if is_video and sync:ff=0x02000000
+        if ff is not None:tflags=(tflags&~0x400)|4
+        tr=words(len(data))+struct.pack('>i',offset)
+        if tflags&4:tr+=words(ff)
+        for i,s in enumerate(data):
+            sf=(0x02000000 if (not is_video or sync and i==0) else 0x01010000)
+            if is_video and vflags is not None:sf=vflags
+            for bit,val in ((0x100,1000 if is_video else 1024),(0x200,len(s)),(0x400,sf),(0x800,cts)):
+                if tflags&bit:tr+=words(val)
+        return box(b'traf',tfh+tfdt+full(b'trun',tr,tflags))
+    def build(v_off,a_off):
+        return box(b'moof',full(b'mfhd',words(seq))+traf(1,vd,videos,True,v_off)+traf(1 if duplicate_track else 2,ad,audio,False,a_off))
+    moof=build(0,0);vo=len(moof)+8+offset_adjust;ao=len(moof)+8+sum(map(len,videos))
+    moof=build(vo,ao)
+    return moof,box(b'mdat',b''.join(videos+audio)+tail)
+
+
+def ring(**kw):
+    r=m.MediaRing('a'*32,**kw);r.initialize(*init_bytes());return r
+
+
+class Parser(unittest.TestCase):
+    def test_init_and_valid_fragment_exact_bytes(self):
+        i=m.parse_init(*init_bytes());p=pair();f=m.parse_fragment(i,*p,0,1,{})
+        self.assertEqual((f.moof,f.mdat),p);self.assertTrue(f.access_point)
+        self.assertEqual(f.start,0);self.assertEqual(dict(f.decode_ends),{1:16000,2:12288})
+
+    def test_default_tfhd_and_first_flags(self):
+        f=m.parse_fragment(m.parse_init(*init_bytes()),*pair(default_flags=True),0,1,{})
+        self.assertTrue(f.access_point)
+
+    def test_init_rejects_unsupported_authority(self):
+        cases=[dict(audio_id=1),dict(track_count=1),dict(entry=b'hev1'),dict(external=True),
+               dict(edits=True),dict(empty_tables=False),dict(hvcc_change=lambda b:b.__setitem__(21,2)),
+               dict(hvcc_change=lambda b:b.__setitem__(23,32))]
+        for kw in cases:
+            with self.subTest(kw=kw),self.assertRaises(m.MediaError):m.parse_init(*init_bytes(**kw))
+
+    def test_malformed_boxes(self):
+        for raw in (b'',b'\0'*7,words(0)+b'moov',words(1)+b'moov',words(99)+b'moov'):
+            with self.subTest(raw=raw),self.assertRaises(m.MediaError):m.plain_box(raw,b'moov')
+
+    def test_fragment_bad_flags_track_offsets_and_spans(self):
+        cases=[dict(vflags=0),dict(vflags=0x03000000),dict(tfhd_flags=0x20001),dict(tfhd_flags=0),
+               dict(trun_flags=0x703),dict(trun_flags=0xf01,cts=1),dict(duplicate_track=True),
+               dict(offset_adjust=1),dict(tail=b'x'),dict(kind=21),dict(kind=1)]
+        i=m.parse_init(*init_bytes())
+        for kw in cases:
+            with self.subTest(kw=kw),self.assertRaises(m.MediaError):m.parse_fragment(i,*pair(**kw),0,1,{})
+
+    def test_divergent_mux_endpoints_are_not_published_without_checkpoint(self):
+        i=m.parse_init(*init_bytes());p=pair(ac=1);x=m.parse_fragment(i,*p,0,1,{})
+        self.assertEqual((x.moof,x.mdat),p)
+        r=ring();r.append(*p);self.assertEqual(r.next_index,0)
+        with self.assertRaisesRegex(m.MediaError,'NO_ACCESS_POINT'):r.resume()
+        with self.assertRaisesRegex(m.MediaError,'AV_CHECKPOINT_REQUIRED'):r._finish_eof()
+
+    def test_all_payload_bytes_and_nal_lengths_accounted(self):
+        i=m.parse_init(*init_bytes());a,b=pair();bad=bytearray(b);bad[8:12]=words(999999)
+        with self.assertRaisesRegex(m.MediaError,'NAL_LENGTH'):m.parse_fragment(i,a,bytes(bad),0,1,{})
+        with self.assertRaises(m.MediaError):m.parse_fragment(i,a,b[:-1],0,1,{})
+
+    def test_no_unknown_sync_and_no_open_gop(self):
+        for kind in (16,17,18,21,22,0,2):
+            with self.subTest(kind=kind),self.assertRaises(m.MediaError):m.closed_idr(nal(kind))
+        self.assertTrue(m.closed_idr(nal(19)))
+        self.assertTrue(m.closed_idr(nal(20)))
+        self.assertFalse(m.closed_idr(nal(1)))
+
+    def test_sequence_decode_gap_overlap_terminal(self):
+        for seq,vd,ad in ((3,16000,12288),(2,16001,12288),(2,16000,12287)):
+            r=ring();r.append(*pair())
+            with self.assertRaises(m.MediaError):r.append(*pair(seq,vd,ad,sync=False))
+            self.assertIsNotNone(r.snapshot()['error'])
+            with self.assertRaisesRegex(m.MediaError,'EPOCH_FAILED'):r.resume()
+
+    def test_aac_descriptor_and_config_unknowns(self):
+        for bad in (b'\x03\x80\x80\x80\x80', b'\x03\x7fxxx',
+                    b'\x03\x03\0\x02\x80'):
+            with self.subTest(bad=bad),self.assertRaises(m.MediaError):
+                m.parse_init(*init_bytes(codec_config=bad))
+        f,b=init_bytes()
+        self.assertIn(b'\x05\x02\x11\x90',b)
+        with self.assertRaisesRegex(m.MediaError,'AAC_LC'):
+            m.parse_init(f,b.replace(b'\x05\x02\x11\x90',b'\x05\x02\x12\x10'))
+
+    def test_duplicate_container_and_disabled_track(self):
+        f,b=init_bytes();rows=m.boxes(m.plain_box(b,b'moov'))
+        dup=box(b'moov',b[8:]+box(b'mvex',bytes(m.one(rows,b'mvex'))))
+        with self.assertRaises(m.MediaError):m.parse_init(f,dup)
+        bad=bytearray(b);p=bad.index(b'tkhd')+4;bad[p+3]=0
+        with self.assertRaisesRegex(m.MediaError,'TRACK_NOT_ENABLED'):
+            m.parse_init(f,bytes(bad))
+
+    def test_sample_count_negative_offset_and_nal_count_bound(self):
+        i=m.parse_init(*init_bytes());a,b=pair()
+        for offset,value in ((8,m.MAX_SAMPLES+1),(12,0xffffffff)):
+            bad=bytearray(a);p=bad.index(b'trun');bad[p+offset:p+offset+4]=words(value)
+            with self.subTest(offset=offset),self.assertRaises(m.MediaError):
+                m.parse_fragment(i,bytes(bad),b,0,1,{})
+        with self.assertRaisesRegex(m.MediaError,'NAL_COUNT'):m.closed_idr(nal(1)*257)
+
+    def test_64bit_decode_times_remain_exact(self):
+        seconds=2**40;i=m.parse_init(*init_bytes())
+        a,b=pair(vd=seconds*60000,ad=seconds*48000)
+        f=m.parse_fragment(i,a,b,0,1,{})
+        self.assertEqual(f.start,seconds)
+        self.assertEqual(f.end-seconds,Fraction(4,15))
+
+    def test_conflicting_first_sample_flags(self):
+        a,b=pair();bad=bytearray(a);pos=bad.index(b'trun')+4
+        bad[pos+3]|=4
+        with self.assertRaisesRegex(m.MediaError,'TRUN_FLAGS_CONFLICT'):
+            m.parse_fragment(m.parse_init(*init_bytes()),bytes(bad),b,0,1,{})
+
+
+class RingTests(unittest.TestCase):
+    def test_indexed_consumers_are_independent(self):
+        r=ring();p=pair();r.append(*p);c1=r.resume().cursor;c2=r.resume().cursor
+        f,nxt=r.read(c1);self.assertEqual((f.moof,f.mdat),p)
+        self.assertIsNone(r.read(nxt));self.assertEqual(r.read(c2)[0],f)
+        with self.assertRaises(m.MediaError):r.read(m.Cursor('b'*32,0))
+        with self.assertRaises(m.MediaError):r.read(m.Cursor(r.epoch,True))
+        with self.assertRaises(m.MediaError):r.read(m.Cursor(r.epoch,9))
+
+    def test_evict_whole_groups_preserve_audio_clock(self):
+        r=ring(max_fragments=3);r.append(*pair());old=r.resume().cursor
+        r.append(*pair(2,16000,12288,sync=False));r.append(*pair(3,32000,24576,sync=True))
+        r.append(*pair(4,48000,36864,sync=False))
+        self.assertEqual([f.index for g in r.groups for f in g],[2,3])
+        with self.assertRaises(m.Lagged) as e:r.read(old)
+        self.assertEqual((e.exception.oldest,e.exception.latest),(2,2))
+        resume=r.resume();f,_=r.read(resume.cursor)
+        self.assertTrue(f.access_point);self.assertEqual(dict(f.decode_ends),{1:48000,2:36864})
+        self.assertEqual(resume.init,b''.join(init_bytes()))
+        self.assertEqual(resume.start,Fraction(24576,48000))
+
+    def test_time_eviction_and_group_caps(self):
+        r=ring(max_seconds=1,max_groups=2)
+        for j in range(5):r.append(*pair(j+1,j*16000,j*12288,sync=j%2==0))
+        self.assertEqual(r.groups[0][0].index,2)
+        self.assertLessEqual(r.groups[-1][-1].end-r.groups[0][0].start,1)
+        r2=ring(max_groups=1);r2.append(*pair());r2.append(*pair(2,16000,12288))
+        self.assertEqual(r2.groups[0][0].index,1)
+
+    def test_byte_cap_evicts_only_complete_group(self):
+        init_size=sum(map(len,init_bytes()));ps=sum(map(len,pair()))
+        r=ring(max_bytes=init_size+ps*2)
+        r.append(*pair());r.append(*pair(2,16000,12288,sync=False));r.append(*pair(3,32000,24576))
+        self.assertEqual([f.index for g in r.groups for f in g],[2])
+        self.assertEqual(r.bytes,init_size+sum(map(len,pair(3,32000,24576))))
+
+    def test_gop_oversize_stops_epoch_without_partial_commit(self):
+        r=ring(max_fragments=1);r.append(*pair());before=r.snapshot()
+        with self.assertRaisesRegex(m.MediaError,'ACCESS_GROUP_OVERFLOW'):
+            r.append(*pair(2,16000,12288,sync=False))
+        self.assertEqual(r.next_index,before['nextIndex']);self.assertEqual(r.count,1)
+        with self.assertRaises(m.MediaError):r.read(m.Cursor(r.epoch,0))
+
+    def test_first_fragment_requires_closed_idr(self):
+        r=ring()
+        with self.assertRaisesRegex(m.MediaError,'INITIAL_IDR_REQUIRED'):r.append(*pair(sync=False))
+        self.assertEqual(r.count,0)
+
+    def test_reader_partial_inputs_finish_exact(self):
+        data=b''.join(init_bytes()+pair());stream=io.BytesIO(data);r=m.MediaRing('a'*32)
+        p=m.Producer(r,lambda n:stream.read(min(n,7)))
+        self.assertEqual([p.step(),p.step(),p.step()],['init','fragment','end'])
+        self.assertTrue(r.ended);self.assertEqual(r.read(r.resume().cursor)[0].index,0)
+
+    def test_reader_never_publishes_partial_pair(self):
+        data=b''.join(init_bytes()+pair())[:-1];r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(data).read)
+        p.step()
+        with self.assertRaisesRegex(m.MediaError,'TRUNCATED_STREAM'):p.step()
+        self.assertEqual(r.count,0)
+        with self.assertRaises(m.MediaError):r.resume()
+
+    def test_reader_bounds_and_unsupported_boxes(self):
+        for suffix in (words(m.MAX_PAIR+1)+b'moof',box(b'free'),box(b'mfra')):
+            r=m.MediaRing('a'*32);p=m.Producer(r,io.BytesIO(b''.join(init_bytes())+suffix).read);p.step()
+            with self.assertRaises(m.MediaError):p.step()
+        with self.assertRaises(m.MediaError):m.read_exact(lambda n:b'x'*(n+1),4)
+
+    def test_reader_exception_is_terminal_and_sanitized(self):
+        r=m.MediaRing('a'*32)
+        def failed(n):raise OSError('sensitive raw transport text')
+        p=m.Producer(r,failed)
+        with self.assertRaisesRegex(m.MediaError,'^READER_FAILURE$'):p.step()
+        self.assertEqual(r.snapshot()['error'],'READER_FAILURE')
+        self.assertNotIn('sensitive',str(r.snapshot()))
+
+    def test_time_and_byte_single_group_overflow(self):
+        r=ring(max_seconds=1)
+        for j in range(3):r.append(*pair(j+1,j*16000,j*12288,sync=j==0))
+        with self.assertRaisesRegex(m.MediaError,'ACCESS_GROUP_OVERFLOW'):
+            r.append(*pair(4,48000,36864,sync=False))
+        r=ring(max_bytes=sum(map(len,init_bytes()))+sum(map(len,pair()))-1)
+        with self.assertRaisesRegex(m.MediaError,'ACCESS_GROUP_OVERFLOW'):r.append(*pair())
+        self.assertEqual(r.count,0)
+
+    def test_repeated_rotation_retains_bounded_payload_and_common_clock(self):
+        r=ring(max_seconds=2,max_fragments=10,max_groups=4)
+        audio_dts=0
+        for j in range(1000):
+            count=12+j%2
+            r.append(*pair(j+1,j*16000,audio_dts,sync=j%4==0,ac=count))
+            audio_dts+=count*1024
+            self.assertLessEqual(r.count,10)
+            self.assertLessEqual(r.bytes,r.max_bytes)
+            self.assertLessEqual(r.groups[-1][-1].end-r.groups[0][0].start,2)
+            self.assertTrue(r.groups[0][0].access_point)
+        self.assertEqual(r.next_index,1000)
+        self.assertGreater(r.groups[0][0].index,980)
+        self.assertEqual(r.prior[2],audio_dts)
+
+    def test_clear_and_integer_configuration(self):
+        for kw in (dict(max_bytes=True),dict(max_seconds=1.5),dict(max_fragments=5000),dict(max_groups=0)):
+            with self.assertRaises(m.MediaError):ring(**kw)
+        r=ring();r.append(*pair());r.clear()
+        self.assertEqual((r.bytes,r.count,len(r.groups)),(0,0,0))
+        self.assertEqual(r.snapshot()['error'],'CLEARED')
+
+
+if __name__=='__main__':unittest.main()

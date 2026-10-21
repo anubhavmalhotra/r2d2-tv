@@ -1,0 +1,4 @@
+__pycache__/
+.local/
+candidate/
+*.local.json

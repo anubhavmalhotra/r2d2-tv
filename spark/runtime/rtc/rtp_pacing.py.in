@@ -1,0 +1,201 @@
+"""Bounded RTP packet pacing; no capture, sockets, logging or auxiliary threads.
+
+The native pad adapter splits BufferLists. Merely sleeping in a BufferList
+probe would delay the whole list without removing its eventual wire burst.
+The schedule is based on actual pushes, with at most 2 ms of batching in
+recoverable mode and no accumulated catch-up credit after an idle interval.
+"""
+import collections,threading,time
+from .signal_protocol import need
+from .capture_clock import MAX_AGE_NS
+RATE=150_000_000
+OVERHEAD=100 # conservative IPv4/UDP/SRTP/Ethernet+IFG allowance, per RTP packet
+MAX_PACKET=1400
+MAX_LIST=2048
+MAX_BATCH_NS=2_000_000
+WINDOW_NS=10_000_000
+# A rolling window can include the bounded early batch plus one whole packet.
+MAX_WINDOW_BYTES=(RATE*(WINDOW_NS+MAX_BATCH_NS)+8_000_000_000-1)//8_000_000_000+MAX_PACKET+OVERHEAD
+CODES=frozenset(('RTP_PACER_BOUND','RTP_PACER_AGE','RTP_PACER_FLOW','RTP_PACER_OWNER','RTP_PACER_CALLBACK'))
+
+class RecoverableAge(ValueError):pass
+
+class PacketPacer:
+    def __init__(self,stop,guard,*,clock=time.monotonic_ns,recover_age=False):
+        need(type(recover_age)is bool,'RTP_PACER_CALLBACK');self.recover_age=recover_age
+        self.stop=stop;self.guard=guard;self.clock=clock;self.lock=threading.RLock()
+        self.next_ns=0;self.last_ns=None;self.first_ns=None;self.failure=None
+        self.packets=0;self.rtp_bytes=0;self.wire_bytes=0;self.wait_ns=0;self.max_age_ns=0
+        self.min_gap_ns=None;self.max_gap_ns=0;self.window=collections.deque();self.window_bytes=0;self.max_window_bytes=0
+        self.single_calls=0;self.list_calls=0;self.max_list_packets=0
+    def _need(self,ok,code):
+        if not ok:
+            self.failure=self.failure or code
+            raise ValueError(code)
+    def _age(self,arrived_ns,now=None):
+        # Only a valid timestamp that has become too old is recoverable. Clock
+        # regression/future/non-integral timestamps remain protocol failures.
+        self._need(type(arrived_ns)is int and arrived_ns>=0,'RTP_PACER_AGE')
+        now=self.clock()if now is None else now
+        self._need(type(now)is int and now>=arrived_ns,'RTP_PACER_AGE')
+        if now-arrived_ns>MAX_AGE_NS and self.recover_age:raise RecoverableAge('RTP_PACER_AGE')
+        self._need(now-arrived_ns<=MAX_AGE_NS,'RTP_PACER_AGE')
+    def ready(self):
+        if self.stop.is_set():return False
+        self._need(self.guard()is True,'RTP_PACER_OWNER');return True
+    def send(self,size,emit,*,arrived_ns):
+        self._need(type(size)is int and 12<=size<=MAX_PACKET,'RTP_PACER_BOUND')
+        if not self.ready():return False
+        self._age(arrived_ns)
+        # Wait interrupts promptly on parent stop. Slow sends postpone following
+        # packets; no credit accumulates while an input frame or thread is late.
+        before=self.clock()
+        while True:
+            now=self.clock();left=self.next_ns-now
+            self._age(arrived_ns,now)
+            if left<=(MAX_BATCH_NS if self.recover_age else 0):break
+            if self.stop.wait(min(left,5_000_000)/1e9):return False
+            if not self.ready():return False
+        if not self.ready():return False
+        sent_ns=self.clock()
+        self._need(emit()is True,'RTP_PACER_FLOW')
+        after=self.clock();wire=size+OVERHEAD
+        # Charge early batches to the schedule. A slow downstream push or idle
+        # interval resets it to completion, so unused credit cannot accumulate.
+        # RTP payload timestamps remain untouched.
+        step=(wire*8*1_000_000_000+RATE-1)//RATE
+        self.next_ns=max(after,self.next_ns)+step if self.recover_age else after+step
+        with self.lock:
+            self.packets+=1;self._need(self.packets<=10**15,'RTP_PACER_BOUND')
+            self.rtp_bytes+=size;self.wire_bytes+=wire;self.wait_ns+=sent_ns-before
+            self.max_age_ns=max(self.max_age_ns,after-arrived_ns)
+            if self.first_ns is None:self.first_ns=sent_ns
+            if self.last_ns is not None:
+                gap=sent_ns-self.last_ns;self.min_gap_ns=gap if self.min_gap_ns is None else min(self.min_gap_ns,gap);self.max_gap_ns=max(self.max_gap_ns,gap)
+            self.last_ns=sent_ns
+            self.window.append((sent_ns,wire));self.window_bytes+=wire
+            while self.window and self.window[0][0]<=sent_ns-WINDOW_NS:self.window_bytes-=self.window.popleft()[1]
+            self._need(len(self.window)<=4096,'RTP_PACER_BOUND');self.max_window_bytes=max(self.max_window_bytes,self.window_bytes)
+        # Count an accepted push truthfully even if its blocking completion
+        # crossed the deadline; refusal stops later packets, not this one.
+        self._age(arrived_ns,after)
+        return True
+    def snapshot(self):
+        with self.lock:
+            return dict(rateBitsPerSecond=RATE,overheadBytes=OVERHEAD,packets=self.packets,rtpBytes=self.rtp_bytes,estimatedWireBytes=self.wire_bytes,
+                waitNs=self.wait_ns,maxResidenceNs=self.max_age_ns,minPushGapNs=self.min_gap_ns,maxPushGapNs=self.max_gap_ns,
+                observedSpanNs=0 if self.first_ns is None else self.last_ns-self.first_ns,maxTenMsWireBytes=self.max_window_bytes,
+                singleCalls=self.single_calls,listCalls=self.list_calls,maxListPackets=self.max_list_packets,failure=self.failure)
+
+def validate(v):
+    names={'rateBitsPerSecond','overheadBytes','packets','rtpBytes','estimatedWireBytes','waitNs','maxResidenceNs','minPushGapNs','maxPushGapNs','observedSpanNs','maxTenMsWireBytes','singleCalls','listCalls','maxListPackets','failure'}
+    need(type(v)is dict and set(v)==names,'COUNTER_SCOPE')
+    need(v['rateBitsPerSecond']==RATE and v['overheadBytes']==OVERHEAD,'COUNTER_SCOPE')
+    for k in names-{'minPushGapNs','failure'}:need(type(v[k])is int and 0<=v[k]<=10**18,'COUNTER_SCOPE')
+    need(v['minPushGapNs']is None or type(v['minPushGapNs'])is int and 0<=v['minPushGapNs']<=10**18,'COUNTER_SCOPE')
+    need(v['failure']is None or type(v['failure'])is str and v['failure']in CODES,'COUNTER_SCOPE')
+    need(v['packets']<=10**15 and v['maxListPackets']<=MAX_LIST and v['estimatedWireBytes']==v['rtpBytes']+OVERHEAD*v['packets'],'COUNTER_SCOPE')
+    need(v['maxTenMsWireBytes']<=MAX_WINDOW_BYTES,'COUNTER_SCOPE')
+    return dict(v)
+
+_ELEMENT_CLASS=None
+_ELEMENT_BASE=None
+def make_element(Gst,pacer,fail,*,name='bounded-rtp-pacer',timestamp_origin=None,au_recovery=None):
+    """A push-only identity element with explicit list splitting and backpressure.
+
+    Buffer.copy() owns a shallow GstBuffer reference for transfer to push; it
+    preserves bytes, PTS/DTS/duration/flags. The incoming list owns its originals
+    until this synchronous chain call returns. No queued list is retained.
+    """
+    global _ELEMENT_CLASS,_ELEMENT_BASE
+    if _ELEMENT_CLASS is None:
+        class PacerElement(Gst.Element):
+            __gtype_name__='R2D2FiniteRtpPacerV27'
+        _ELEMENT_CLASS=PacerElement;_ELEMENT_BASE=Gst.Element
+    need(_ELEMENT_BASE is Gst.Element,'RTP_PACER_CALLBACK')
+    element=_ELEMENT_CLASS(name=name)
+    template=Gst.Caps.from_string('application/x-rtp')
+    sink=Gst.Pad.new_from_template(Gst.PadTemplate.new('sink',Gst.PadDirection.SINK,Gst.PadPresence.ALWAYS,template),'sink')
+    src=Gst.Pad.new_from_template(Gst.PadTemplate.new('src',Gst.PadDirection.SRC,Gst.PadPresence.ALWAYS,template),'src')
+    element.add_pad(sink);element.add_pad(src)
+    need(sink.get_parent()==element and src.get_parent()==element,'RTP_PACER_CALLBACK')
+    def refused(error):
+        code=str(error)if type(error)is ValueError and str(error)in CODES else'RTP_PACER_CALLBACK'
+        pacer.failure=pacer.failure or code;fail(code);return Gst.FlowReturn.ERROR
+    def send(item,arrived):
+        need(item is not None,'RTP_PACER_BOUND')
+        if timestamp_origin is not None:
+            origin=timestamp_origin(item);need(type(origin)is int and 0<=origin<=arrived,'RTP_PACER_AGE');arrived=origin
+        if au_recovery is not None:
+            need(timestamp_origin is not None and pacer.recover_age,'RTP_PACER_CALLBACK')
+            # The pre-payloader gate owns this exact synchronous AU. Once age
+            # abandons it, suppress every later fragment/list of the same AU.
+            if not au_recovery.packet_allowed(origin):return True
+        try:return pacer.send(item.get_size(),lambda:src.push(item.copy())==Gst.FlowReturn.OK,arrived_ns=arrived)
+        except RecoverableAge:
+            need(au_recovery is not None,'RTP_PACER_CALLBACK')
+            au_recovery.abandon(origin);return True
+    def chain(pad,parent,item):
+        try:
+            pacer.single_calls+=1
+            return Gst.FlowReturn.OK if send(item,pacer.clock())else Gst.FlowReturn.FLUSHING
+        except BaseException as error:return refused(error)
+    def chain_list(pad,parent,group):
+        try:
+            count=group.length();need(1<=count<=MAX_LIST,'RTP_PACER_BOUND')
+            pacer.list_calls+=1;pacer.max_list_packets=max(pacer.max_list_packets,count);arrived=pacer.clock()
+            for i in range(count):
+                if not send(group.get(i),arrived):return Gst.FlowReturn.FLUSHING
+            return Gst.FlowReturn.OK
+        except BaseException as error:return refused(error)
+    def downstream(pad,parent,event):return src.push_event(event)
+    def upstream(pad,parent,event):return sink.push_event(event)
+    def query_sink(pad,parent,query):
+        return src.peer_query(query)if src.is_linked()else pad.query_default(parent,query)
+    def query_src(pad,parent,query):
+        return sink.peer_query(query)if sink.is_linked()else pad.query_default(parent,query)
+    sink.set_chain_function_full(chain);sink.set_chain_list_function_full(chain_list)
+    sink.set_event_function_full(downstream);src.set_event_function_full(upstream)
+    sink.set_query_function_full(query_sink);src.set_query_function_full(query_src)
+    element._pacer_callbacks=(chain,chain_list,downstream,upstream,query_sink,query_src)
+    return element
+
+def native_selftest(Gst):
+    """One local three-packet Gst BufferList; no sockets, media or TV action.
+
+    This precedes public encoding/peer setup. It exercises the real GI list,
+    shallow-copy ownership, caps/event flow, and actual callback pacing. Native
+    lifetime cleanup is separately checked by the existing worker diagnostics.
+    """
+    pipe=Gst.Pipeline.new('owned-pacer-selftest');source=Gst.ElementFactory.make('appsrc','source');sink=Gst.ElementFactory.make('fakesink','sink')
+    need(source is not None and sink is not None,'RTP_PACER_CALLBACK')
+    stop=threading.Event();pace=PacketPacer(stop,lambda:True);errors=[];seen=[];done=threading.Event()
+    pacer=make_element(Gst,pace,errors.append,name='selftest-pacer')
+    try:
+        source.set_property('is-live',True);source.set_property('format',Gst.Format.TIME)
+        source.set_property('caps',Gst.Caps.from_string('application/x-rtp,media=video,encoding-name=VP9,clock-rate=90000,payload=96'))
+        sink.set_property('sync',False);sink.set_property('async',False);sink.set_property('signal-handoffs',True)
+        def handoff(element,buffer,pad):
+            # Read only authored numeric fixture bytes and timestamps. Retain no
+            # Gst buffers; any mismatch fails this bounded startup test.
+            seen.append((buffer.get_size(),buffer.pts,buffer.dts,buffer.duration,bytes(buffer.extract_dup(0,12))))
+            if len(seen)>=3:done.set()
+        sink.connect('handoff',handoff)
+        for x in(source,pacer,sink):pipe.add(x)
+        need(all(x.get_parent()==pipe for x in(source,pacer,sink))and source.link(pacer)and pacer.link(sink),'RTP_PACER_CALLBACK')
+        need(pipe.set_state(Gst.State.PLAYING)!=Gst.StateChangeReturn.FAILURE,'RTP_PACER_CALLBACK')
+        group=Gst.BufferList.new();expected=[]
+        for i in range(3):
+            raw=bytes((0x80,96,0,i,0,0,0,1,0,0,0,2))+bytes(1388)
+            b=Gst.Buffer.new_allocate(None,len(raw),None);b.fill(0,raw);b.pts=10;b.dts=10;b.duration=20
+            group.insert(-1,b);expected.append((1400,10,10,20,raw[:12]))
+        need(source.emit('push-buffer-list',group)==Gst.FlowReturn.OK and done.wait(1),'RTP_PACER_CALLBACK')
+        end=time.monotonic()+1
+        while pace.packets<3 and time.monotonic()<end:stop.wait(.001)
+        need(not errors and seen==expected and pace.list_calls==1 and pace.packets==3,'RTP_PACER_CALLBACK')
+        receipt=pace.snapshot();need(receipt['minPushGapNs']>=80_000,'RTP_PACER_CALLBACK')
+        source.emit('end-of-stream');return True
+    finally:
+        stop.set();pipe.set_state(Gst.State.NULL)
+        result,state,_=pipe.get_state(1*Gst.SECOND)
+        need(result!=Gst.StateChangeReturn.FAILURE and state==Gst.State.NULL,'RTP_PACER_CALLBACK')

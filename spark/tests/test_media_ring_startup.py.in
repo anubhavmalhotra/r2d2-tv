@@ -1,0 +1,485 @@
+"""MediaRing initial-AAC boundary with the duration carried by the tfhd default (no trun 0x100).
+
+Synthetic moof/mdat pairs only: generated numbers and payload bytes, no captured
+media. The builder writes fragments the way FFmpeg's movenc.c does in the
+observed dialect (tfhd 0x020038: default-base-is-moof plus default
+duration/size/flags; the tfhd defaults are the FIRST sample's values; trun
+0x100/0x200 appear only when some sample differs from them). With one audio
+sample that gives trun 0x001, the exact shape of every isolated start failure
+recorded before this change.
+
+R is the rendered runtime media_ring. A is an in-memory control built from the
+same source with only the tfhd-default admission reverted, so every case
+checks that the change differs from the previous rule on the admitted startup
+case and nowhere else. No file, process or socket is created.
+"""
+import io
+import itertools
+import struct
+import sys
+import types
+import unittest
+from fractions import Fraction
+from pathlib import Path
+
+import media_ring as R
+
+AAC_SYNC = 0x02000000
+VIDEO_NONSYNC = 0x01010000
+VIDEO_SCALE = 15360
+FIX = '(flags & 0x100 or tfhd_duration)'
+# First-AAC durations of failed isolated starts (all single-sample, tfhd
+# 0x020038, trun 0x001) and of successful ones (two samples, trun 0x301, or
+# 0x201 when 1024), recorded as scalar ticks only.
+OBSERVED_FAILED = (1197, 1393, 1120, 1120, 1160, 1475, 1417, 1487, 1259, 1090, 1184, 1339, 1197, 1467,
+                   1100, 1519, 1388, 1172, 1284, 1172, 1084, 1255, 1428)
+OBSERVED_OK = (1025, 1024, 1008, 1085, 985, 1076, 1049, 924, 825, 1144, 954, 1037, 995, 1090, 847, 1170, 1044,
+               1062, 1054, 1247, 1223, 1109, 1075, 1045, 1031)
+
+
+def previous_rule():
+    """The same module source with only the tfhd-default admission reverted."""
+    text = Path(R.__file__).read_text()
+    if text.count(FIX) != 1:
+        raise AssertionError('tfhd-default admission expression changed; re-review this test')
+    name = 'media_ring_previous_rule'
+    module = types.ModuleType(name)
+    module.__file__ = '<%s>' % name
+    sys.modules[name] = module
+    try:
+        exec(compile(text.replace(FIX, 'flags & 0x100'), module.__file__, 'exec'), module.__dict__)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+A = previous_rule()
+
+
+# ---------------------------------------------------------------------------------------- BMFF builders
+def box(k, b=b''):
+    return struct.pack('>I4s', 8 + len(b), k) + b
+
+
+def full(k, b=b'', flags=0, version=0):
+    return box(k, bytes([version]) + flags.to_bytes(3, 'big') + b)
+
+
+def words(*values):
+    return struct.pack('>' + 'I' * len(values), *values)
+
+
+def nal(kind, n=6):
+    unit = bytes([kind << 1, 1]) + b'x' * n
+    return words(len(unit)) + unit
+
+
+def init_bytes(trex_audio_duration=0):
+    """ftyp + moov: HEVC Main 3840x2160 (timescale 15360) + AAC-LC 48 kHz stereo, empty_moov dialect."""
+    ftyp = box(b'ftyp', b'iso5' + words(512) + b'iso6mp41')
+    h = bytearray(23)
+    h[0] = 1; h[1] = 1; h[12] = 153; h[16] = 0xfd; h[17] = 0xf8; h[18] = 0xf8; h[21] = 3; h[22] = 3
+    for kind in (32, 33, 34):
+        h += bytes([128 | kind]) + b'\0\1\0\3' + bytes([kind << 1, 1, 0])
+    tracks = []
+    for ident, typ in ((1, b'vide'), (2, b'soun')):
+        tk = bytearray(80); tk[8:12] = words(ident)
+        md = bytearray(20); md[8:12] = words(VIDEO_SCALE if typ == b'vide' else 48000)
+        hd = words(0) + typ + b'\0' * 12
+        if typ == b'vide':
+            se = bytearray(78); se[6:8] = b'\0\1'; se[24:28] = struct.pack('>HH', 3840, 2160)
+            se = box(b'hvc1', bytes(se) + box(b'hvcC', bytes(h))); hdr = full(b'vmhd', b'\0' * 8, 1)
+        else:
+            se = bytearray(28); se[6:8] = b'\0\1'; se[16:20] = struct.pack('>HH', 2, 16); se[24:28] = words(48000 << 16)
+            asc = b'\x05\x02\x11\x90'
+            dc = b'\x04' + bytes([13 + len(asc)]) + b'\x40\x15' + b'\0' * 11 + asc
+            es = b'\x03' + bytes([3 + len(dc) + 3]) + b'\0\x02\0' + dc + b'\x06\x01\x02'
+            se = box(b'mp4a', bytes(se) + full(b'esds', es)); hdr = full(b'smhd', b'\0' * 4)
+        st = full(b'stsd', words(1) + se) + full(b'stts', words(0)) + full(b'stsc', words(0))
+        st += full(b'stsz', words(0, 0)) + full(b'stco', words(0))
+        dr = full(b'dref', words(1) + full(b'url ', b'', 1))
+        mi = box(b'minf', hdr + box(b'dinf', dr) + box(b'stbl', st))
+        tracks.append(box(b'trak', full(b'tkhd', bytes(tk), 3) + box(b'mdia', full(b'mdhd', bytes(md)) +
+                                                                  full(b'hdlr', hd) + mi)))
+    trex = full(b'trex', words(1, 1, 0, 0, 0)) + full(b'trex', words(2, 1, trex_audio_duration, 0, 0))
+    return ftyp, box(b'moov', full(b'mvhd', b'\0' * 96) + b''.join(tracks) + box(b'mvex', trex))
+
+
+def traf(ident, start, durations, sizes, sample_flags, data_offset, *, explicit=False, tfhd_duration=True):
+    """One traf the way movenc.c writes it: tfhd defaults = sample 0's values; per-sample trun fields only
+    when some sample differs (explicit=True forces trun 0x100 like a varied fragment would)."""
+    tf_flags = 0x020000 | 0x10 | 0x20 | (0x08 if tfhd_duration else 0)
+    default_flags = sample_flags[1] if len(sample_flags) > 1 else sample_flags[0]
+    if ident == 2:
+        default_flags = sample_flags[0]
+    body = words(ident) + (words(durations[0]) if tfhd_duration else b'') + words(sizes[0], default_flags)
+    tfhd = full(b'tfhd', body, tf_flags)
+    tfdt = full(b'tfdt', struct.pack('>Q', start), version=1)
+    flags = 0x001
+    if explicit or any(d != durations[0] for d in durations):
+        flags |= 0x100
+    if any(s != sizes[0] for s in sizes):
+        flags |= 0x200
+    first = None
+    if sample_flags[0] != default_flags and all(f == default_flags for f in sample_flags[1:]):
+        flags |= 0x004
+        first = sample_flags[0]
+    elif any(f != default_flags for f in sample_flags):
+        flags |= 0x400
+    raw = words(len(durations)) + struct.pack('>i', data_offset)
+    if first is not None:
+        raw += words(first)
+    for d, s, f in zip(durations, sizes, sample_flags):
+        if flags & 0x100:
+            raw += words(d)
+        if flags & 0x200:
+            raw += words(s)
+        if flags & 0x400:
+            raw += words(f)
+    return box(b'traf', tfhd + tfdt + full(b'trun', raw, flags))
+
+
+def pair(seq=1, *, video=(256, 256), audio=(1265,), vd=0, ad=0, sync=True, explicit=False, tfhd_duration=True,
+         aflags=AAC_SYNC, video_explicit=False):
+    """(moof, mdat) with a video traf (track 1) then an audio traf (track 2); None omits a track."""
+    rows = []
+    if video is not None:
+        units = [nal(19 if sync and i == 0 else 1, 6 + 3 * i) for i in range(len(video))]
+        vflags = [AAC_SYNC if sync and i == 0 else VIDEO_NONSYNC for i in range(len(video))]
+        rows.append((1, vd, list(video), units, vflags, video_explicit, True))
+    if audio is not None:
+        units = [bytes([0x21, 0x10 + i]) + b'a' * (5 + i) for i in range(len(audio))]
+        rows.append((2, ad, list(audio), units, [aflags] * len(audio), explicit, tfhd_duration))
+
+    def build(offsets):
+        parts = [traf(i, start, durs, [len(u) for u in units], fl, offsets.get(i, 0), explicit=ex, tfhd_duration=td)
+                 for i, start, durs, units, fl, ex, td in rows]
+        return box(b'moof', full(b'mfhd', words(seq)) + b''.join(parts))
+    moof = build({})
+    offsets, pos = {}, len(moof) + 8
+    for i, _, _, units, _, _, _ in rows:
+        offsets[i] = pos
+        pos += sum(map(len, units))
+    return build(offsets), box(b'mdat', b''.join(u for row in rows for u in row[3]))
+
+
+def trun_flags(moof, ident):
+    p = moof.index(b'traf')
+    while True:
+        tfhd = moof.index(b'tfhd', p)
+        if struct.unpack_from('>I', moof, tfhd + 8)[0] == ident:
+            t = moof.index(b'trun', tfhd)
+            return int.from_bytes(moof[t + 5:t + 8], 'big')
+        p = tfhd + 4
+
+
+def outcome(mod, init, moof, mdat, index=0, sequence=1, prior=None, terminal=False):
+    try:
+        f = mod.parse_fragment(init, moof, mdat, index, sequence, dict(prior or {}), _terminal_candidate=terminal)
+    except mod.MediaError as e:
+        return ('error', str(e))
+    return ('ok', f.index, f.sequence, f.start, f.end, f.access_point, f.decode_ends, f.terminal_audio_trim,
+            f.initial_audio_trim, f.track_spans, f.moof == moof and f.mdat == mdat)
+
+
+class Shape(unittest.TestCase):
+    """The builder reproduces the observed FFmpeg numeric shapes."""
+    def test_single_sample_is_trun_0x001_and_two_varied_is_0x301(self):
+        m, d = pair(audio=(1265,))
+        self.assertEqual(trun_flags(m, 2), 0x001)
+        self.assertEqual(trun_flags(m, 1), 0x205)
+        m, d = pair(audio=(1265, 1024))
+        self.assertEqual(trun_flags(m, 2), 0x301)
+        m, d = pair(audio=(1024, 1024))
+        self.assertEqual(trun_flags(m, 2), 0x201)
+        m, d = pair(seq=2, vd=512, ad=1265, sync=False, audio=(1024,))
+        self.assertEqual((trun_flags(m, 1), trun_flags(m, 2)), (0x201, 0x001))
+        for mod in (R, A):
+            init = mod.parse_init(*init_bytes())
+            self.assertEqual([(t.ident, t.kind, t.scale) for t in init.tracks], [(1, 'video', VIDEO_SCALE), (2, 'audio', 48000)])
+
+
+class Positive(unittest.TestCase):
+    def setUp(self):
+        self.init = R.parse_init(*init_bytes())
+        self.ainit = A.parse_init(*init_bytes())
+
+    def test_single_first_sample_via_tfhd_default_1265(self):
+        moof, mdat = pair(audio=(1265,))
+        f = R.parse_fragment(self.init, moof, mdat, 0, 1, {})
+        self.assertEqual((f.moof, f.mdat), (moof, mdat))
+        self.assertEqual(dict(f.decode_ends), {1: 512, 2: 1265})
+        self.assertEqual(f.track_spans, ((1, 0, 512), (2, 0, 1265)))
+        self.assertEqual((f.start, f.end), (Fraction(0), Fraction(512, VIDEO_SCALE)))
+        self.assertTrue(f.access_point)
+        self.assertFalse(f.initial_audio_trim or f.terminal_audio_trim)  # an extension is not a trim
+        with self.assertRaisesRegex(A.MediaError, '^AUDIO_SAMPLE_FLAGS_OR_DURATION$'):
+            A.parse_fragment(self.ainit, moof, mdat, 0, 1, {})  # the previous refusal
+
+    def test_single_first_sample_via_tfhd_default_943(self):
+        moof, mdat = pair(audio=(943,))
+        for terminal in (False, True):
+            f = R.parse_fragment(self.init, moof, mdat, 0, 1, {}, _terminal_candidate=terminal)
+            self.assertEqual(dict(f.decode_ends), {1: 512, 2: 943})
+            self.assertTrue(f.initial_audio_trim)          # short first keeps its existing meaning
+            self.assertFalse(f.terminal_audio_trim)        # and is never terminal authority
+            with self.assertRaisesRegex(A.MediaError, '^AUDIO_SAMPLE_FLAGS_OR_DURATION$'):
+                A.parse_fragment(self.ainit, moof, mdat, 0, 1, {}, _terminal_candidate=terminal)
+
+    def test_two_samples_with_0x100_unchanged(self):
+        for first in (1265, 943, 825, 1669, 1024):
+            moof, mdat = pair(audio=(first, 1024))
+            self.assertEqual(trun_flags(moof, 2), 0x301 if first != 1024 else 0x201)
+            got = outcome(R, self.init, moof, mdat)
+            self.assertEqual(got[0], 'ok', (first, got))
+            self.assertEqual(got, outcome(A, self.ainit, moof, mdat), first)
+            self.assertEqual(dict(got[6]), {1: 512, 2: first + 1024})
+
+    def test_every_observed_failed_start_is_now_admitted(self):
+        for dur in OBSERVED_FAILED:
+            moof, mdat = pair(audio=(dur,))
+            self.assertEqual(trun_flags(moof, 2), 0x001)
+            self.assertEqual(outcome(R, self.init, moof, mdat)[0], 'ok', dur)
+            self.assertEqual(outcome(A, self.ainit, moof, mdat), ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'), dur)
+
+    def test_every_observed_successful_start_still_admitted_identically(self):
+        for dur in OBSERVED_OK:
+            moof, mdat = pair(audio=(dur, 1024))
+            got = outcome(R, self.init, moof, mdat)
+            self.assertEqual(got[0], 'ok', dur)
+            self.assertEqual(got, outcome(A, self.ainit, moof, mdat), dur)
+
+    def test_whole_bound_1_to_2047(self):
+        for dur in (1, 2, 512, 825, 1023, 1024, 1025, 1669, 2046, 2047):
+            got = outcome(R, self.init, *pair(audio=(dur,)))
+            self.assertEqual(got[0], 'ok', dur)
+            self.assertEqual(got[8], dur < 1024, dur)  # initial_audio_trim only when shortened
+
+    def test_private_video_prefix_then_single_default_audio(self):
+        # Video-only fragment 0 stays private; audio starts at DTS 0 in fragment 1 (prior has no audio clock).
+        r = R.MediaRing('a' * 32, clock=lambda: 0.0)
+        r.initialize(*init_bytes())
+        first = pair(1, audio=None)
+        second = pair(2, vd=512, sync=False, audio=(1265,))
+        r.append(*first)
+        self.assertEqual((r.next_index, r.prior), (0, {}))
+        r.append(*second)
+        self.assertEqual((r.next_index, r.prior), (2, {1: 1024, 2: 1265}))
+        self.assertTrue(r.bootstrap_seen)
+        cur = r.resume().cursor
+        got = []
+        while True:
+            x = r.read(cur)
+            if x is None:
+                break
+            got.append((x[0].moof, x[0].mdat))
+            cur = x[1]
+        self.assertEqual(got, [first, second])
+
+    def test_ring_and_producer_end_to_end(self):
+        frags = [pair(1, audio=(1265,))]
+        ad, vd = 1265, 512
+        for seq in range(2, 9):
+            audio = (1024,) if seq % 2 else (1024, 1024)
+            frags.append(pair(seq, vd=vd, ad=ad, sync=(seq == 5), audio=audio))
+            ad += 1024 * len(audio)
+            vd += 512
+        raw = b''.join(init_bytes()) + b''.join(a + b for a, b in frags)
+        r = R.MediaRing('b' * 32, clock=lambda: 0.0)
+        p = R.Producer(r, io.BytesIO(raw).read)
+        steps = []
+        while True:
+            steps.append(p.step())
+            if steps[-1] == 'end':
+                break
+        self.assertEqual(steps, ['init'] + ['fragment'] * len(frags) + ['end'])
+        snap = r.snapshot()
+        self.assertEqual((snap['error'], snap['nextIndex'], snap['ended'], snap['avBootstrapSeen']),
+                         (None, len(frags), True, True))
+        self.assertFalse(snap['initialAudioTrim'] or snap['terminalAudioTrim'])
+        self.assertEqual(r.prior, {1: vd, 2: ad})
+        cur = r.resume(latest=False).cursor
+        out = []
+        while (x := r.read(cur)) is not None:
+            out.append((x[0].moof, x[0].mdat))
+            cur = x[1]
+        self.assertEqual(out, frags)  # bytes untouched
+        # Control: the previous rule ends the epoch on the very first pair.
+        ra = A.MediaRing('b' * 32, clock=lambda: 0.0)
+        pa = A.Producer(ra, io.BytesIO(raw).read)
+        self.assertEqual(pa.step(), 'init')
+        with self.assertRaisesRegex(A.MediaError, '^AUDIO_SAMPLE_FLAGS_OR_DURATION$'):
+            pa.step()
+        self.assertEqual((ra.snapshot()['error'], ra.next_index), ('AUDIO_SAMPLE_FLAGS_OR_DURATION', 0))
+
+
+class Negative(unittest.TestCase):
+    """Same single-sample tfhd-default duration, with any one bound of the allowance broken."""
+    def setUp(self):
+        self.init = R.parse_init(*init_bytes())
+
+    def refused(self, init, moof, mdat, **kw):
+        """Refused by the new rule with the same code as by the previous rule."""
+        self.assertIs(init, self.init)
+        got = outcome(R, init, moof, mdat, **kw)
+        self.assertEqual(got, ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'))
+        self.assertEqual(outcome(A, A.parse_init(*init_bytes()), moof, mdat, **kw), got)
+
+    def test_begin_not_zero(self):
+        for ad in (1, 1024, 1265):
+            self.refused(self.init, *pair(audio=(1265,), ad=ad))
+            self.refused(self.init, *pair(audio=(943,), ad=ad))
+
+    def test_audio_already_in_prior(self):
+        for prior in ({2: 0}, {1: 0, 2: 0}):
+            self.refused(self.init, *pair(audio=(1265,)), prior=prior)
+            self.refused(self.init, *pair(audio=(943,)), prior=prior)
+
+    def test_duration_2048_or_more(self):
+        for dur in (2048, 2049, 4095, 48000, 96000):
+            self.refused(self.init, *pair(audio=(dur,)))
+        for dur in (96001, 2 ** 32 - 1):  # beyond 2 s per sample: refused even earlier
+            self.assertEqual(outcome(R, self.init, *pair(audio=(dur,))), ('error', 'SAMPLE_FIELDS'))
+
+    def test_zero_duration(self):
+        self.assertEqual(outcome(R, self.init, *pair(audio=(0,))), ('error', 'SAMPLE_FIELDS'))
+
+    def test_scale_not_48000(self):
+        # parse_init already refuses a non-48 kHz AAC track (AUDIO_FORMAT); the allowance's own scale bound is
+        # checked with a hand-built Init around the same fragment.
+        moof, mdat = pair(audio=(1265,))
+        for scale, ok in ((48000, True), (44100, False), (96000, False), (24000, False)):
+            for mod in (R, A):
+                init = mod.Init(b'', (mod.Track(1, 'video', VIDEO_SCALE, 0, 0, 0), mod.Track(2, 'audio', scale, 0, 0, 0)))
+                got = outcome(mod, init, moof, mdat)
+                if mod is R and ok:
+                    self.assertEqual(got[0], 'ok')
+                else:
+                    self.assertEqual(got, ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'), (mod.__name__, scale))
+
+    def test_wrong_sample_flags(self):
+        for aflags in (0x01010000, 0, 0x02010000, 0x00010000, 0x02000001):
+            self.refused(self.init, *pair(audio=(1265,), aflags=aflags))
+            self.refused(self.init, *pair(audio=(1024,), aflags=aflags))  # flags are checked for 1024 too
+
+    def test_non_first_fragment(self):
+        # Audio already started (published clock): a later single default-only non-1024 sample is refused,
+        # whether parsed directly or appended to a live ring, and the ring does not advance.
+        self.refused(self.init, *pair(2, vd=512, ad=2048, sync=False, audio=(1265,)), index=1, sequence=2,
+                     prior={1: 512, 2: 2048})
+        r = R.MediaRing('c' * 32, clock=lambda: 0.0)
+        r.initialize(*init_bytes())
+        r.append(*pair(1, audio=(1024, 1024)))
+        before = (r.next_index, r.sequence, dict(r.prior), r.count, r.bytes)
+        self.assertEqual(before[:3], (1, 2, {1: 512, 2: 2048}))
+        with self.assertRaisesRegex(R.MediaError, '^AUDIO_SAMPLE_FLAGS_OR_DURATION$'):
+            r.append(*pair(2, vd=512, ad=2048, sync=False, audio=(1265,)))
+        self.assertEqual((r.next_index, r.sequence, dict(r.prior), r.count, r.bytes), before)
+        self.assertEqual(r.failed, 'AUDIO_SAMPLE_FLAGS_OR_DURATION')
+        # Also after a first fragment that itself used the new allowance.
+        r = R.MediaRing('d' * 32, clock=lambda: 0.0)
+        r.initialize(*init_bytes())
+        r.append(*pair(1, audio=(1265,)))
+        with self.assertRaisesRegex(R.MediaError, '^AUDIO_SAMPLE_FLAGS_OR_DURATION$'):
+            r.append(*pair(2, vd=512, ad=1265, sync=False, audio=(943,)))
+        self.assertEqual(r.next_index, 1)
+
+    def test_only_sample_index_0(self):
+        # Default-only (no 0x100) with two samples gives every sample the default: sample 1 is refused.
+        for dur in (943, 1265):
+            self.refused(self.init, *pair(audio=(dur, dur)))
+        # A varied (0x100) fragment whose non-first sample is off 1024 stays refused too.
+        for durs in ((1024, 1265), (1265, 1265), (1024, 943, 1024)):
+            self.refused(self.init, *pair(audio=durs))
+
+    def test_trex_default_never_qualifies(self):
+        # tfhd without 0x08: the duration falls back to trex. That source is NOT admitted.
+        for dur in (943, 1265):
+            init = R.parse_init(*init_bytes(trex_audio_duration=dur))
+            ainit = A.parse_init(*init_bytes(trex_audio_duration=dur))
+            moof, mdat = pair(audio=(dur,), tfhd_duration=False)
+            self.assertEqual(outcome(R, init, moof, mdat), ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'))
+            self.assertEqual(outcome(A, ainit, moof, mdat), ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'))
+            # ...while the same duration from trun 0x100 is admitted (existing behaviour).
+            moof, mdat = pair(audio=(dur,), tfhd_duration=False, explicit=True)
+            self.assertEqual(outcome(R, init, moof, mdat)[0], 'ok')
+            self.assertEqual(outcome(R, init, moof, mdat), outcome(A, ainit, moof, mdat))
+
+
+class Unchanged(unittest.TestCase):
+    """short_last still needs trun 0x100; video unchanged; and an exhaustive differential grid."""
+    def setUp(self):
+        self.init = R.parse_init(*init_bytes())
+        self.ainit = A.parse_init(*init_bytes())
+
+    def test_short_last_still_requires_0x100(self):
+        prior = {1: 512, 2: 2048}
+        # default-only single short sample at the end of the stream: refused (as before)
+        moof, mdat = pair(2, vd=512, ad=2048, sync=False, audio=(500,))
+        for mod, init in ((R, self.init), (A, self.ainit)):
+            self.assertEqual(outcome(mod, init, moof, mdat, 1, 2, prior, terminal=True),
+                             ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'))
+        # explicit 0x100: terminal trim candidate (as before)
+        moof, mdat = pair(2, vd=512, ad=2048, sync=False, audio=(500,), explicit=True)
+        got = outcome(R, self.init, moof, mdat, 1, 2, prior, terminal=True)
+        self.assertEqual(got[0], 'ok')
+        self.assertTrue(got[7])
+        self.assertEqual(got, outcome(A, self.ainit, moof, mdat, 1, 2, prior, terminal=True))
+        # and the startup case never becomes terminal authority, default-only or explicit
+        for explicit in (False, True):
+            got = outcome(R, self.init, *pair(audio=(500,), explicit=explicit), terminal=True)
+            self.assertEqual((got[0], got[7], got[8]), ('ok', False, True))
+
+    def test_video_unchanged(self):
+        # Video-side variations (audio absent or plain 1024): identical outcomes, accepted and refused alike.
+        cases = [pair(audio=(1024,)), pair(video=(256, 300, 256), audio=(1024,)), pair(video=(256,), audio=None),
+                 pair(sync=False, audio=None), pair(video=(256, 256), video_explicit=True, audio=None),
+                 pair(video=(20000,), audio=(1024,)), pair(video=(40000,), audio=(1024,)),
+                 pair(video=(256,), vd=7, audio=None)]
+        got = [outcome(R, self.init, moof, mdat) for moof, mdat in cases]
+        self.assertEqual(got, [outcome(A, self.ainit, moof, mdat) for moof, mdat in cases])
+        self.assertEqual([g[0] for g in got], ['ok'] * 6 + ['error', 'ok'])
+        # A sync-flag/NAL mismatch is still refused: an IDR sample flagged non-sync.
+        moof, mdat = pair(audio=None)
+        p = moof.index(b'trun', moof.index(b'traf'))
+        bad = moof[:p + 16] + struct.pack('>I', VIDEO_NONSYNC) + moof[p + 20:]  # type|ver+flags|count|offset|FIRST
+        for mod, init in ((R, self.init), (A, self.ainit)):
+            self.assertEqual(outcome(mod, init, bad, mdat), ('error', 'SYNC_FLAG_NAL_MISMATCH'))
+
+    def test_differential_grid_differs_only_on_the_admitted_case(self):
+        diffs = admitted = 0
+        grid = itertools.product(
+            (1, 943, 1023, 1024, 1025, 1265, 2047, 2048, 3000),     # first audio duration
+            (1, 2),                                                 # audio samples (2nd: 1024 if varied)
+            (False, True),                                          # trun 0x100 forced
+            (True, False),                                          # tfhd 0x08 present (else trex)
+            (0, 1024),                                              # audio tfdt
+            ('none', 'audio', 'video'),                             # prior clocks
+            (AAC_SYNC, VIDEO_NONSYNC),                              # audio sample flags
+            (False, True))                                          # terminal candidate
+        for dur, count, explicit, tfhd_dur, ad, prior_kind, aflags, terminal in grid:
+            audio = (dur,) if count == 1 else ((dur, 1024) if explicit else (dur, dur))
+            vd = 512 if prior_kind == 'video' else 0
+            prior = {'none': {}, 'audio': {1: vd, 2: ad}, 'video': {1: vd}}[prior_kind]
+            moof, mdat = pair(audio=audio, explicit=explicit, tfhd_duration=tfhd_dur, ad=ad, vd=vd, aflags=aflags,
+                              sync=prior_kind != 'video')
+            inits = (R.parse_init(*init_bytes(0 if tfhd_dur else dur)), A.parse_init(*init_bytes(0 if tfhd_dur else dur)))
+            new = outcome(R, inits[0], moof, mdat, prior=prior, terminal=terminal)
+            old = outcome(A, inits[1], moof, mdat, prior=prior, terminal=terminal)
+            expect_diff = (count == 1 and not explicit and tfhd_dur and ad == 0 and prior_kind != 'audio'
+                           and aflags == AAC_SYNC and 0 < dur < 2048 and dur != 1024)
+            key = (dur, count, explicit, tfhd_dur, ad, prior_kind, hex(aflags), terminal)
+            if expect_diff:
+                diffs += 1
+                self.assertEqual(old, ('error', 'AUDIO_SAMPLE_FLAGS_OR_DURATION'), key)
+                self.assertEqual(new[0], 'ok', key)
+                self.assertEqual((new[7], new[8]), (False, dur < 1024), key)
+            else:
+                self.assertEqual(new, old, key)
+                admitted += new[0] == 'ok'
+        self.assertEqual(diffs, 6 * 2 * 2)  # 6 durations x prior {none, video} x terminal {False, True}
+        self.assertGreater(admitted, 100)
+
+
+if __name__ == '__main__':
+    unittest.main()

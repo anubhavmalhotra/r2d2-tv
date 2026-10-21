@@ -1,0 +1,59 @@
+'use strict';
+// Actual viewer teardown with synthetic media APIs; no decoding or device calls.
+const assert=require('node:assert/strict'),fs=require('node:fs');
+const {fixture}=require('./viewer_fixture.js');
+const source=fs.readFileSync(process.env.VIEWER_SOURCE||__dirname+'/viewer.js','utf8');
+let groups=0;
+const privateError=()=>{const e=Error('private media diagnostic must not escape');e.name='InvalidStateError';throw e;};
+async function check(fault,trigger){
+  // Exercise the outer viewer's RTC cleanup boundary without an ICE/DTLS session.
+  const options={continual:true,bridge:true,frames:true};
+  if(fault==='rtc-close'){
+    assert(source.includes('rtcDisplay=null'));
+    options.source=source.replace('rtcDisplay=null',"rtcDisplay={close:function(){video.rtcCloseCalls=(video.rtcCloseCalls||0)+1;throw Error('private media diagnostic must not escape');}}");
+  }
+  const h=await fixture(options);await h.advance(100);
+  const media=h.view().media,sb=media.sb,calls={pause:0,abort:0,end:0,detach:0,remove:0,load:0,frame:0};
+  const originalPause=h.video.pause.bind(h.video),originalAbort=sb.abort.bind(sb),originalEnd=media.endOfStream.bind(media),originalFrame=h.video.cancelVideoFrameCallback;
+  let attached={owned:true};
+  Object.defineProperty(h.video,'srcObject',{get(){return attached;},set(value){calls.detach++;assert.equal(value,null);if(fault==='detach')privateError();attached=value;}});
+  h.video.pause=()=>{calls.pause++;if(fault==='pause')privateError();originalPause();};
+  sb.updating=true;sb.abort=()=>{calls.abort++;if(fault==='abort')privateError();originalAbort();};
+  media.endOfStream=()=>{calls.end++;if(fault==='end')privateError();originalEnd();};
+  h.video.removeAttribute=name=>{calls.remove++;assert.equal(name,'src');if(fault==='remove')privateError();};
+  h.video.load=()=>{calls.load++;if(fault==='load')privateError();};
+  h.video.cancelVideoFrameCallback=id=>{calls.frame++;if(fault==='frame')privateError();originalFrame(id);};
+  if(fault==='quality')h.video.getVideoPlaybackQuality=privateError;
+  if(fault==='buffered')Object.defineProperty(sb,'buffered',{get:privateError});
+  const stop=()=>{if(trigger==='close')h.endButton.click();else if(trigger==='pagehide')h.window.emit('pagehide');else{h.document.hidden=true;h.document.emit('visibilitychange');}};
+  assert.doesNotThrow(stop);
+  assert.deepEqual(calls,{pause:1,abort:1,end:1,detach:1,remove:1,load:1,frame:1});
+  assert(h.view().readerCancelled);assert(h.view().revoked);
+  if(fault!=='pause')assert(h.view().paused);
+  if(fault!=='detach')assert.equal(attached,null);
+  if(fault==='rtc-close')assert.equal(h.video.rtcCloseCalls,1);
+  // An operation that throws is attempted, never reported as a verified release.
+  assert.equal(h.nodes['state-panel'].hidden,false);
+  assert.equal(h.nodes['state-title'].textContent,trigger==='close'?'Browser closed':'Your browser connection stopped');
+  h.window.emit('pagehide');h.document.hidden=true;h.document.emit('visibilitychange');
+  assert.deepEqual(calls,{pause:1,abort:1,end:1,detach:1,remove:1,load:1,frame:1});
+  h.document.emit('keydown',{key:'ArrowLeft',preventDefault(){}});await h.advance(400);
+  assert(!h.posts.some(p=>p.url.endsWith('/input')));
+  assert(!JSON.stringify(h.posts).includes('private media diagnostic'));
+  const final=h.posts.filter(p=>p.url.endsWith('/metrics')&&p.value.final);
+  assert.equal(final.length,['quality','buffered'].includes(fault)?0:1);
+  if(trigger==='close'){
+    assert.equal(h.posts.filter(p=>p.url.endsWith('/end')).length,1);
+    assert.equal(h.bridgeCalls.length,1);
+    assert.equal(h.bridgeView.closed,1);
+  }
+  groups++;console.log('PASS cleanup '+trigger+' '+fault);
+}
+async function run(selected){
+  if(selected&&selected.length){assert.equal(selected.length,2);assert(['none','quality','buffered'].includes(selected[0]));assert(['hidden','pagehide','close'].includes(selected[1]));await check(selected[0],selected[1]);console.log(JSON.stringify({groups,actualViewer:true,syntheticMedia:true,deviceCalls:0}));return;}
+  for(const fault of ['none','quality','buffered','rtc-close','frame','pause','abort','end','detach','remove','load'])await check(fault,'hidden');
+  for(const trigger of ['pagehide','close'])for(const fault of ['quality','buffered'])await check(fault,trigger);
+  console.log(JSON.stringify({groups,actualViewer:true,syntheticMedia:true,deviceCalls:0}));
+}
+module.exports={run};
+if(require.main===module)run(process.argv.slice(2)).catch(error=>{console.error(error);process.exitCode=1;});

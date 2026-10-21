@@ -1,0 +1,104 @@
+"""Closed media profiles and HEVC init-segment level inspection for 4K60 and 4K120."""
+from dataclasses import dataclass
+import struct
+import media_ring as mr
+
+
+@dataclass(frozen=True)
+class MediaProfile:
+    name: str
+    codec_string: str
+    width: int
+    height: int
+    fps: int
+    level_idc: int
+    timescale: int
+    frame_duration_ticks: int
+
+
+PROFILE_4K60_HEVC = MediaProfile(
+    name='4k60_hevc',
+    codec_string='hvc1.1.6.L153.B0',
+    width=3840,
+    height=2160,
+    fps=60,
+    level_idc=153,
+    timescale=90000,
+    frame_duration_ticks=1500,
+)
+
+PROFILE_4K120_HEVC = MediaProfile(
+    name='4k120_hevc',
+    codec_string='hvc1.1.6.L156.B0',
+    width=3840,
+    height=2160,
+    fps=120,
+    level_idc=156,
+    timescale=90000,
+    frame_duration_ticks=750,
+)
+
+PROFILE_4K60_AVC = MediaProfile(
+    name='4k60_avc',
+    codec_string='avc1.640033',
+    width=3840,
+    height=2160,
+    fps=60,
+    level_idc=51,
+    timescale=90000,
+    frame_duration_ticks=1500,
+)
+
+PROFILES_BY_NAME = {
+    PROFILE_4K60_HEVC.name: PROFILE_4K60_HEVC,
+    PROFILE_4K120_HEVC.name: PROFILE_4K120_HEVC,
+    PROFILE_4K60_AVC.name: PROFILE_4K60_AVC,
+}
+
+PROFILES_BY_CODEC = {
+    PROFILE_4K60_HEVC.codec_string: PROFILE_4K60_HEVC,
+    PROFILE_4K120_HEVC.codec_string: PROFILE_4K120_HEVC,
+    PROFILE_4K60_AVC.codec_string: PROFILE_4K60_AVC,
+}
+
+HEVC_PROFILES_BY_LEVEL = {
+    153: PROFILE_4K60_HEVC,
+    156: PROFILE_4K120_HEVC,
+}
+
+
+def profile_for_name(name):
+    if type(name) is not str or name not in PROFILES_BY_NAME:
+        raise ValueError('UNSUPPORTED_MEDIA_PROFILE')
+    return PROFILES_BY_NAME[name]
+
+
+def profile_for_codec(codec_string):
+    if type(codec_string) is not str or codec_string not in PROFILES_BY_CODEC:
+        raise ValueError('UNSUPPORTED_CODEC_STRING')
+    return PROFILES_BY_CODEC[codec_string]
+
+
+def inspect_init_profile(ftyp, moov):
+    """Validate an ftyp+moov init pair and return its negotiated HEVC MediaProfile."""
+    mr.parse_init(ftyp, moov, allowed_levels=(153, 156))
+    rows = mr.boxes(mr.plain_box(moov, b'moov'))
+    for _, raw_trak in (r for r in rows if r[0] == b'trak'):
+        trak = mr.boxes(raw_trak)
+        mdia = mr.boxes(mr.one(trak, b'mdia'))
+        _, _, hdlr = mr.full(mr.one(mdia, b'hdlr'))
+        if bytes(hdlr[4:8]) != b'vide':
+            continue
+        minf = mr.boxes(mr.one(mdia, b'minf'))
+        stbl = mr.boxes(mr.one(minf, b'stbl'))
+        _, _, stsd = mr.full(mr.one(stbl, b'stsd'))
+        entries = mr.boxes(stsd[4:])
+        _, sample_entry = entries[0]
+        width, height = struct.unpack_from('>HH', sample_entry, 24)
+        mr.require((width, height) == (3840, 2160), 'VIDEO_DIMENSIONS')
+        children = mr.boxes(sample_entry[78:])
+        raw_hvcc = bytes(mr.one(children, b'hvcC'))
+        level_idc = raw_hvcc[12]
+        mr.require(level_idc in HEVC_PROFILES_BY_LEVEL, 'HVCC_PROFILE')
+        return HEVC_PROFILES_BY_LEVEL[level_idc]
+    raise mr.MediaError('TRACK_KINDS')

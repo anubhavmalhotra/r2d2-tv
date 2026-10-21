@@ -1,0 +1,104 @@
+"""GPL-3.0-or-later. Source-only adapter for a NEW PrivateProfile before launch.
+
+Does not create a browser, read personal profiles, set global policy, or enable
+anything in an existing session. Errors leave files solely in the caller's owned
+tree; the existing PrivateProfile cleanup is mandatory on every failure path.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+from private_profile import fresh_preferences
+
+ROOT=Path(__file__).resolve().parent
+RUNTIME=Path('/run/user/1000/snap.chromium')
+UID=1000
+BUNDLE_SHA='c9db61de58e4b1cb91caf2ad72bff2487b8995999bcaa511dd62b9208026a94b'
+FILES={'manifest.json','LICENSE','NOTICE.txt','cosmetic.css','popup_guard.js','proof.html','proof.js',
+       'rules/easylist.json','rules/easyprivacy.json','rules/ublock-badware.json','generic.css','rules/lg-policy.json'}
+
+class StageError(RuntimeError): pass
+
+def regular(path, maximum):
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        before=os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1 or before.st_size>maximum:
+            raise StageError('STAGE_REGULAR')
+        data=os.read(fd,maximum+1);after=os.fstat(fd)
+        if len(data)!=before.st_size or (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns):
+            raise StageError('STAGE_READ_CHANGED')
+        return data
+    finally: os.close(fd)
+
+def directory(path):
+    s=path.lstat()
+    if not stat.S_ISDIR(s.st_mode) or s.st_uid!=UID or stat.S_IMODE(s.st_mode)!=0o700:
+        raise StageError('STAGE_DIRECTORY')
+    return s
+
+def create(path,data,mode=0o400):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
+    try:
+        os.fchmod(fd,mode)
+        offset=0
+        while offset<len(data):
+            n=os.write(fd,data[offset:])
+            if n<=0:raise StageError('STAGE_WRITE')
+            offset+=n
+    finally:os.close(fd)
+
+class Prepared:
+    def __init__(self,profile,extension,prefs_hash,bundle):
+        self.profile=profile;self.extension=extension;self.prefs_hash=prefs_hash;self.bundle=bundle;self.used=False
+    def launch(self,args):
+        if self.used:raise StageError('STAGE_LAUNCH_REPLAY')
+        self.used=True
+        if type(args) not in (list,tuple) or not all(type(x)is str for x in args):raise StageError('STAGE_ARGS')
+        if any(x.startswith(('--load-extension','--disable-extensions','--disable-web-security','--no-sandbox','--safebrowsing-disable')) for x in args):
+            raise StageError('STAGE_FLAG_CONFLICT')
+        if hashlib.sha256(regular(self.profile.path/'profile/Default/Preferences',65536)).hexdigest()!=self.prefs_hash:
+            raise StageError('STAGE_PREFS_CHANGED')
+        for name,item in self.bundle['files'].items():
+            if hashlib.sha256(regular(self.extension/name,5000000)).hexdigest()!=item['sha256']:
+                raise StageError('STAGE_PAYLOAD_CHANGED')
+        return self.profile.launch(['--load-extension='+str(self.extension)]+list(args))
+    def evidence(self):
+        return {'staged':True,'incognitoRequested':True,'nativeActivationProved':False,'globalPolicyChanged':False,'popupDefaultBlockRequested':True}
+
+def prepare(profile):
+    if os.getuid()!=UID or profile.removed or profile.mount.get('fstype')!='tmpfs':raise StageError('STAGE_PROFILE')
+    if (profile.path!=RUNTIME/profile.name or not re.fullmatch('baaz-private-[a-f0-9]{16}',profile.name)
+        or os.path.realpath(RUNTIME)!=str(RUNTIME)):raise StageError('STAGE_PATH')
+    directory(RUNTIME)
+    base=os.fstat(profile.basefd);path=RUNTIME.stat()
+    if (base.st_dev,base.st_ino)!=(path.st_dev,path.st_ino):raise StageError('STAGE_BASEFD')
+    own=directory(profile.path);old=profile.identity
+    if (own.st_dev,own.st_ino,own.st_uid)!=(old.st_dev,old.st_ino,UID):raise StageError('STAGE_IDENTITY')
+    directory(profile.path/'profile');directory(profile.path/'profile/Default')
+    preferences=profile.path/'profile/Default/Preferences'
+    original=regular(preferences,65536)
+    expected=fresh_preferences(profile.path)
+    if json.loads(original)!=expected:raise StageError('STAGE_NOT_FRESH')
+    raw=regular(ROOT/'bundle-pins.json',65536)
+    if hashlib.sha256(raw).hexdigest()!=BUNDLE_SHA:raise StageError('STAGE_BUNDLE_PIN')
+    bundle=json.loads(raw)
+    if set(bundle)!= {'schema','extensionId','files'} or bundle['schema']!=1 or set(bundle['files'])!=FILES or not re.fullmatch('[a-p]{32}',bundle['extensionId']):raise StageError('STAGE_BUNDLE')
+    payload={}
+    for name,item in bundle['files'].items():
+        data=regular(ROOT/'extension'/name,5000000)
+        if len(data)!=item['bytes'] or hashlib.sha256(data).hexdigest()!=item['sha256']:raise StageError('STAGE_BUNDLE_FILE')
+        payload[name]=data
+    if sum(map(len,payload.values()))>5000000:raise StageError('STAGE_BUNDLE_SIZE')
+    target=profile.path/'protection';target.mkdir(mode=0o700);(target/'rules').mkdir(mode=0o700)
+    for name,data in payload.items():create(target/name,data)
+    expected['extensions']={'settings':{bundle['extensionId']:{'incognito':True}}}
+    expected['profile']={'default_content_setting_values':{'popups':2}}
+    fresh=(json.dumps(expected,sort_keys=True)+'\n').encode()
+    temp=preferences.with_name('Preferences.r2d2-new')
+    create(temp,fresh,0o600)
+    if regular(preferences,65536)!=original:raise StageError('STAGE_PREFS_RACE')
+    os.replace(temp,preferences)
+    return Prepared(profile,target,hashlib.sha256(fresh).hexdigest(),bundle)

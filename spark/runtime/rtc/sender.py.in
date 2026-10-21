@@ -1,0 +1,484 @@
+"""Inert source-ready LAN WebRTC sender. Native work requires explicit start().
+First target: public 1080p60 synthetic H264 NVENC/Opus fixture, finite lifetime.
+No browser launch, profile changes, installation, public ICE or device capture.
+"""
+import http.server
+import json
+import secrets
+import socket
+import socketserver
+import threading
+import time
+from .signal_protocol import canonical,inspect_sdp,ipv4,need,sign,verify
+from .media_source import Latest,Nvenc,Synthetic
+from .ice_binding import checked_ice,bind_local_ip,empty_optional_string
+from .receiver_result import verify_result
+from .page_stage import verify as verify_stage
+
+def load_gst(codec='H264'):
+    import gi
+    gi.require_version('Gst','1.0');gi.require_version('GstWebRTC','1.0');gi.require_version('GstSdp','1.0')
+    from gi.repository import Gst,GstWebRTC,GstSdp,GLib
+    Gst.init(None)
+    for name in ('appsrc','queue','capsfilter',* (('av1parse','rtpav1pay') if codec=='AV1' else ('h264parse','rtph264pay')),'webrtcbin','audioconvert','audioresample','opusenc','rtpopuspay','nicesrc','nicesink'):
+        need(Gst.ElementFactory.find(name),'MISSING_GST_FACTORY')
+    return Gst,GstWebRTC,GstSdp,GLib
+
+class Sender:
+    def __init__(self,owner,source,guard,sender_ip,receiver_ip,port,env=None,duration=120,max_restarts=2,codec='H264'):
+        need(callable(guard) and guard() is True,'OWNER_GUARD')
+        need(type(port)is int and 1024<=port<=65535 and type(duration)is int and 10<=duration<=315360000,'TRIAL_BOUND')
+        self.sender_ip=ipv4(sender_ip);self.receiver_ip=ipv4(receiver_ip);need(sender_ip!=receiver_ip,'PEER_IDENTITY')
+        need(codec in ('H264','AV1','VP9'),'VIDEO_CODEC');self.codec=codec
+        if codec=='AV1':need((source.width,source.height)==(3840,2160),'AV1_4K_REQUIRED')
+        self.receiver_av1_format=None;self.receiver_vp9_format=None
+        if codec=='VP9':need((source.width,source.height)==(3840,2160),'VP9_4K_REQUIRED')
+        self.owner=owner;self.source=source;self.guard=guard;self.port=port;self.env=env;self.duration=duration
+        self.attempt=secrets.token_hex(32);self.key=secrets.token_bytes(32);self.offer=None;self.answer_taken=False
+        self.stop=threading.Event();self.offer_ready=threading.Event();self.lock=threading.RLock();self.started=False
+        self.rtp_pads=[];self.pipeline=None;self.loop=None;self.server=None;self.encoder=None;self.threads=[];self.audio_raw=Latest()
+        self.video_count=0;self.audio_count=0;self.pli_count=0;self.error=None;self.negotiating=False;self.max_restarts=max_restarts
+        self.close_lock=threading.RLock();self.closed=False;self.cleanup_thread=None
+        self.receiver_format=None
+        self.page_stages={};self.page_boot_ack_time=None;self.receiver_http={'offerServed':False,'answerAttempted':False,'answerAccepted':False,'answerRejected':False,'resultAttempted':False,'resultAccepted':False,'resultRejected':False,'socketAccepted':False,'socketPeerRejected':False,'requestPeerRejected':False,'originRejected':False,'hostRejected':False,'headersRejected':False,'phaseRejected':False,'pathRejected':False,'pageStageAckWritten':False}
+        self.offer_progress={'offerPromiseState':None,'offerReplyKind':None,'localPromiseState':None,'localDescriptionApplied':False}
+        self.offer_promises=[]
+        self.receiver_result=None;self.result_taken=False;self.result_ready=threading.Event();self.peer_stopped_at=None;self.connection_ready=False;self.pending_keyframe_request=False
+    def fail(self,code):
+        if self.error is None:self.error=code
+        self._request_stop()
+    def _request_stop(self):
+        self.stop.set();self.offer_ready.set()
+        if self.loop:self.loop.quit()
+        with self.lock:
+            if self.started and self.cleanup_thread is None:
+                def cleanup():
+                    try:self.close()
+                    except BaseException:self.error='CLEANUP_UNRESOLVED'
+                self.cleanup_thread=threading.Thread(target=cleanup,daemon=True);self.cleanup_thread.start()
+    def _element(self,factory,name,**properties):
+        element=self.Gst.ElementFactory.make(factory,name);need(element is not None,'GST_ELEMENT')
+        for key,value in properties.items():element.set_property(key.replace('_','-'),value)
+        self.pipeline.add(element);return element
+    def _configure_ice(self):
+        from gi.repository import GObject
+        for name in ('stun-server','turn-server','http-proxy'):
+            need(self.webrtc.find_property(name),'ICE_PROPERTY');self.webrtc.set_property(name,None)
+            need(empty_optional_string(self.webrtc.get_property(name)),'PUBLIC_ICE_REFUSED')
+        ice=checked_ice(self.webrtc,self.Gst,self.WebRTC,GObject);need(ice.find_property('agent'),'NICE_BACKEND')
+        agent=ice.get_property('agent');need(agent and agent.find_property('upnp'),'UPNP_CONTROL')
+        agent.set_property('upnp',False);need(agent.get_property('upnp') is False,'UPNP_REFUSED')
+        ice.set_property('ice-tcp',False);ice.set_property('ice-udp',True)
+        need(ice.get_property('ice-tcp') is False and ice.get_property('ice-udp') is True,'ICE_UDP_ONLY')
+        for property_name,value in (('stun-server',None),('proxy-type',0),('proxy-ip',None)):
+            need(agent.find_property(property_name),'NICE_PROXY_CONTROL');agent.set_property(property_name,value)
+            observed=agent.get_property(property_name)
+            need(empty_optional_string(observed) if value is None else observed==value,'NICE_PROXY_REFUSED')
+        bind_local_ip(self.webrtc,ice,self.sender_ip,self.Gst,self.WebRTC,GObject)
+        self.ice=ice;self.nice=agent
+    def _link_rtp(self,pay):
+        pad=self.webrtc.request_pad_simple('sink_%u');need(pad,'WEBRTC_SINK_PAD')
+        need(pay.get_static_pad('src').link(pad)==self.Gst.PadLinkReturn.OK,'RTP_LINK')
+        self.rtp_pads.append(pad)
+        transceiver=pad.get_property('transceiver');need(transceiver,'TRANSCEIVER')
+        transceiver.set_property('direction',self.WebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
+    def _setup(self):
+        need(self.codec!='VP9','VP9_MEDIA_ADAPTER_REQUIRED')
+        self.Gst,self.WebRTC,self.Sdp,self.GLib=load_gst(self.codec);Gst=self.Gst
+        self.pipeline=Gst.Pipeline.new('owned-lan-webrtc')
+        self.webrtc=self._element('webrtcbin','peer',bundle_policy=self.WebRTC.WebRTCBundlePolicy.MAX_BUNDLE,latency=0)
+        self._configure_ice()
+        av1=self.codec=='AV1'
+        self.video=self._element('appsrc','video',is_live=True,format=Gst.Format.TIME,block=True,max_buffers=2,max_bytes=2097152,
+            caps=Gst.Caps.from_string('video/x-av1,stream-format=obu-stream,alignment=tu,width=3840,height=2160,framerate=60/1' if av1 else 'video/x-h264,stream-format=byte-stream,alignment=au'))
+        vq=self._element('queue','vqueue',max_size_buffers=2,max_size_bytes=2097152,max_size_time=0)
+        parse=self._element('av1parse','parse') if av1 else self._element('h264parse','parse',config_interval=-1)
+        pay=self._element('rtpav1pay','vpay',pt=96) if av1 else self._element('rtph264pay','vpay',pt=96,config_interval=-1,aggregate_mode=1)
+        format_caps='application/x-rtp,media=video,encoding-name=AV1,clock-rate=90000,payload=96,profile=(string)0,level-idx=(string)13,tier=(string)0' if av1 else 'application/x-rtp,media=video,encoding-name=H264,clock-rate=90000,payload=96,packetization-mode=(string)1'
+        vcaps=self._element('capsfilter','vcaps',caps=Gst.Caps.from_string(format_caps+',rtcp-fb-nack-pli=(boolean)true,rtcp-fb-ccm-fir=(boolean)true'))
+        need(self.video.link(vq) and vq.link(parse) and parse.link(pay) and pay.link(vcaps),'VIDEO_LINK');self._link_rtp(vcaps)
+        pay.get_static_pad('src').add_probe(Gst.PadProbeType.EVENT_UPSTREAM,self._feedback)
+        self.audio=self._element('appsrc','audio',is_live=True,format=Gst.Format.TIME,block=True,max_buffers=2,max_bytes=7680,
+            caps=Gst.Caps.from_string('audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2'))
+        aq=self._element('queue','aqueue',max_size_buffers=2,max_size_bytes=7680,max_size_time=0,leaky=2)
+        convert=self._element('audioconvert','convert');resample=self._element('audioresample','resample')
+        opus=self._element('opusenc','opus',bitrate=128000,frame_size=20,audio_type=2049)
+        apay=self._element('rtpopuspay','apay',pt=111)
+        chain=(self.audio,aq,convert,resample,opus,apay)
+        need(all(a.link(b)for a,b in zip(chain,chain[1:])),'AUDIO_LINK');self._link_rtp(apay)
+        self.webrtc.connect('notify::ice-gathering-state',self._gathered)
+        self.webrtc.connect('notify::connection-state',self._connection)
+        bus=self.pipeline.get_bus();bus.add_signal_watch();bus.connect('message',self._bus)
+        self.loop=self.GLib.MainLoop();self.pipeline.set_state(Gst.State.PLAYING)
+        state,current,_=self.pipeline.get_state(2*Gst.SECOND)
+        need(state!=Gst.StateChangeReturn.FAILURE and current==Gst.State.PLAYING,'PIPELINE_START')
+        self.zero=time.monotonic_ns()-(self.pipeline.get_clock().get_time()-self.pipeline.get_base_time())
+    def _feedback(self,pad,info):
+        event=info.get_event();structure=event.get_structure() if event else None
+        if structure and structure.get_name()=='GstForceKeyUnit':
+            self.pli_count+=1
+            if self.encoder:
+                if self.connection_ready:self.encoder.request_idr()
+                else:self.pending_keyframe_request=True
+        return self.Gst.PadProbeReturn.OK
+    def _bus(self,bus,message):
+        if message.type in (self.Gst.MessageType.ERROR,self.Gst.MessageType.EOS):self.fail('GST_PIPELINE_STOPPED')
+    def _connection(self,peer,spec):
+        self.connection_ready=peer.get_property('connection-state')==self.WebRTC.WebRTCPeerConnectionState.CONNECTED
+        if self.connection_ready and self.pending_keyframe_request:
+            self.pending_keyframe_request=False
+            if self.encoder:self.encoder.request_idr()
+        if peer.get_property('connection-state') in (self.WebRTC.WebRTCPeerConnectionState.FAILED,self.WebRTC.WebRTCPeerConnectionState.CLOSED):
+            # Receiver closes its peer before posting the authenticated scalar result.
+            with self.lock:
+                if self.peer_stopped_at is None:self.peer_stopped_at=time.monotonic()
+    def _push(self,element,stamp,data,duration,keyframe=False):
+        need(self.guard() is True and not self.stop.is_set(),'OWNER_GUARD')
+        need(stamp>=self.zero,'MEDIA_TIMESTAMP')
+        buffer=self.Gst.Buffer.new_allocate(None,len(data),None);buffer.fill(0,data)
+        buffer.pts=stamp-self.zero;buffer.dts=buffer.pts;buffer.duration=duration
+        if element is self.video and not keyframe:buffer.set_flags(self.Gst.BufferFlags.DELTA_UNIT)
+        need(element.emit('push-buffer',buffer)==self.Gst.FlowReturn.OK,'MEDIA_FLOW')
+    def push_video(self,stamp,data,keyframe):
+        self._push(self.video,stamp,data,self.Gst.SECOND//60,keyframe);self.video_count+=1;self._maybe_offer()
+    def _maybe_offer(self):
+        with self.lock:
+            if self.video_count and self.audio_count and not self.negotiating:
+                # appsrc push completion does not mean both RTP caps reached
+                # webrtcbin. Wait for actual fixed caps before making the offer.
+                if len(self.rtp_pads)!=2:return
+                for pad in self.rtp_pads:
+                    caps=pad.get_current_caps()
+                    if caps is None or caps.is_empty() or not caps.is_fixed():return
+                    fields=caps.get_structure(0)
+                    codec=fields.get_string('encoding-name')
+                    if codec=='H264' and not fields.get_string('profile-level-id'):return
+                    if codec not in (self.codec,'OPUS'):return
+                self.negotiating=True;self.GLib.idle_add(self._create_offer)
+    def _promise_state(self,promise,phase):
+        # A change callback runs only after the one terminal transition. The
+        # official wait contract returns immediately here; never read a reply
+        # from an interrupted/expired promise, which emits a native critical.
+        state=promise.wait()
+        values={self.Gst.PromiseResult.REPLIED:'replied',self.Gst.PromiseResult.INTERRUPTED:'interrupted',self.Gst.PromiseResult.EXPIRED:'expired'}
+        observed=values.get(state,'unexpected')
+        self.offer_progress[phase+'PromiseState']=observed
+        need(state==self.Gst.PromiseResult.REPLIED,'OFFER_PROMISE_NOT_REPLIED')
+        return promise.get_reply()
+    def _create_offer(self):
+        if self.stop.is_set():return False
+        def done(promise,*unused):
+            try:
+                reply=self._promise_state(promise,'offer')
+                if self.stop.is_set():return
+                if reply is None:self.offer_progress['offerReplyKind']='empty';raise ValueError('OFFER_REPLY_EMPTY')
+                if reply.has_field('error'):self.offer_progress['offerReplyKind']='error';raise ValueError('OFFER_REPLY_ERROR')
+                if not reply.has_field('offer'):self.offer_progress['offerReplyKind']='unexpected';raise ValueError('OFFER_REPLY_MISSING')
+                self.offer_progress['offerReplyKind']='offer'
+                offer=reply.get_value('offer');need(offer is not None,'OFFER_REPLY_MISSING')
+                # The reply is owned by its promise. Copy the boxed description
+                # before scheduling its application on our owned main loop.
+                copied=offer.copy();need(copied is not None,'OFFER_REPLY_MISSING')
+                self.GLib.idle_add(self._apply_local_offer,copied)
+            except BaseException as error:
+                if not self.stop.is_set():self.fail(error.args[0] if type(error)is ValueError and error.args and error.args[0] in ('OFFER_PROMISE_NOT_REPLIED','OFFER_REPLY_EMPTY','OFFER_REPLY_ERROR','OFFER_REPLY_MISSING') else 'OFFER_CALLBACK_FAILED')
+        try:
+            promise=self.Gst.Promise.new_with_change_func(done,None,None)
+            self.offer_promises.append(('offer',promise));self.offer_progress['offerPromiseState']='pending'
+            self.webrtc.emit('create-offer',None,promise)
+        except BaseException:self.fail('OFFER_EMIT_FAILED')
+        return False
+    def _apply_local_offer(self,offer):
+        if self.stop.is_set():return False
+        def done(promise,*unused):
+            try:
+                reply=self._promise_state(promise,'local')
+                if self.stop.is_set():return
+                need(reply is None or not reply.has_field('error'),'LOCAL_DESCRIPTION_ERROR')
+                self.offer_progress['localDescriptionApplied']=True
+                # Gathering may have completed before the ack callback. Publish
+                # only after both actual acknowledgement and complete gathering.
+                self.GLib.idle_add(self._gathered,self.webrtc,None)
+            except BaseException as error:
+                if not self.stop.is_set():self.fail(error.args[0] if type(error)is ValueError and error.args and error.args[0] in ('OFFER_PROMISE_NOT_REPLIED','LOCAL_DESCRIPTION_ERROR') else 'LOCAL_DESCRIPTION_CALLBACK_FAILED')
+        try:
+            promise=self.Gst.Promise.new_with_change_func(done,None,None)
+            self.offer_promises.append(('local',promise));self.offer_progress['localPromiseState']='pending'
+            self.webrtc.emit('set-local-description',offer,promise)
+        except BaseException:self.fail('LOCAL_DESCRIPTION_EMIT_FAILED')
+        return False
+    def _gathered(self,peer,spec):
+        if self.stop.is_set() or not self.offer_progress['localDescriptionApplied'] or peer.get_property('ice-gathering-state')!=self.WebRTC.WebRTCICEGatheringState.COMPLETE:return
+        try:
+            sdp=peer.get_property('local-description').sdp.as_text()
+            facts=inspect_sdp(sdp,self.sender_ip,'offer',self.codec)
+            if self.codec=='VP9':need(facts['vp9Format']['profileId']==0,'VP9_FORMAT')
+            if self.codec=='AV1':need(facts['av1Format']=={'profile':0,'levelIdx':13,'tier':0},'AV1_FORMAT')
+            with self.lock:self.offer=sign(self.key,self.attempt,'offer',sdp);self.offer_facts=facts
+            self.offer_ready.set()
+        except BaseException as error:
+            # Preserve only an exact closed validator code, never SDP, GError,
+            # exception text, addresses or private provisioning.
+            allowed=('LAN_IPV4', 'SDP_BOUND', 'SDP_LINES', 'SDP_VERSION', 'MEDIA_COUNT', 'BUNDLE', 'MEDIA_TRANSPORT', 'MEDIA_MID', 'MEDIA_DIRECTION', 'MEDIA_CODEC', 'H264_FORMAT', 'AV1_FORMAT', 'VP9_FORMAT', 'DTLS_FINGERPRINT', 'SDP_CONNECTION', 'MEDIA_IDENTITY', 'HOST_ICE', 'ICE_EXTENSION', 'ICE_COUNT', 'SDP_SCOPE', 'ICE_MISSING', 'SIGN_SCOPE')
+            self.fail(error.args[0] if type(error)is ValueError and len(error.args)==1 and error.args[0] in allowed else 'OFFER_LOCAL_SCOPE')
+    def provisioning(self):
+        settled=self.offer_ready.wait(10)
+        if not settled and self.error is None:
+            self.error='OFFER_FAILED'
+            for pad in self.rtp_pads:
+                caps=pad.get_current_caps()
+                if caps is None or caps.is_empty() or not caps.is_fixed():self.error='MEDIA_FLOW';break
+                fields=caps.get_structure(0);codec=fields.get_string('encoding-name')
+                if codec not in (self.codec,'OPUS'):self.error='MEDIA_CODEC';break
+                if codec=='H264' and not fields.get_string('profile-level-id'):self.error='H264_FORMAT';break
+            else:
+                if self.webrtc.get_property('local-description')is not None:self.error='ICE_MISSING'
+        need(settled and self.offer is not None and not self.error,'OFFER_NOT_READY')
+        return {'attempt':self.attempt,'keyHex':self.key.hex(),'expectedOfferSha256':self.offer_facts['sdpSha256'],
+                'expectedSenderDtlsFingerprint':self.offer_facts['fingerprint'],'senderIPv4':self.sender_ip,
+                'receiverIPv4':self.receiver_ip,'port':self.port,'lifetimeSeconds':getattr(self,'signal_lifetime_seconds',30),
+                'createdUnixMs':self.created_unix_ms,'expiresUnixMs':self.created_unix_ms+1000*getattr(self,'signal_lifetime_seconds',30)}
+    def accept_answer(self,raw):
+        with self.lock:
+            need(not self.answer_taken and self.peer_stopped_at is None and time.monotonic()<self.handshake_deadline and self.guard() is True,'ANSWER_REPLAY_OR_EXPIRED')
+            sdp=verify(self.key,self.attempt,'answer',raw);facts=inspect_sdp(sdp,self.receiver_ip,'answer',self.codec)
+            if self.codec=='VP9':
+                fmt=facts['vp9Format'];need(fmt['profileId']==0,'VP9_FORMAT');self.receiver_vp9_format=dict(fmt)
+            elif self.codec=='AV1':
+                fmt=facts['av1Format'];refused=fmt['profile']!=0 or fmt['levelIdx']<13
+                self.receiver_av1_format=dict(fmt,targetLevelIdx=13,levelRefused=refused)
+                need(not refused,'AV1_RECEIVER_LEVEL')
+            else:
+                required=42 if self.source.width==1920 else 52
+                self.receiver_format={'profileLevelId':facts['h264ProfileLevelId'],'targetLevel':required,
+                                      'levelByte':int(facts['h264ProfileLevelId'][-2:],16),
+                                      'levelRefused':int(facts['h264ProfileLevelId'][-2:],16)<required or facts['h264ProfileLevelId'][:2]!='42'}
+                need(int(facts['h264ProfileLevelId'][-2:],16)>=required and facts['h264ProfileLevelId'][:2]=='42','H264_RECEIVER_LEVEL')
+            self.answer_taken=True
+        ready=threading.Event();ok=[]
+        def apply():
+            try:
+                status,message=self.Sdp.SDPMessage.new();need(status==self.Sdp.SDPResult.OK,'ANSWER_SDP')
+                need(self.Sdp.sdp_message_parse_buffer(sdp.encode('ascii'),message)==self.Sdp.SDPResult.OK,'ANSWER_SDP')
+                description=self.WebRTC.WebRTCSessionDescription.new(self.WebRTC.WebRTCSDPType.ANSWER,message)
+                def done(promise,*unused):
+                    reply=promise.get_reply();ok.append(reply is None or not reply.has_field('error'));ready.set()
+                self.webrtc.emit('set-remote-description',description,self.Gst.Promise.new_with_change_func(done,None,None))
+            except BaseException:ready.set()
+            return False
+        self.GLib.idle_add(apply)
+        if not ready.wait(3) or ok!=[True]:self.fail('ANSWER_APPLICATION_FAILED');raise ValueError('ANSWER_APPLICATION_FAILED')
+    def accept_result(self,raw):
+        with self.lock:
+            bound=min(self.handshake_deadline,self.peer_stopped_at+2 if self.peer_stopped_at is not None else self.handshake_deadline)
+            need(not self.result_taken and not self.stop.is_set() and time.monotonic()<bound and self.guard() is True,'RESULT_REPLAY_OR_EXPIRED')
+            self.receiver_result=verify_result(self.key,self.attempt,raw);self.result_taken=True
+    def accept_stage(self,raw):
+        with self.lock:
+            bound=min(self.handshake_deadline,self.peer_stopped_at+2 if self.peer_stopped_at is not None else self.handshake_deadline)
+            need(not self.stop.is_set() and time.monotonic()<bound and self.guard() is True,'STAGE_EXPIRED')
+            seq,value=verify_stage(self.key,self.attempt,raw)
+            need(seq not in self.page_stages,'STAGE_REPLAY')
+            self.page_stages[seq]=value
+    def _worker(self,function):
+        def run():
+            try:function()
+            except BaseException:
+                if not self.stop.is_set():self.fail('MEDIA_SOURCE_FAILED')
+        thread=threading.Thread(target=run,daemon=True);self.threads.append(thread);thread.start()
+    def start(self):
+        need(not self.started and self.guard() is True,'START_REPLAY');self.started=True
+        self.deadline=time.monotonic()+self.duration;self.handshake_deadline=time.monotonic()+30
+        self.created_unix_ms=int(time.time()*1000)
+        try:
+            self._setup()
+            self._worker(self.loop.run)
+            if hasattr(self.source,'start'):self.source.start()
+            self.encoder=Nvenc(self.owner,self.source.width,self.source.height,self.guard,self.push_video,self.fail,self.env,self.max_restarts,self.codec)
+            self.encoder.can_feed=lambda:self.video_count==0 or self.connection_ready
+            self.encoder.start()
+            def video():
+                while not self.stop.is_set():
+                    item=self.source.video();need(item is not None,'SOURCE_VIDEO_ENDED');self.encoder.raw.put(item)
+            def audio_capture():
+                while not self.stop.is_set():
+                    item=self.source.audio();need(item is not None,'SOURCE_AUDIO_ENDED');self.audio_raw.put(item)
+            def audio_feed():
+                while not self.stop.is_set():
+                    item=self.audio_raw.take()
+                    if item is None:continue
+                    stamp,data=item;need(len(data)==3840 and time.monotonic_ns()-stamp<150_000_000,'RAW_AUDIO_SCOPE')
+                    self._push(self.audio,stamp,data,self.Gst.SECOND//50);self.audio_count+=1;self._maybe_offer()
+            def watch():
+                while not self.stop.wait(.05):
+                    self._maybe_offer()
+                    if self.result_ready.is_set():self._request_stop();return
+                    if self.peer_stopped_at is not None and time.monotonic()>=min(self.handshake_deadline,self.peer_stopped_at+2):
+                        self.fail('PEER_STOPPED_RESULT_TIMEOUT');return
+                    if time.monotonic()>=self.deadline or self.guard() is not True:self.fail('DEADLINE_OR_OWNER_LOST');return
+                    if not self.answer_taken and time.monotonic()>=self.handshake_deadline:self.fail('HANDSHAKE_TIMEOUT');return
+            for function in (video,audio_capture,audio_feed,watch):self._worker(function)
+            self.provisioning();self.server=SignalServer(self);self.server.start();return self
+        except BaseException:self.close();raise
+    def close(self):
+        with self.close_lock:
+            if self.closed:return
+            self._close();self.closed=True
+    def _close(self):
+        self.stop.set();self.audio_raw.close()
+        if self.server:self.server.close()
+        if self.source:self.source.close()
+        # Cancel only our known pending promises before destroying the peer.
+        # interrupt(REPLIED) is a no-op; callback terminal state is retained.
+        for phase,promise in self.offer_promises:
+            if self.offer_progress[phase+'PromiseState']=='pending':promise.interrupt()
+        if self.pipeline:self.pipeline.set_state(self.Gst.State.NULL)
+        if self.encoder:self.encoder.close()
+        if self.loop:self.loop.quit()
+        for thread in self.threads:
+            if thread is not threading.current_thread():thread.join(timeout=2)
+        need(not any(t.is_alive()for t in self.threads if t is not threading.current_thread()),'SENDER_THREADS_UNRESOLVED')
+        self.key=b'';self.offer=None;self.offer_promises.clear()
+    def counters(self):
+        return {'videoAUs':self.video_count,'audioBlocks':self.audio_count,'rawVideoDrops':self.encoder.raw.dropped if self.encoder else 0,
+                'rawAudioDrops':self.audio_raw.dropped,'pliRequests':self.pli_count,'encoderRestarts':self.encoder.restarts if self.encoder else 0,
+                'error':self.error,'offerProgress':dict(self.offer_progress),'receiverHttp':dict(self.receiver_http),'pageBootStage':self.page_stages.get(1),'pageErrorStage':self.page_stages.get(2),
+                'receiverH264Format':self.receiver_format,'receiverAv1Format':self.receiver_av1_format,'receiverVp9Format':self.receiver_vp9_format,
+                'receiverResult':self.receiver_result,
+                'receiverResultAckWritten':self.result_ready.is_set(),
+                'nativeQualified':False,'physical4K60Qualified':False,'zeroLGTrafficQualified':False}
+
+class HeaderReader:
+    """Aggregate request-line/header budget; body handled by its separate bound."""
+    def __init__(self,stream):self.stream=stream;self.remaining=16384;self.headers=True
+    def readline(self,size=-1):
+        need(self.headers and self.remaining>0,'HTTP_HEADER_BOUND')
+        line=self.stream.readline(min(size if size>=0 else self.remaining+1,self.remaining+1))
+        self.remaining-=len(line);need(self.remaining>=0,'HTTP_HEADER_BOUND')
+        if line in (b'\n',b'\r\n'):self.headers=False
+        return line
+    def read(self,length):
+        need(not self.headers and type(length)is int and 0<=length<=70000,'HTTP_BODY_BOUND')
+        return self.stream.read(length)
+    def close(self):self.stream.close()
+
+class SignalServer:
+    def __init__(self,sender):self.sender=sender;self.http=None;self.thread=None
+    def start(self):
+        sender=self.sender;prefix='/webrtc/'+sender.attempt;counts={'get':0,'options':0,'post':0,'result':0,'stage':0}
+        self.active=set();self.active_lock=threading.Lock();outer=self
+        class QuietServer(http.server.HTTPServer):
+            request_queue_size=2;allow_reuse_address=False
+            def server_bind(self):
+                socketserver.TCPServer.server_bind(self)
+                self.server_name=sender.sender_ip;self.server_port=sender.port
+            def verify_request(self,request,address):
+                if address[0]!=sender.receiver_ip:sender.receiver_http['socketPeerRejected']=True
+                return address[0]==sender.receiver_ip and not sender.stop.is_set() and time.monotonic()<sender.handshake_deadline
+            def get_request(self):
+                request,address=super().get_request();sender.receiver_http['socketAccepted']=True
+                with outer.active_lock:outer.active.add(request)
+                return request,address
+            def shutdown_request(self,request):
+                try:super().shutdown_request(request)
+                finally:
+                    with outer.active_lock:outer.active.discard(request)
+            def handle_error(self,request,address):pass
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self,*unused):pass
+            def setup(self):
+                super().setup();self.connection.settimeout(2);self.rfile=HeaderReader(self.rfile)
+                remaining=min(3,max(0,sender.handshake_deadline-time.monotonic()))
+                def expire():
+                    try:self.connection.shutdown(socket.SHUT_RDWR)
+                    except OSError:pass
+                    self.connection.close()
+                self.absolute_timer=threading.Timer(remaining,expire);self.absolute_timer.daemon=True;self.absolute_timer.start()
+            def finish(self):
+                try:
+                    if hasattr(self,'absolute_timer'):self.absolute_timer.cancel()
+                    super().finish()
+                finally:
+                    with outer.active_lock:outer.active.discard(self.connection)
+            def handle_expect_100(self):self.response(417);return False
+            def allowed(self,result=False):
+                duplicates=any(len(self.headers.get_all(name,[]))>1 for name in ('Host','Origin','Content-Length','Transfer-Encoding','Expect'))
+                phase=sender.peer_stopped_at is None or result and time.monotonic()<sender.peer_stopped_at+2
+                if duplicates or len(self.headers)>16 or self.headers.get('Transfer-Encoding') is not None or self.headers.get('Expect') is not None:sender.receiver_http['headersRejected']=True
+                if self.headers.get('Host')!=sender.sender_ip+':'+str(sender.port):sender.receiver_http['hostRejected']=True
+                if self.client_address[0]!=sender.receiver_ip:sender.receiver_http['requestPeerRejected']=True
+                if self.headers.get('Origin')!='null':sender.receiver_http['originRejected']=True
+                if not phase or time.monotonic()>=sender.handshake_deadline or sender.stop.is_set():sender.receiver_http['phaseRejected']=True
+                if self.path not in(prefix+'/offer',prefix+'/answer',prefix+'/result',prefix+'/stage'):sender.receiver_http['pathRejected']=True
+                return (not duplicates and len(self.headers)<=16 and self.headers.get('Host')==sender.sender_ip+':'+str(sender.port) and
+                        self.headers.get('Transfer-Encoding') is None and self.headers.get('Expect') is None and
+                        self.client_address[0]==sender.receiver_ip and self.headers.get('Origin')=='null' and
+                        phase and time.monotonic()<sender.handshake_deadline and not sender.stop.is_set())
+            def response(self,status,data=b''):
+                self.send_response(status);self.send_header('Content-Type','application/json')
+                self.send_header('Content-Length',str(len(data)));self.send_header('Cache-Control','no-store')
+                self.send_header('Access-Control-Allow-Origin','null');self.send_header('Connection','close')
+                self.send_header('X-Content-Type-Options','nosniff');self.end_headers()
+                if data:self.wfile.write(data)
+            def do_OPTIONS(self):
+                if not self.allowed(result=self.path==prefix+'/result' or self.path==prefix+'/stage') or self.path not in (prefix+'/offer',prefix+'/answer',prefix+'/result',prefix+'/stage') or counts['options']>=4:
+                    self.response(403);return
+                counts['options']+=1;self.send_response(204)
+                self.send_header('Access-Control-Allow-Origin','null');self.send_header('Access-Control-Allow-Methods','GET, POST')
+                self.send_header('Access-Control-Allow-Headers','Content-Type');self.send_header('Content-Length','0');self.end_headers()
+            def do_GET(self):
+                if not self.allowed() or self.path!=prefix+'/offer' or counts['get']>=2:self.response(403);return
+                counts['get']+=1;self.response(200,canonical(sender.offer));sender.receiver_http['offerServed']=True
+            def do_POST(self):
+                if self.path==prefix+'/stage':
+                    if not self.allowed(result=True) or counts['stage']>=2:self.response(403);return
+                    counts['stage']+=1
+                    try:
+                        need(self.headers.get('Content-Type')=='application/json','STAGE_SCOPE')
+                        length=int(self.headers.get('Content-Length','0'));need(0<length<=1024,'STAGE_BOUND')
+                        body=self.rfile.read(length);need(len(body)==length,'STAGE_BOUND');sender.accept_stage(body)
+                        self.response(200,b'{"accepted":true}')
+                        if getattr(sender,'connectivity_only',False) and 1 in sender.page_stages:
+                            sender.receiver_http['pageStageAckWritten']=True
+                            if sender.page_boot_ack_time is None:sender.page_boot_ack_time=time.monotonic()
+                    except (ValueError,OSError,TimeoutError,RecursionError):self.response(400,b'{"accepted":false}')
+                    return
+                if self.path==prefix+'/result':
+                    if not self.allowed(result=True) or counts['result']>=1:self.response(403);return
+                    counts['result']+=1;sender.receiver_http['resultAttempted']=True
+                    try:
+                        need(self.headers.get('Content-Type')=='application/json','RESULT_HEADERS')
+                        length=int(self.headers.get('Content-Length','0'));need(0<length<=4096,'RESULT_BOUND')
+                        body=self.rfile.read(length);need(len(body)==length,'RESULT_TRUNCATED');sender.accept_result(body)
+                        self.response(200,b'{"accepted":true}');sender.receiver_http['resultAccepted']=True;sender.result_ready.set()
+                    except (ValueError,OSError,TimeoutError,RecursionError):sender.receiver_http['resultRejected']=True;self.response(400,b'{"accepted":false}')
+                    return
+                if not self.allowed() or self.path!=prefix+'/answer' or counts['post']>=1:self.response(403);return
+                counts['post']+=1;sender.receiver_http['answerAttempted']=True
+                try:
+                    need(self.headers.get('Content-Type')=='application/json' and self.headers.get('Transfer-Encoding') is None,'ANSWER_HEADERS')
+                    length=int(self.headers.get('Content-Length','0'));need(0<length<=70000,'ANSWER_BOUND')
+                    body=self.rfile.read(length);need(len(body)==length,'ANSWER_TRUNCATED');sender.accept_answer(body)
+                    self.response(200,b'{"accepted":true}');sender.receiver_http['answerAccepted']=True
+                except (ValueError,OSError,TimeoutError):sender.receiver_http['answerRejected']=True;self.response(400,b'{"accepted":false}')
+        self.http=QuietServer((sender.sender_ip,sender.port),Handler)
+        self.http.timeout=.2
+        def serve():
+            while not sender.stop.is_set():self.http.handle_request()
+        self.thread=threading.Thread(target=serve,daemon=True);self.thread.start()
+    def close(self):
+        if self.http:
+            with self.active_lock:
+                for request in tuple(self.active):
+                    try:request.shutdown(socket.SHUT_RDWR)
+                    except OSError:pass
+                    request.close()
+        if self.thread:self.thread.join(timeout=3)
+        if self.http:self.http.server_close()
+        need(not self.thread or not self.thread.is_alive(),'SIGNAL_SERVER_UNRESOLVED')
+
+if __name__=='__main__':
+    print(json.dumps({'preparedOnly':True,'nativeActions':False,'prototype':'H264 NVENC1080p60 + Opus48kHz',
+                      'explicitEntry':'Sender(...).start() under parent-owned worker and verified dependencies',
+                      'minimumPackages':['gstreamer1.0-plugins-bad','gstreamer1.0-nice','gir1.2-gst-plugins-bad-1.0'],
+                      'receiverQualified':False,'physical4K60Qualified':False}))

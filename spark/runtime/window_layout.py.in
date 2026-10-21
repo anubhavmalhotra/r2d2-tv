@@ -1,0 +1,99 @@
+"""Owned private-X padding/marker windows; never discover or select browser windows.
+
+Caller has verified the original browser's existing nonce pin before every call.
+All resources use that same private X connection. XCloseDisplay removes its own
+windows even when an interrupted create prevented ledger assignment.
+"""
+import ctypes as c
+import secrets
+from layout import WIDTH, HEIGHT, valid_height, valid_marker, marker_bits
+
+class Overlays:
+    def __init__(self, display):
+        self.d = display
+        self.x = x = display.x11
+        self.handle = display.handle
+        self.root = x.XDefaultRootWindow(display.handle)
+        self.token = secrets.token_bytes(16)
+        self.pad = self.marker = None
+        self.value = None
+        self.height = HEIGHT
+        U, I = c.c_ulong, c.c_int
+        x.XBlackPixel.argtypes=[c.c_void_p,I];x.XBlackPixel.restype=U
+        x.XWhitePixel.argtypes=[c.c_void_p,I];x.XWhitePixel.restype=U
+        x.XCreateSimpleWindow.argtypes=[c.c_void_p,U,I,I,c.c_uint,c.c_uint,c.c_uint,U,U];x.XCreateSimpleWindow.restype=U
+        class Attr(c.Structure):
+            _fields_=[('background_pixmap',U),('background_pixel',U),('border_pixmap',U),('border_pixel',U),
+              ('bit_gravity',I),('win_gravity',I),('backing_store',I),('backing_planes',U),('backing_pixel',U),
+              ('save_under',I),('event_mask',c.c_long),('do_not_propagate_mask',c.c_long),
+              ('override_redirect',I),('colormap',U),('cursor',U)]
+        self.Attr=Attr
+        x.XChangeWindowAttributes.argtypes=[c.c_void_p,U,U,c.POINTER(Attr)]
+        x.XMapRaised.argtypes=[c.c_void_p,U]
+        x.XUnmapWindow.argtypes=[c.c_void_p,U]
+        x.XDestroyWindow.argtypes=[c.c_void_p,U]
+        x.XCreateGC.argtypes=[c.c_void_p,U,U,c.c_void_p];x.XCreateGC.restype=c.c_void_p
+        x.XSetForeground.argtypes=[c.c_void_p,c.c_void_p,U]
+        x.XFillRectangle.argtypes=[c.c_void_p,U,c.c_void_p,I,I,c.c_uint,c.c_uint]
+        x.XFreeGC.argtypes=[c.c_void_p,c.c_void_p]
+        self.atom=x.XInternAtom(self.handle,b'_R2D2_LAYOUT_OWNER',0)
+        self.string=x.XInternAtom(self.handle,b'STRING',1)
+        self.black=x.XBlackPixel(self.handle,0);self.white=x.XWhitePixel(self.handle,0)
+        if not self.atom or not self.string:raise RuntimeError('LAYOUT_ATOM')
+
+    def _owned(self, window):
+        actual,fmt,count,after,data=c.c_ulong(),c.c_int(),c.c_ulong(),c.c_ulong(),c.c_void_p()
+        result=self.x.XGetWindowProperty(self.handle,window,self.atom,0,4,0,self.string,
+            c.byref(actual),c.byref(fmt),c.byref(count),c.byref(after),c.byref(data))
+        try:
+            return (not result and actual.value==self.string and fmt.value==8 and count.value==16 and
+                after.value==0 and bool(data.value) and c.string_at(data.value,16)==self.token)
+        finally:
+            if data.value:self.x.XFree(data)
+
+    def _create(self, width, height):
+        window=self.x.XCreateSimpleWindow(self.handle,self.root,0,0,width,height,0,self.black,self.black)
+        if not window:raise RuntimeError('LAYOUT_CREATE')
+        raw=c.create_string_buffer(self.token)
+        self.x.XChangeProperty(self.handle,window,self.atom,self.string,8,0,raw,16)
+        attrs=self.Attr();attrs.override_redirect=1
+        self.x.XChangeWindowAttributes(self.handle,window,1<<9,c.byref(attrs))
+        self.x.XSync(self.handle,0)
+        if not self._owned(window):raise RuntimeError('LAYOUT_OWNERSHIP')
+        return window
+
+    def sync(self, height, marker=None):
+        if not valid_height(height) or (marker is not None and not valid_marker(marker)):
+            raise ValueError('LAYOUT_ARGUMENT')
+        if self.pad is None:self.pad=self._create(WIDTH,1)
+        if not self._owned(self.pad):raise RuntimeError('LAYOUT_OWNERSHIP')
+        if height<HEIGHT:
+            self.x.XMoveResizeWindow(self.handle,self.pad,0,height,WIDTH,HEIGHT-height)
+            self.x.XMapRaised(self.handle,self.pad)
+        else:self.x.XUnmapWindow(self.handle,self.pad)
+        marker = marker if marker is not None else self.value
+        if marker is not None:
+            if self.marker is None:self.marker=self._create(576,16)
+            if not self._owned(self.marker):raise RuntimeError('LAYOUT_OWNERSHIP')
+            self.x.XMoveResizeWindow(self.handle,self.marker,WIDTH-576,height-16,576,16)
+            # Mapping/raising can expose and clear an unmapped window; paint
+            # AFTER mapping, including on later focus/raise calls.
+            self.x.XMapRaised(self.handle,self.marker)
+            gc=self.x.XCreateGC(self.handle,self.marker,0,None)
+            if not gc:raise RuntimeError('LAYOUT_GC')
+            try:
+                for i,bit in enumerate(marker_bits(marker)):
+                    self.x.XSetForeground(self.handle,gc,self.white if bit else self.black)
+                    self.x.XFillRectangle(self.handle,self.marker,gc,8*i,0,8,16)
+            finally:self.x.XFreeGC(self.handle,gc)
+            self.value=marker
+        self.x.XSync(self.handle,0)
+        self.height=height
+
+    def clear(self, marker):
+        if not valid_marker(marker) or marker!=self.value or self.marker is None or not self._owned(self.marker):
+            raise RuntimeError('LAYOUT_MARKER_IDENTITY')
+        self.x.XDestroyWindow(self.handle,self.marker)
+        self.x.XSync(self.handle,0)
+        self.marker=None;self.value=None
+        return {'cleared':True,'height':self.height}

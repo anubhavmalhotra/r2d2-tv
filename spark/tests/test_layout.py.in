@@ -1,0 +1,119 @@
+import copy
+import math
+import unittest
+from layout import *
+
+
+def proof(h):
+    return {'pinned': True, 'pin_valid': True, 'matched': 1, 'focused': True,
+            'after': {'x': 0, 'y': 0, 'width': WIDTH, 'height': h, 'border': 0}}
+
+
+def viewport(h): return {'width': 1920, 'height': h // 2, 'dpr': 2}
+
+
+class Tests(unittest.TestCase):
+    def test_ratio_and_limits(self):
+        self.assertEqual(desired_height(1920, 940), 1880)
+        self.assertEqual(desired_height(1920, 1080), 2160)
+        self.assertEqual(desired_height(1920, 600), 1500)
+        self.assertEqual(desired_height(1920, 940.7), 1880)
+        for v in (0, -1, True, float('nan'), float('inf'), 20000, '940'):
+            with self.assertRaises(ValueError): desired_height(1920, v)
+
+    def test_request_exact_and_no_boolean_numeric(self):
+        for h in (1500, 1880, 2160): self.assertTrue(valid_request({'height': h, 'baseRevision': 0}))
+        for h in (1498, 2162, 1881, True, 1880.0): self.assertFalse(valid_request({'height': h, 'baseRevision': 0}))
+        for r in (-1, 120, True, 0.0): self.assertFalse(valid_request({'height': 1880, 'baseRevision': r}))
+        self.assertFalse(valid_request({'height': 1880, 'baseRevision': 0, 'window': 3}))
+
+    def test_queue_does_not_commit(self):
+        s=Layout(); body={'height':1880,'baseRevision':0}
+        self.assertTrue(s.queue(body)); body['height']=1500
+        self.assertEqual(s.requested_height(),1880)
+        self.assertEqual(s.view()['height'],2160); self.assertTrue(s.view()['pending'])
+        self.assertFalse(s.queue({'height':2160,'baseRevision':0}))
+        p=proof(1880);p['layoutMarker']=s.request()['marker'];result=s.commit(p,viewport(1880))
+        self.assertTrue(result['pending']);self.assertEqual(result['height'],1880);self.assertEqual(result['revision'],1)
+        self.assertEqual(result['marker']['rect'],{'x':3264,'y':1864,'width':576,'height':16})
+        self.assertTrue(s.seen({'revision':1,'marker':result['marker']['value']}))
+        self.assertFalse(s.cleared({'cleared':True,'height':1880})['pending'])
+        self.assertFalse(s.queue({'height':1880,'baseRevision':0}))
+
+    def test_every_window_identity_and_geometry_field_required(self):
+        for key in ('pinned','pin_valid','matched','after'):
+            p=proof(1880); del p[key]; self.assertFalse(window_matches(p,1880))
+        for key in ('x','y','width','height','border'):
+            p=proof(1880); p['after'][key]+=1; self.assertFalse(window_matches(p,1880))
+        for key in ('pinned','pin_valid'): p=proof(1880);p[key]=1;self.assertFalse(window_matches(p,1880))
+        p=proof(1880);p['after']['x']=False;self.assertFalse(window_matches(p,1880))
+        p=proof(1880);p['focused']=False;self.assertFalse(window_matches(p,1880,True))
+
+    def test_failed_commit_remains_pending(self):
+        cases=[({},viewport(1880)),(proof(2160),viewport(1880)),(proof(1880),viewport(2160))]
+        for p,v in cases:
+            s=Layout();s.queue({'height':1880,'baseRevision':0})
+            with self.assertRaises(ValueError):s.commit(p,v)
+            self.assertEqual(s.view()['height'],2160);self.assertEqual(s.revision,0);self.assertTrue(s.view()['pending'])
+        s=Layout()
+        with self.assertRaises(ValueError):s.commit(proof(2160),viewport(2160))
+
+    def test_viewport_no_scale_or_bool_loophole(self):
+        for k,v in [('width',3840),('height',2160),('dpr',1),('dpr',True),('height',float('nan'))]:
+            p=viewport(1880);p[k]=v;self.assertFalse(viewport_matches(p,1880))
+
+    def test_transition_limit_and_roundtrip(self):
+        s=Layout()
+        for i in range(120):
+            h=1880 if i%2==0 else 2160
+            self.assertTrue(s.queue({'height':h,'baseRevision':i}));p=proof(h);p['layoutMarker']=s.request()['marker'];s.commit(p,viewport(h))
+            self.assertTrue(s.seen({'revision':i+1,'marker':s.view()['marker']['value']}));s.cleared({'cleared':True,'height':h})
+        self.assertFalse(s.queue({'height':1880,'baseRevision':120}))
+        self.assertEqual(s.view()['height'],2160)
+
+    def test_pointer_edges_center_and_padding(self):
+        for h in (1500,1880,2160):
+            for u,v in ((0,0),(.5,.5),(1,1)):
+                x,y=capture_point(u,v,h)
+                self.assertEqual(round(x*(WIDTH-1)),round(u*(WIDTH-1)))
+                self.assertEqual(round(y*(HEIGHT-1)),round(v*(h-1)))
+                self.assertTrue(point_in_capture({'kind':'point','x':x,'y':y},h))
+            self.assertFalse(point_in_capture({'kind':'point','x':0,'y':(h-1)/(HEIGHT-1)+1e-8},h))
+        for v in (True,float('nan'),float('inf'),-.01,1.01):
+            with self.assertRaises(ValueError):capture_point(0,v,1880)
+        self.assertTrue(point_in_capture({'kind':'key'},1880))
+
+    def test_decoded_ack_and_native_clear_both_required(self):
+        s=Layout();s.queue({'height':1880,'baseRevision':0});p=proof(1880);p['layoutMarker']=s.request()['marker'];s.commit(p,viewport(1880))
+        m=s.view()['marker']['value']
+        self.assertIsNone(s.clear_request());self.assertTrue(s.view()['pending'])
+        for b in ({'revision':0,'marker':m},{'revision':1,'marker':'0'*16},{'revision':True,'marker':m},{'revision':1,'marker':m,'extra':True}):self.assertFalse(s.seen(b))
+        with self.assertRaises(ValueError):s.cleared({'cleared':True,'height':1880})
+        self.assertTrue(s.seen({'revision':1,'marker':m}));self.assertTrue(s.seen({'revision':1,'marker':m}))
+        self.assertEqual(s.clear_request(),m)
+        with self.assertRaises(ValueError):s.cleared({'cleared':True,'height':2160})
+        self.assertTrue(s.view()['pending']);s.cleared({'cleared':True,'height':1880})
+        self.assertIsNone(s.clear_request());self.assertIsNone(s.view()['marker'])
+
+    def test_marker_exact_bits(self):
+        bits=marker_bits('0123456789abcdef')
+        self.assertEqual(len(bits),72);self.assertEqual(bits[:8],(1,0,1,0,0,1,1,0))
+        self.assertEqual(''.join(map(str,bits[8:])),format(0x0123456789abcdef,'064b'))
+        for m in ('A'*16,'a'*15,'a'*17,None,False):
+            with self.assertRaises(ValueError):marker_bits(m)
+
+    def test_network_input_revision_and_pending_gate(self):
+        s=Layout();body={'kind':'point','x':0.5,'y':0.5,'click':True,'layoutRevision':0}
+        self.assertEqual(s.input_body(body),{k:v for k,v in body.items() if k!='layoutRevision'})
+        for r in (True,-1,1,None):self.assertIsNone(s.input_body(dict(body,layoutRevision=r)))
+        s.queue({'height':1880,'baseRevision':0});self.assertIsNone(s.input_body(body))
+        p=proof(1880);p['layoutMarker']=s.request()['marker'];s.commit(p,viewport(1880))
+        self.assertIsNone(s.input_body(dict(body,layoutRevision=1)))
+        s.seen({'revision':1,'marker':s.view()['marker']['value']});s.cleared({'cleared':True,'height':1880})
+        self.assertIsNone(s.input_body(body));self.assertIsNotNone(s.input_body(dict(body,layoutRevision=1)))
+
+    def test_view_is_detached(self):
+        s=Layout();v=s.view();v['captureRect']['height']=1500;v['height']=1500
+        self.assertEqual(s.view()['captureRect']['height'],2160)
+
+if __name__=='__main__':unittest.main()

@@ -1,0 +1,95 @@
+"""Encoder rate presets, scalar progress counters and ring sizing; argv only.
+
+No encoder, display, Pulse server or socket is opened. The defaults must equal
+the reference installation: 25 Mbit/s CBR with a 2 MiB VBV, no progress file,
+and the 16 MiB ring.
+"""
+import os
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+
+import audio
+import media_stream
+import trial
+
+
+class FakeAudio:
+    server = 'unix:/synthetic/private/pulse/native'
+    monitor = 'synthetic_owned.monitor'
+
+    def _identity(self):
+        return None
+
+
+def value(args, key):
+    if args.count(key) != 1:
+        raise AssertionError('option must occur exactly once: ' + key)
+    return args[args.index(key) + 1]
+
+
+PROGRESS = '/run/user/1000/synthetic-run-0123456789abcdef/encoder-progress'
+
+
+class Presets(unittest.TestCase):
+    def test_default_is_reference_rate_without_progress(self):
+        args = audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True)
+        self.assertEqual((value(args, '-b:v'), value(args, '-maxrate'), value(args, '-bufsize')), ('25M', '25M', '2M'))
+        self.assertNotIn('-progress', args)
+        self.assertNotIn('-stats_period', args)
+
+    def test_every_preset_keeps_cbr_and_grows_the_vbv(self):
+        for mbps, vbv in audio.VIDEO_RATE_CONTROL.items():
+            with self.subTest(mbps=mbps):
+                args = audio.ffmpeg_args(':99', FakeAudio(), bitrate_mbps=mbps)
+                self.assertEqual((value(args, '-rc'), value(args, '-b:v'), value(args, '-maxrate'),
+                                  value(args, '-bufsize')), ('cbr', '%dM' % mbps, '%dM' % mbps, vbv))
+                # HEVC Main tier level 5.1 allows 40 Mbit/s; every preset stays below it.
+                self.assertLess(mbps, 40)
+                self.assertEqual(value(args, '-level:v'), '5.1')
+        self.assertEqual(sorted(audio.VIDEO_RATE_CONTROL), [25, 30, 38])
+
+    def test_unreviewed_rate_values_are_refused(self):
+        for bad in (24, 40, 0, '38', 38.0, True, None):
+            with self.subTest(bad=bad), self.assertRaises(audio.AudioError):
+                audio.ffmpeg_args(':99', FakeAudio(), bitrate_mbps=bad)
+
+    def test_progress_counters_are_scalar_and_path_bound(self):
+        args = audio.ffmpeg_args(':99', FakeAudio(), progress_path=PROGRESS)
+        self.assertEqual((value(args, '-stats_period'), value(args, '-progress')), ('1', PROGRESS))
+        self.assertLess(args.index('-progress'), args.index('-f'))
+        for bad in ('relative/encoder-progress', '/tmp/../x/encoder-progress', '/run/x/progress',
+                    '/run/x/encoder-progress;rm', 'pipe:1', 7):
+            with self.subTest(bad=bad), self.assertRaises(audio.AudioError):
+                audio.ffmpeg_args(':99', FakeAudio(), progress_path=bad)
+
+
+class Environment(unittest.TestCase):
+    def evaluate(self, env):
+        source = Path(trial.__file__).read_text()
+        lines = [line for line in source.splitlines() if line.startswith(('VIDEO_MBPS = ', 'ENCODER_PROGRESS = '))]
+        self.assertEqual(len(lines), 2)
+        namespace = {'os': type('FakeOs', (), {'environ': env})}
+        for line in lines:
+            exec(line, namespace)
+        return namespace['VIDEO_MBPS'], namespace['ENCODER_PROGRESS']
+
+    def test_service_environment_selects_only_reviewed_values(self):
+        self.assertEqual(self.evaluate({}), (25, False))
+        self.assertEqual(self.evaluate({'R2D2_VIDEO_MBPS': '38', 'R2D2_ENCODER_PROGRESS': '1'}), (38, True))
+        for bad in ('99', '25.0', ' 38', '', 'x'):
+            self.assertEqual(self.evaluate({'R2D2_VIDEO_MBPS': bad})[0], 25, bad)
+        self.assertEqual(self.evaluate({'R2D2_ENCODER_PROGRESS': 'true'})[1], False)
+
+    def test_ring_scales_with_the_higher_presets_only(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('R2D2_VIDEO_MBPS', None)
+            self.assertEqual(media_stream.ring_bytes(), 16 * 1024 * 1024)
+            for mbps, size in (('25', 16), ('30', 32), ('38', 32), ('99', 16)):
+                os.environ['R2D2_VIDEO_MBPS'] = mbps
+                self.assertEqual(media_stream.ring_bytes(), size * 1024 * 1024, mbps)
+            os.environ.pop('R2D2_VIDEO_MBPS', None)
+
+
+if __name__ == '__main__':
+    unittest.main()

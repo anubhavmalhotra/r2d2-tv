@@ -1,0 +1,158 @@
+"""Offline argv/production-call controls; no encoder, display, Pulse or socket opens."""
+import threading
+import unittest
+from unittest.mock import Mock
+
+import audio
+import protocol
+import trial
+
+
+class FakeAudio:
+    server = 'unix:/synthetic/private/pulse/native'
+    monitor = 'synthetic_owned.monitor'
+
+    def __init__(self):
+        self.checked = 0
+
+    def _identity(self):
+        self.checked += 1
+
+
+def value(args, key):
+    if args.count(key) != 1:
+        raise AssertionError('option must occur exactly once: ' + key)
+    return args[args.index(key) + 1]
+
+
+class Encoder60(unittest.TestCase):
+
+    def test_4k60_main_level51_sample_entry_and_one_second_gop(self):
+        args = audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True)
+        self.assertEqual((protocol.WIDTH, protocol.HEIGHT), (3840, 2160))
+        for key, val in [('-video_size', '3840x2160'), ('-framerate', '60'),
+                         ('-g', '60'), ('-c:v', 'hevc_nvenc'), ('-profile:v', 'main'),
+                         ('-level:v', '5.1'), ('-tag:v', 'hvc1')]:
+            self.assertEqual(value(args, key), val)
+        # NVENC receives bgr0 and converts to 4:2:0 on the GPU; no CPU swscale step.
+        self.assertNotIn('-pix_fmt', args)
+        self.assertEqual(int(value(args, '-g')) / int(value(args, '-framerate')), 1)
+        self.assertEqual(protocol.CODEC, 'hvc1.1.6.L153.B0')
+        self.assertIn(protocol.CODEC, audio.MIME)
+        self.assertIn('mp4a.40.2', audio.MIME)
+        self.assertNotIn('-r', args)  # No output-side frame duplication knob.
+
+    def test_nvenc_low_delay_rate_control_and_bounded_queues(self):
+        args = audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True)
+        for key, val in [('-preset', 'p1'), ('-tune', 'ull'), ('-rc', 'cbr'),
+                         ('-b:v', '25M'), ('-maxrate', '25M'), ('-bufsize', '2M'),
+                         ('-bf', '0'), ('-zerolatency', '1'), ('-delay', '0')]:
+            self.assertEqual(value(args, key), val)
+        # x11grab queue of 32 frames absorbs the encoder-initialisation stall; Pulse stays 32.
+        self.assertEqual([args[i + 1] for i, x in enumerate(args) if x == '-thread_queue_size'],
+                         [str(audio.CAPTURE_QUEUE_FRAMES), '32'])
+        self.assertEqual(audio.CAPTURE_QUEUE_FRAMES, 32)
+        self.assertNotIn('-re', args)  # Already live inputs, no second throttling clock.
+        self.assertNotIn('-copyts', args)
+
+    def test_private_audio_source_and_timestamp_contract_unchanged(self):
+        fake = FakeAudio()
+        args = audio.ffmpeg_args(':99', fake, lower_delay=True)
+        self.assertEqual(fake.checked, 1)
+        self.assertEqual([args[i + 1] for i, x in enumerate(args) if x == '-i'], [':99.0', fake.monitor])
+        self.assertEqual([args[i + 1] for i, x in enumerate(args) if x == '-map'], ['0:v:0', '1:a:0'])
+        expected_af = 'asetpts=PTS+%d/1000/TB,aresample=async=1:first_pts=%d,asetnsamples=n=1024:p=1' % (
+            audio.AUDIO_LEAD_MS, audio.AUDIO_FIRST_PTS)
+        self.assertEqual((audio.AUDIO_LEAD_MS, audio.AUDIO_FIRST_PTS), (55, 1264))
+        for key, val in [('-server', fake.server), ('-isync', '0'), ('-wallclock', '1'),
+                         ('-sample_rate', '48000'), ('-channels', '2'), ('-fragment_size', '4096'),
+                         ('-c:a', 'aac'), ('-profile:a', 'aac_low'), ('-b:a', '128k'),
+                         ('-ar', '48000'), ('-ac', '2'), ('-af', expected_af)]:
+            self.assertEqual(value(args, key), val)
+        self.assertNotIn('default', args)
+        self.assertNotIn('anullsrc', args)
+        self.assertNotIn('-an', args)
+
+    def test_short_mux_retains_mp4_and_keyframe_trigger_and_flush(self):
+        args = audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True)
+        self.assertEqual(value(args, '-frag_duration'), '33333')
+        self.assertEqual(value(args, '-max_interleave_delta'), '20000')
+        self.assertEqual(value(args, '-movflags'), 'frag_keyframe+empty_moov+default_base_moof')
+        self.assertEqual(value(args, '-flush_packets'), '1')
+        self.assertEqual(args[-3:], ['-f', 'mp4', 'pipe:1'])
+        self.assertEqual(value(args, '-map_metadata'), '-1')
+        # These are thresholds, not permission to drop dependent fragments/packets.
+        self.assertNotIn('-skip_frame', args)
+        short = audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True, short_fragment=True)
+        self.assertEqual(value(short, '-frag_duration'), '16667')
+        self.assertEqual(value(short, '-max_interleave_delta'), '1000')
+        with self.assertRaises(audio.AudioError):
+            audio.ffmpeg_args(':99', FakeAudio(), short_fragment=1)
+
+    def test_display_and_duration_scope(self):
+        for display, duration in [(':99', True), (':99', 0), (':99', 1801),
+                                  (':99', 1.5), ('other:0', 1), (':123456', 1),
+                                  (':99;command', 1)]:
+            with self.subTest(display=display, duration=duration):
+                fake = FakeAudio()
+                with self.assertRaises(audio.AudioError):
+                    audio.ffmpeg_args(display, fake, duration=duration)
+                self.assertEqual(fake.checked, 0)
+        for duration in (1, 1800):
+            self.assertEqual(value(audio.ffmpeg_args(':0', FakeAudio(), duration=duration), '-t'), str(duration))
+
+    def test_identity_failure_produces_no_encoder_arguments(self):
+        fake = FakeAudio()
+        fake._identity = Mock(side_effect=audio.AudioError('AUDIO_SINK_CHANGED'))
+        with self.assertRaisesRegex(audio.AudioError, 'AUDIO_SINK_CHANGED'):
+            audio.ffmpeg_args(':99', fake, lower_delay=True)
+        fake._identity.assert_called_once_with()
+
+    def test_production_encode_uses_exact_new_argv_under_audio_lock(self):
+        t = trial.Trial.__new__(trial.Trial)
+        t.audio_lock = threading.Lock()
+        t.audio = FakeAudio()
+        original_identity = t.audio._identity
+        def identity():
+            self.assertTrue(t.audio_lock.locked())
+            original_identity()
+        t.audio._identity = identity
+        t.audio_preflight = {'passed': True}
+        t.audio_graph = Mock(spec=['assert_alive'])
+        t.env = {'SYNTHETIC_ONLY': '1'}
+        t.display = ':99'
+        t.spawn = Mock(return_value=object())
+        result = t.encode()
+        args = t.spawn.call_args.args[0]
+        self.assertEqual(args, audio.ffmpeg_args(':99', FakeAudio(), lower_delay=True))
+        self.assertIs(result, t.encoder)
+        self.assertEqual(t.spawn.call_args.kwargs, {'env': t.env, 'stdout': trial.subprocess.PIPE})
+        t.audio_graph.assert_alive.assert_called_once_with()
+        self.assertFalse(t.audio_lock.locked())
+
+    def test_production_refuses_unproved_audio_or_dead_private_graph(self):
+        for preflight in (None, {}, {'passed': False}):
+            t = trial.Trial.__new__(trial.Trial)
+            t.audio_lock = threading.Lock(); t.audio = FakeAudio()
+            t.audio_preflight = preflight; t.spawn = Mock()
+            with self.assertRaisesRegex(RuntimeError, 'AUDIO_STARTUP_UNPROVED'):
+                t.encode()
+            t.spawn.assert_not_called()
+        t.audio_preflight = {'passed': True}
+        t.audio_graph = Mock(spec=['assert_alive'])
+        t.audio_graph.assert_alive.side_effect = RuntimeError('OWNED_GRAPH_DEAD')
+        with self.assertRaisesRegex(RuntimeError, 'OWNED_GRAPH_DEAD'):
+            t.encode()
+        t.spawn.assert_not_called()
+
+
+    def test_nominal_rate_fits_existing_session_byte_cap_without_cap_increase(self):
+        nominal = (25_000_000 + 128_000) * 1800 // 8
+        self.assertEqual(nominal, 5_653_800_000)
+        self.assertGreater(protocol.MAX_BYTES, nominal)
+        self.assertEqual(protocol.MAX_BYTES, 6_442_450_944)
+        # Mux overhead/VBR excursions still consume the existing fail-closed cap.
+
+
+if __name__ == '__main__':
+    unittest.main()

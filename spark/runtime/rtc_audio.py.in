@@ -1,0 +1,245 @@
+"""Private Pulse monitor -> Opus in the existing video pipeline; import is inert.
+
+Source PTS/segment are preserved. Running-time lateness is measured; it is not
+an assertion about the physical sound-device acquisition clock. No PCM is read
+by Python, persisted, inspected or logged. No default audio source is accepted.
+"""
+import os
+import re
+import threading
+import time
+import math
+
+class AudioRouteError(RuntimeError): pass
+
+def need(value, code):
+    if not value: raise AudioRouteError(code)
+
+class PrivatePulseOpus:
+    def __init__(self, trial, Gst, pipeline, connected, fail, on_buffer=None, diagnostics=None):
+        need(callable(connected) and callable(fail), 'RTC_AUDIO_CALLBACK')
+        self.trial, self.owner, self.Gst, self.pipeline = trial, trial.owner, Gst, pipeline
+        self.connected, self.fail, self.on_buffer = connected, fail, on_buffer
+        self.diagnostics = diagnostics
+        self.lock = threading.RLock()
+        self.elements, self.probes = [], []
+        self.started = self.closed = self.built = False
+        self.actual_buffer_us = self.actual_latency_us = None
+        self.readiness_polls = self.readiness_wait_ns = 0
+        self.segment = self.clock = self.base = None
+        self.last_running = None
+        self.buffers = self.preconnection_dropped = self.discontinuities = 0
+        self.max_lateness_ns = 0
+        self.error = None
+        self.pid = os.getpid()
+        self.audio = trial.audio
+        self.server = self.audio.server
+        self.monitor = self.audio.monitor
+        need(self.audio.isolated is True and re.fullmatch(r'unix:/run/user/[0-9]+/snap\.chromium/r2d2-audio-[a-f0-9]{16}/pulse/native', self.server), 'RTC_AUDIO_SERVER')
+        need(re.fullmatch(r'r2d2_[a-f0-9]{32}\.monitor', self.monitor), 'RTC_AUDIO_MONITOR')
+        self._identity()
+
+    def _identity(self):
+        need(self.trial.owner is self.owner and self.trial.audio is self.audio and
+             self.audio.server == self.server and self.audio.monitor == self.monitor,
+             'RTC_AUDIO_IDENTITY')
+        self.trial.audio_graph.assert_alive()
+        identity = self.audio._identity()
+        need(identity['monitorName'] == self.monitor and identity['rate'] == 48000 and identity['channels'] == 2,
+             'RTC_AUDIO_IDENTITY')
+
+    def _element(self, factory, name, **properties):
+        element = self.Gst.ElementFactory.make(factory, name)
+        need(element is not None, 'RTC_AUDIO_FACTORY')
+        for key, value in properties.items():
+            prop = key.replace('_', '-')
+            need(element.find_property(prop) is not None, 'RTC_AUDIO_PROPERTY')
+            element.set_property(prop, value)
+            need(element.get_property(prop) == value, 'RTC_AUDIO_PROPERTY')
+        self.pipeline.add(element)
+        need(element.get_parent() == self.pipeline, 'RTC_AUDIO_PARENT')
+        self.elements.append(element)
+        return element
+
+    def build(self):
+        with self.lock:
+            need(not self.started and not self.closed and self.trial.capture_allowed(), 'RTC_AUDIO_REPLAY')
+            self.started = True
+            self._identity()
+            try:
+                # AudioBaseSrc supplies its capture-derived PTS; never replace
+                # them with Python read completion or do-timestamp arrival time.
+                self.source = self._element('pulsesrc', 'private-monitor', server=self.server,
+                    device=self.monitor, provide_clock=False, do_timestamp=False,
+                    buffer_time=40000, latency_time=10000, slave_method=2)
+                convert = self._element('audioconvert', 'private-convert')
+                resample = self._element('audioresample', 'private-resample')
+                caps = self._element('capsfilter', 'private-audio-format', caps=self.Gst.Caps.from_string(
+                    'audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=2'))
+                queue = self._element('queue', 'private-audio-queue', max_size_buffers=4,
+                    max_size_bytes=7680, max_size_time=40000000, leaky=2)
+                opus = self._element('opusenc', 'private-opus', bitrate=128000, frame_size=20, audio_type=2049)
+                pay = self._element('rtpopuspay', 'private-opus-pay', pt=111)
+                chain = (self.source, convert, resample, caps, queue, opus, pay)
+                need(all(a.link(b) for a,b in zip(chain, chain[1:])), 'RTC_AUDIO_LINK')
+                # Validate the actual downstream TIME segment, after format
+                # negotiation; do not assume PTS == running time for any segment.
+                pad = queue.get_static_pad('src')
+                need(pad is not None, 'RTC_AUDIO_PAD')
+                mask = self.Gst.PadProbeType.BUFFER | self.Gst.PadProbeType.EVENT_DOWNSTREAM
+                ident = pad.add_probe(mask, self._probe)
+                need(bool(ident), 'RTC_AUDIO_PROBE')
+                self.probes.append((pad, ident))
+                self.built = True
+                return pay
+            except BaseException:
+                self.close()
+                raise
+
+    def bind_clock(self, cancelled=lambda: False, deadline=None, *, now=None, wait=None):
+        # PLAYING may precede AudioBaseSrc ringbuffer acquisition. Only the
+        # documented -1 sentinel is transient: positive out-of-policy values,
+        # type errors and identity/clock changes refuse immediately. No wait is
+        # performed under the audio lock, so streaming probes can progress.
+        now, wait = now or time.monotonic, wait or time.sleep
+        started = now()
+        need(type(started) in (int, float) and math.isfinite(started) and started >= 0,
+             'RTC_AUDIO_READINESS_CLOCK')
+        end = started + 1.0
+        if deadline is not None:
+            need(type(deadline) in (int, float) and math.isfinite(deadline), 'RTC_AUDIO_READINESS_CLOCK')
+            end = min(end, deadline)
+        last = started
+        with self.lock:
+            need(self.started and not self.closed, 'RTC_AUDIO_STATE')
+            clock, base = self.pipeline.get_clock(), self.pipeline.get_base_time()
+            need(clock is not None and type(base) is int and 0 <= base < self.Gst.CLOCK_TIME_NONE, 'RTC_AUDIO_CLOCK')
+            for key in ('actual-buffer-time', 'actual-latency-time'):
+                need(self.source.find_property(key) is not None, 'RTC_AUDIO_BUFFER_READBACK')
+        while True:
+            current = now()
+            need(type(current) in (int, float) and math.isfinite(current) and current >= last,
+                 'RTC_AUDIO_READINESS_CLOCK')
+            last = current
+            with self.lock:
+                self.readiness_wait_ns = int((current - started) * 1_000_000_000)
+            need(current < end and self.readiness_polls < 101, 'RTC_AUDIO_READINESS_TIMEOUT')
+            need(cancelled() is False and self.trial.capture_allowed() is True, 'RTC_AUDIO_OWNER')
+            self._identity()
+            with self.lock:
+                need(self.started and not self.closed, 'RTC_AUDIO_STATE')
+                need(self.pipeline.get_clock() == clock and self.pipeline.get_base_time() == base,
+                     'RTC_AUDIO_CLOCK_CHANGED')
+                actual_buffer = self.source.get_property('actual-buffer-time')
+                actual_latency = self.source.get_property('actual-latency-time')
+                self.readiness_polls += 1
+                if self.diagnostics is not None: self.diagnostics.pulse_values(actual_buffer, actual_latency)
+                need(type(actual_buffer) is int and (actual_buffer == -1 or 0 < actual_buffer <= 80000) and
+                     type(actual_latency) is int and (actual_latency == -1 or 0 < actual_latency <= 20000),
+                     'RTC_AUDIO_BUFFER_READBACK')
+                ready = actual_buffer != -1 and actual_latency != -1
+                if ready: need(actual_latency <= actual_buffer, 'RTC_AUDIO_BUFFER_READBACK')
+            current = now()
+            need(type(current) in (int, float) and math.isfinite(current) and current >= last,
+                 'RTC_AUDIO_READINESS_CLOCK')
+            last = current
+            with self.lock: self.readiness_wait_ns = int((current - started) * 1_000_000_000)
+            need(current < end, 'RTC_AUDIO_READINESS_TIMEOUT')
+            need(cancelled() is False and self.trial.capture_allowed() is True, 'RTC_AUDIO_OWNER')
+            if ready:
+                self._identity()
+                current = now()
+                need(type(current) in (int, float) and math.isfinite(current) and current >= last,
+                     'RTC_AUDIO_READINESS_CLOCK')
+                with self.lock: self.readiness_wait_ns = int((current - started) * 1_000_000_000)
+                need(current < end, 'RTC_AUDIO_READINESS_TIMEOUT')
+                need(cancelled() is False and self.trial.capture_allowed() is True, 'RTC_AUDIO_OWNER')
+                with self.lock:
+                    need(self.started and not self.closed, 'RTC_AUDIO_STATE')
+                    need(self.pipeline.get_clock() == clock and self.pipeline.get_base_time() == base,
+                         'RTC_AUDIO_CLOCK_CHANGED')
+                    self.actual_buffer_us, self.actual_latency_us = actual_buffer, actual_latency
+                    self.clock, self.base = clock, base
+                return
+            wait(min(.01, end - current))
+
+    def owns_capture(self, pid):
+        return type(pid) is int and pid == self.pid and self.built and not self.closed
+
+    def _probe(self, pad, info):
+        Gst = self.Gst
+        try:
+            with self.lock:
+                if self.closed: return Gst.PadProbeReturn.DROP
+                if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+                    event = info.get_event()
+                    if event is not None and event.type == Gst.EventType.SEGMENT:
+                        segment = event.parse_segment()
+                        need(segment is not None and segment.format == Gst.Format.TIME and
+                             segment.rate == 1.0 and segment.applied_rate == 1.0, 'RTC_AUDIO_SEGMENT')
+                        self.segment = segment.copy()
+                        # Segments may change their PTS mapping, but running
+                        # time still shares the same checked pipeline clock.
+                        # Retain the last forwarded watermark across segments.
+                    return Gst.PadProbeReturn.OK
+                buffer = info.get_buffer()
+                need(buffer is not None, 'RTC_AUDIO_BUFFER')
+                # The source is private even before authentication, but nothing
+                # reaches Opus/RTP until actual answer + connection. Drop, don't
+                # retain a pre-connection audio backlog.
+                if self.clock is None or not self.connected():
+                    self.preconnection_dropped += 1
+                    return Gst.PadProbeReturn.DROP
+                need(self.trial.capture_allowed(), 'RTC_AUDIO_OWNER')
+                need(self.pipeline.get_clock() == self.clock and self.pipeline.get_base_time() == self.base, 'RTC_AUDIO_CLOCK_CHANGED')
+                need(self.segment is not None, 'RTC_AUDIO_SEGMENT')
+                pts, duration = buffer.pts, buffer.duration
+                need(type(pts) is int and 0 <= pts < Gst.CLOCK_TIME_NONE and type(duration) is int and
+                     0 < duration <= 40000000 and 0 < buffer.get_size() <= 7680, 'RTC_AUDIO_BUFFER')
+                running = self.segment.to_running_time(Gst.Format.TIME, pts)
+                need(type(running) is int and 0 <= running < Gst.CLOCK_TIME_NONE, 'RTC_AUDIO_SEGMENT')
+                now = self.clock.get_time() - self.base
+                # Drop transient PulseAudio skew/re-anchor buffers instead of
+                # terminating the session.
+                lateness = now - running
+                if self.last_running is not None and running <= self.last_running:
+                    # A dropped buffer must never move the forwarded watermark
+                    # backward. Resume only with fresh, advancing running time.
+                    self.discontinuities += 1
+                    return Gst.PadProbeReturn.DROP
+                if not (-50000000 <= lateness <= 500000000):
+                    self.discontinuities += 1
+                    return Gst.PadProbeReturn.DROP
+                self.last_running = running
+                self.buffers += 1
+                self.max_lateness_ns = max(self.max_lateness_ns, lateness)
+                self.discontinuities += int(buffer.has_flags(Gst.BufferFlags.DISCONT))
+                if self.on_buffer is not None: self.on_buffer()
+                return Gst.PadProbeReturn.OK
+        except BaseException as exc:
+            code = exc.args[0] if type(exc) is AudioRouteError and len(exc.args) == 1 else 'RTC_AUDIO_PROBE_FAILED'
+            with self.lock:
+                if self.error is None: self.error = code
+            self.fail(code)
+            return Gst.PadProbeReturn.DROP
+
+    def close(self):
+        # Owning sender sets the pipeline NULL before calling this method, so
+        # removal doesn't race a streaming callback or detach a live element.
+        with self.lock:
+            if self.closed: return
+            self.closed = True
+            for pad, ident in self.probes: pad.remove_probe(ident)
+            self.probes.clear()
+            self.segment = self.clock = None
+
+    def snapshot(self):
+        with self.lock:
+            return dict(schema=1, privateMonitorBound=self.built, sourcePtsPreserved=self.buffers > 0,
+                        actualBufferUs=self.actual_buffer_us, actualLatencyUs=self.actual_latency_us,
+                        readinessPolls=self.readiness_polls, readinessWaitNs=self.readiness_wait_ns,
+                        sharedPipelineClockObserved=self.base is not None,
+                        physicalAcquisitionClockProven=False, buffers=self.buffers,
+                        preconnectionDropped=self.preconnection_dropped,
+                        discontinuities=self.discontinuities, maxRunningTimeLatenessNs=self.max_lateness_ns,
+                        error=self.error, closed=self.closed)

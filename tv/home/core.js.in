@@ -1,0 +1,280 @@
+(function (root) {
+  "use strict";
+  var ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+  var LIST = "luna://com.webos.applicationManager/listApps";
+  var LAUNCH = "luna://com.webos.applicationManager/launch";
+  var REMOVE = "luna://com.webos.appInstallService/remove";
+  var STORE_APP = "com.webos.app.discovery";
+  var MAX_RESPONSE_BYTES = 1024 * 1024;
+  var BROWSER_APP = "com.webos.app.tinybrowser", BROWSER_ORIGIN = "http://{{SPARK_IP}}:4181";
+  function configuredBrowser(config) { return !!config && config.origin === BROWSER_ORIGIN && typeof config.key === "string" && /^[a-f0-9]{64}$/.test(config.key); }
+
+  function boundedResponse(raw) {
+    if (typeof raw !== "string" || raw.length > MAX_RESPONSE_BYTES) return false;
+    var bytes = 0;
+    for (var i = 0; i < raw.length; i++) {
+      var code = raw.charCodeAt(i);
+      if (code < 0x80) bytes++;
+      else if (code < 0x800) bytes += 2;
+      else if (code >= 0xD800 && code <= 0xDBFF && i + 1 < raw.length && raw.charCodeAt(i + 1) >= 0xDC00 && raw.charCodeAt(i + 1) <= 0xDFFF) { bytes += 4; i++; }
+      else bytes += 3;
+      if (bytes > MAX_RESPONSE_BYTES) return false;
+    }
+    return true;
+  }
+
+  function normalize(reply, catalog) {
+    if (!reply || reply.returnValue !== true || !Array.isArray(reply.apps) || reply.apps.length > 1000) {
+      throw new Error("The TV did not return a valid app list.");
+    }
+    var seen = Object.create(null), shortcuts = Object.create(null), library = Object.create(null);
+    catalog.shortcuts.forEach(function (a) { shortcuts[a.id] = true; });
+    catalog.library.forEach(function (id) { library[id] = true; });
+    return reply.apps.filter(function (a) {
+      if (!a || typeof a.id !== "string" || !ID.test(a.id) || seen[a.id] || a.id === catalog.appId || a.type === "stub") return false;
+      if (!library[a.id] && !shortcuts[a.id]) return false;
+      if (a.visible === false && !shortcuts[a.id]) return false;
+      seen[a.id] = true;
+      return true;
+    }).map(function (a) {
+      return {id: a.id, title: typeof a.title === "string" ? a.title.slice(0, 100) : a.id, type: String(a.type || "web"), visible: !!library[a.id] && a.visible !== false,
+        removable: !!library[a.id] && a.removable === true && a.systemApp === false && !shortcuts[a.id], systemApp: a.systemApp !== false};
+    });
+  }
+
+  function Service(Bridge, timeoutMs, browserConfig) {
+    this.Bridge = Bridge;
+    this.browserConfig = configuredBrowser(browserConfig) ? Object.freeze({origin:BROWSER_ORIGIN,key:browserConfig.key}) : null;
+    this.timeoutMs = timeoutMs || 7000;
+    this.pending = [];
+    this.apps = [];
+    this.generation = 0;
+    this.cancelGeneration = 0;
+    this.catalog = null;
+    this.removing = false;
+  }
+  Service.prototype.request = function (uri, payload) {
+    var self = this;
+    if (uri !== LIST && uri !== LAUNCH && uri !== REMOVE) return Promise.reject(new Error("Unsupported operation."));
+    if (uri === REMOVE && (!payload || Object.keys(payload).join(",") !== "id" || !self.apps.some(function (app) { return app.id === payload.id && app.removable === true && app.systemApp === false; }))) return Promise.reject(new Error("This app cannot be deleted here."));
+    if (typeof self.Bridge !== "function") return Promise.reject(new Error("App access is available when App Library runs on the TV."));
+    return new Promise(function (resolve, reject) {
+      var bridge, timer, finished = false;
+      function finish(error, value) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        self.pending = self.pending.filter(function (p) { return p !== cancel; });
+        if (bridge && typeof bridge.cancel === "function") { try { bridge.cancel(); } catch (_) {} }
+        if (error) reject(error); else resolve(value);
+      }
+      function cancel() { finish(new Error("Request cancelled.")); }
+      try {
+        bridge = new self.Bridge();
+        self.pending.push(cancel);
+        bridge.onservicecallback = function (raw) {
+          if (finished) return;
+          if (!boundedResponse(raw)) { finish(new Error("The TV returned an oversized or invalid response.")); return; }
+          var value;
+          try { value = JSON.parse(raw); } catch (_) { finish(new Error("The TV returned an unreadable response.")); return; }
+          if (!value || value.returnValue !== true) {
+            finish(new Error(uri === LIST ? "App-list permission is unavailable. Installation needs app access." : uri === REMOVE ? "The TV did not allow app deletion. No automatic retry was made." : "The TV could not open that app.")); return;
+          }
+          finish(null, value);
+        };
+        timer = setTimeout(function () { finish(new Error("The TV did not respond. Please try again.")); }, self.timeoutMs);
+        bridge.call(uri, JSON.stringify(payload));
+      } catch (_) { finish(new Error("The TV service is unavailable.")); }
+    });
+  };
+  Service.prototype.refresh = function (catalog) {
+    var self = this, generation = ++self.generation, epoch = self.cancelGeneration;
+    self.catalog = catalog;
+    // Clear launch authority before reading; stale entries cannot launch after an error.
+    self.apps = [];
+    return self.request(LIST, {}).then(function (reply) {
+      if (generation !== self.generation || epoch !== self.cancelGeneration) throw new Error("A newer app refresh replaced this response.");
+      self.apps = normalize(reply, catalog); return self.apps;
+    });
+  };
+  Service.prototype.launch = function (id) {
+    if (id === BROWSER_APP || typeof id !== "string" || !this.apps.some(function (a) { return a.id === id; })) return Promise.reject(new Error("This app is not in the current TV inventory."));
+    return this.request(LAUNCH, {id: id});
+  };
+  Service.prototype.storeAvailable = function () { return this.apps.some(function (app) { return app.id === STORE_APP; }); };
+  Service.prototype.openStore = function () {
+    if (arguments.length || !this.storeAvailable()) return Promise.reject(new Error("App Store is not available on this TV."));
+    return this.request(LAUNCH, {id:STORE_APP});
+  };
+  Service.prototype.removeApp = function (id) {
+    var self = this, epoch = self.cancelGeneration, generation = self.generation, catalog = self.catalog;
+    function eligible(list) { return list.some(function (app) { return app.id === id && app.removable === true && app.systemApp === false; }); }
+    if (arguments.length !== 1 || typeof id !== "string" || !ID.test(id) || !catalog || self.removing || !eligible(self.apps)) return Promise.reject(new Error("This app cannot be deleted here."));
+    self.removing = true;
+    var dispatched = false, polls = 0, deadline;
+    function current() { if (epoch !== self.cancelGeneration || generation !== self.generation) throw new Error("Deletion check cancelled. Refresh apps before trying again."); }
+    function waitForPoll() {
+      return new Promise(function (resolve, reject) {
+        var timer, finished = false;
+        function finish(error) {
+          if (finished) return; finished = true; clearTimeout(timer);
+          self.pending = self.pending.filter(function (entry) { return entry !== cancel; });
+          if (error) reject(error); else resolve();
+        }
+        function cancel() { finish(new Error("Deletion check cancelled. Refresh apps before trying again.")); }
+        self.pending.push(cancel); timer = setTimeout(function () { finish(null); },300);
+      });
+    }
+    function validateList(reply) {
+      var list = normalize(reply,catalog);
+      // A malformed entry must not be mistaken for absence of the target.
+      if (reply.apps.some(function (app) { return !app || typeof app.id !== "string" || !ID.test(app.id); })) throw new Error("App deletion could not be confirmed. Refresh apps before trying again.");
+      return list;
+    }
+    function observe() {
+      current();
+      if (++polls > 40 || Date.now() >= deadline) throw new Error("App deletion could not be confirmed. Refresh apps before trying again.");
+      return self.request(LIST,{}).then(function (reply) {
+        current(); var list = validateList(reply);
+        if (!reply.apps.some(function (app) { return app.id === id; })) { self.apps = list; return {removed:true,id:id}; }
+        return waitForPoll().then(observe);
+      });
+    }
+    return self.request(LIST,{}).then(function (reply) {
+      current(); var list = validateList(reply);
+      if (!eligible(list) || reply.apps.some(function (app) { return app.id === id && (app.removable !== true || app.systemApp !== false); })) throw new Error("This app is no longer eligible for deletion. Refresh apps.");
+      self.apps = list; dispatched = true;
+      // An acknowledgement is not completion. Never replay a removal request.
+      return self.request(REMOVE,{id:id});
+    }).then(function () { deadline = Date.now()+15000; return observe(); }).then(function (result) {
+      self.removing = false; return result;
+    },function (error) {
+      self.removing = false;
+      if (dispatched && epoch === self.cancelGeneration && generation === self.generation) self.apps = [];
+      throw error;
+    });
+  };
+  Service.prototype.browserAvailable = function () {
+    return configuredBrowser(this.browserConfig) && this.apps.some(function (a) { return a.id === BROWSER_APP; });
+  };
+  Service.prototype.launchBrowser = function () {
+    if (arguments.length || !this.browserAvailable()) return Promise.reject(new Error("The Spark browser connection is unavailable."));
+    return this.request(LAUNCH, {id:BROWSER_APP,params:{contentTarget:BROWSER_ORIGIN + "/" + this.browserConfig.key + "/open"}});
+  };
+  Service.prototype.restartTv = function () {
+    if (arguments.length || !this.browserAvailable()) return Promise.reject(new Error("The Spark browser connection is unavailable."));
+    return this.request(LAUNCH, {id:BROWSER_APP,params:{contentTarget:BROWSER_ORIGIN + "/" + this.browserConfig.key + "/open#restart-tv"}});
+  };
+  function managerRead(self, path, project, offline, invalid, options) {
+    // A long-poll keeps its cancel in its own owner, out of Service.cancelAll.
+    var owner = options && options.owner || self, timeoutMs = options && options.timeoutMs || 2500;
+    if (!configuredBrowser(self.browserConfig) || typeof root.fetch !== "function" || typeof root.AbortController !== "function") return Promise.resolve(offline);
+    return new Promise(function (resolve) {
+      var controller = new root.AbortController(), reader = null, timer, done = false;
+      function finish(state) {
+        if (done) return; done = true; clearTimeout(timer);
+        owner.pending = owner.pending.filter(function (p) { return p !== cancel; });
+        try { controller.abort(); } catch (_) {}
+        if (reader) { try { var closed = reader.cancel(); if (closed && closed.catch) closed.catch(function () {}); } catch (_) {} }
+        resolve(state);
+      }
+      function cancel() { finish(offline); }
+      owner.pending.push(cancel); timer = setTimeout(cancel, timeoutMs);
+      var url = BROWSER_ORIGIN + "/" + self.browserConfig.key + "/" + path;
+      Promise.resolve().then(function () { return root.fetch(url, {method:"GET",mode:"cors",credentials:"omit",cache:"no-store",redirect:"error",referrerPolicy:"no-referrer",signal:controller.signal}); }).then(function (reply) {
+        if (done) return;
+        if (!reply || reply.status !== 200 || reply.url !== url || !reply.body || typeof reply.body.getReader !== "function") { finish(invalid); return; }
+        reader = reply.body.getReader(); var body = "", bytes = 0;
+        function read() {
+          return reader.read().then(function (part) {
+            if (done) return;
+            if (part.done) {
+              try { finish(project(JSON.parse(body))); } catch (_) { finish(invalid); }
+              return;
+            }
+            if (!part.value || (bytes += part.value.length) > 512) { finish(invalid); return; }
+            for (var i=0;i<part.value.length;i++) { if (part.value[i] > 127) { finish(invalid); return; } body += String.fromCharCode(part.value[i]); }
+            return read();
+          });
+        }
+        return read();
+      }).catch(function () { finish(offline); });
+    });
+  }
+  Service.prototype.browserStatus = function () {
+    if (!this.browserAvailable()) return Promise.resolve("unavailable");
+    return managerRead(this, "status", function (value) {
+      if (!value || Array.isArray(value) || Object.keys(value).length !== 1 || ["idle","starting","ready","stopping","error"].indexOf(value.state) < 0) throw new Error();
+      return value.state;
+    }, "offline", "error");
+  };
+  // Spark derives weather from its public IP and sends zip "" (an older Spark sent five digits).
+  // Home never shows or keeps it.
+  function unavailableWeather() { return {state:"unavailable",zip:"",temperatureF:null,condition:null,icon:null,observedAt:null}; }
+  function weatherValue(value) {
+    if (!value || Array.isArray(value) || Object.keys(value).sort().join(",") !== "condition,icon,observedAt,state,temperatureF,zip" || typeof value.zip !== "string" || !/^(?:\d{5})?$/.test(value.zip) || ["live","stale","unavailable"].indexOf(value.state) < 0) throw new Error();
+    if (value.state === "unavailable") {
+      if (value.temperatureF !== null || value.condition !== null || value.icon !== null || value.observedAt !== null) throw new Error();
+      return unavailableWeather();
+    }
+    if (!Number.isInteger(value.temperatureF) || value.temperatureF < -100 || value.temperatureF > 150 || typeof value.condition !== "string" || !/^[ -~]{1,64}$/.test(value.condition) || ["clear","partly-cloudy","cloudy","fog","rain","snow","storm","wind","unknown"].indexOf(value.icon) < 0 || typeof value.observedAt !== "string" || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(value.observedAt)) throw new Error();
+    var stamp = Date.parse(value.observedAt), now = Date.now();
+    if (!Number.isFinite(stamp) || new Date(stamp).toISOString().replace(".000Z","Z") !== value.observedAt || stamp > now + 300000) throw new Error();
+    return {state:value.state === "stale" || now - stamp > 7200000 ? "stale" : "live",zip:"",temperatureF:value.temperatureF,condition:value.condition,icon:value.icon,observedAt:value.observedAt};
+  }
+  Service.prototype.weather = function () { return managerRead(this, "weather", weatherValue, unavailableWeather(), unavailableWeather()); };
+  Service.prototype.cancelAll = function () { ++this.cancelGeneration; this.pending.slice().forEach(function (cancel) { cancel(); }); };
+
+  // Spark owns every voice string; Home accepts only its closed shape and charset.
+  var VOICE_KEYS = "ageMs,badge,chip,detail,dwellMs,headline,meter,meterMs,mood,phase,seq,tone,v,word";
+  var VOICE_TEXT = /^[ -~\u2018\u2019\u201c\u201d\u2026]*$/;
+  var VOICE_OFFLINE = Object.freeze({}), VOICE_INVALID = Object.freeze({});
+  function voiceCount(value, max) { return Number.isInteger(value) && value >= 0 && value <= max; }
+  function voiceText(value, max) { return typeof value === "string" && value.length <= max && VOICE_TEXT.test(value); }
+  function voiceValue(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).sort().join(",") !== VOICE_KEYS || value.v !== 1 || !voiceCount(value.seq, 9999999999) || !voiceCount(value.ageMs, 600000)) throw new Error();
+    if (["idle","pressed","listening","released","doing","confirm","result"].indexOf(value.phase) < 0 || ["idle","ready","listen","work","done","sent","unsure","nothing","failed","ask"].indexOf(value.tone) < 0 || ["idle","front","listening","thinking","verified","asking","dim","sleepy"].indexOf(value.mood) < 0 || ["ready","warming","starting","unavailable","paused"].indexOf(value.chip) < 0) throw new Error();
+    if (typeof value.word !== "string" || !/^[A-Z'\u2019 ]{0,20}$/.test(value.word) || !voiceText(value.headline, 40) || !voiceText(value.detail, 72)) throw new Error();
+    if (value.badge !== null && ["confirmed","sent","unconfirmed","nothing","changed","failed","waiting"].indexOf(value.badge) < 0 || value.meter !== null && ["hold","sweep","countdown"].indexOf(value.meter) < 0 || value.meterMs !== null && !voiceCount(value.meterMs, 20000) || value.dwellMs !== null && !voiceCount(value.dwellMs, 20000)) throw new Error();
+    // A timed meter needs its duration; a sweep may omit it.
+    if (value.meter === null ? value.meterMs !== null : value.meter !== "sweep" && value.meterMs === null) throw new Error();
+    if (value.phase === "idle" ? value.word || value.headline || value.detail || value.badge !== null || value.meter !== null : !value.headline) throw new Error();
+    return {v:1,seq:value.seq,phase:value.phase,ageMs:value.ageMs,tone:value.tone,word:value.word,headline:value.headline,detail:value.detail,badge:value.badge,meter:value.meter,meterMs:value.meterMs,dwellMs:value.dwellMs,mood:value.mood,chip:value.chip};
+  }
+  function VoiceFeed(service, onUpdate) {
+    this.service = service; this.onUpdate = onUpdate; this.pending = [];
+    this.generation = 0; this.since = 0; this.failures = 0; this.replay = false; this.timer = null; this.running = false;
+  }
+  VoiceFeed.prototype.available = function () { return configuredBrowser(this.service.browserConfig) && typeof root.fetch === "function" && typeof root.AbortController === "function"; };
+  VoiceFeed.prototype.start = function () {
+    if (this.running || !this.available()) return;
+    // since=0 is never held by Spark, so a fresh start replays the current view at once.
+    this.running = true; this.since = 0; this.failures = 0; this.replay = true; this.poll(++this.generation);
+  };
+  VoiceFeed.prototype.stop = function () {
+    this.running = false; ++this.generation; clearTimeout(this.timer); this.timer = null;
+    // Aborting lets Spark see the peer close and free its single waiter slot.
+    this.pending.slice().forEach(function (cancel) { cancel(); });
+  };
+  VoiceFeed.prototype.poll = function (generation) {
+    var self = this; self.timer = null;
+    managerRead(self.service, "voice/" + self.since, voiceValue, VOICE_OFFLINE, VOICE_INVALID, {owner:self, timeoutMs:25000}).then(function (value) {
+      if (generation !== self.generation) return;
+      var replay = self.replay, failed = value === VOICE_OFFLINE || value === VOICE_INVALID, notify = failed;
+      if (failed) self.failures++;
+      else { notify = replay || self.failures > 0 || value.seq !== self.since; self.failures = 0; self.since = value.seq; self.replay = false; }
+      // Even a valid reply waits 250 ms, so a seq Spark never holds cannot spin the TV.
+      self.timer = setTimeout(function () { self.poll(generation); }, failed ? Math.min(30000, 1000 * Math.pow(2, self.failures - 1)) : 250);
+      if (notify) self.onUpdate(failed ? null : value, self.failures, replay);
+    });
+  };
+
+  function selectFavorites(apps, saved, catalog) {
+    var ids = Array.isArray(saved) ? saved : catalog.favorites.map(function (a) { return a.id; });
+    var byId = Object.create(null), seen = Object.create(null);
+    apps.forEach(function (a) { if (a.visible) byId[a.id] = a; });
+    return ids.filter(function (id) { if (typeof id !== "string" || !byId[id] || seen[id]) return false; seen[id] = true; return true; }).slice(0, 12);
+  }
+  root.OwnerCore = {Service: Service, VoiceFeed: VoiceFeed, normalize: normalize, selectFavorites: selectFavorites, voiceValue: voiceValue, weatherValue: weatherValue, uris: {list: LIST, launch: LAUNCH}};
+  if (typeof module !== "undefined" && module.exports) module.exports = root.OwnerCore;
+}(typeof window !== "undefined" ? window : globalThis));

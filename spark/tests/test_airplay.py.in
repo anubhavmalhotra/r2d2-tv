@@ -1,0 +1,2937 @@
+"""Unit tests for Spark 4K60 / 4K120 AirPlay profiles, UxPlay ingress, and relay session."""
+import unittest
+import airplay as ap
+import airplay_ingress as ai
+import build_viewer as bv
+import media_profile as mp
+import media_ring as mr
+import protocol as proto
+from test_media_ring import init_bytes, pair
+
+
+def init_bytes_level(level_idc):
+    return init_bytes(hvcc_change=lambda h: h.__setitem__(12, level_idc))
+
+
+class MediaProfileTests(unittest.TestCase):
+    def test_closed_profiles_and_lookup(self):
+        p60 = mp.profile_for_name('4k60_hevc')
+        self.assertEqual(p60.codec_string, 'hvc1.1.6.L153.B0')
+        self.assertEqual((p60.width, p60.height, p60.fps, p60.level_idc, p60.frame_duration_ticks),
+                         (3840, 2160, 60, 153, 1500))
+        p120 = mp.profile_for_name('4k120_hevc')
+        self.assertEqual(p120.codec_string, 'hvc1.1.6.L156.B0')
+        self.assertEqual((p120.width, p120.height, p120.fps, p120.level_idc, p120.frame_duration_ticks),
+                         (3840, 2160, 120, 156, 750))
+        self.assertEqual(mp.profile_for_codec('hvc1.1.6.L156.B0'), p120)
+        with self.assertRaises(ValueError):
+            mp.profile_for_name('1080p60')
+        with self.assertRaises(ValueError):
+            mp.profile_for_codec('hev1.1.6.L153.B0')
+
+    def test_inspect_init_profile_detects_4k60_and_4k120(self):
+        ftyp60, moov60 = init_bytes_level(153)
+        self.assertEqual(mp.inspect_init_profile(ftyp60, moov60), mp.PROFILE_4K60_HEVC)
+        ftyp120, moov120 = init_bytes_level(156)
+        self.assertEqual(mp.inspect_init_profile(ftyp120, moov120), mp.PROFILE_4K120_HEVC)
+        ftyp_bad, moov_bad = init_bytes_level(120)
+        with self.assertRaisesRegex(mr.MediaError, 'HVCC_PROFILE'):
+            mp.inspect_init_profile(ftyp_bad, moov_bad)
+
+
+class AirPlayIngressTests(unittest.TestCase):
+    def test_uxplay_version_gate_requires_1_73_7(self):
+        self.assertEqual(ai.require_uxplay_version('UxPlay version 1.73.7; for help, use option "-h"'), (1, 73, 7))
+        self.assertEqual(ai.require_uxplay_version('UxPlay 1.73.7 (AirPlay2 Mirroring)'), (1, 73, 7))
+        self.assertEqual(ai.require_uxplay_version('UxPlay v1.74.0'), (1, 74, 0))
+        for old in (
+            'UxPlay version 1.73.6; for help, use option "-h"',
+            'UxPlay 1.68.2',
+            'UxPlay 1.72.3',
+            'UxPlay 1.73.6',
+        ):
+            with self.subTest(old=old), self.assertRaisesRegex(ValueError, 'UXPLAY_VERSION_TOO_OLD'):
+                ai.require_uxplay_version(old)
+
+    def test_uxplay_command_4k60_and_4k120_loopback_only_no_hls(self):
+        cmd60 = ai.build_uxplay_command(profile_name='4k60_hevc', pin=1234, fps_data=True)
+        self.assertIn('-h265', cmd60)
+        self.assertIn('3840x2160@60', cmd60)
+        self.assertIn('-nh', cmd60)
+        self.assertNotIn('-hls', cmd60)
+        self.assertIn('1234', cmd60)
+        self.assertIn('-FPSdata', cmd60)
+        self.assertTrue(any('host=127.0.0.1 port=5000' in x and 'timestamp-offset=0' in x for x in cmd60))
+        self.assertTrue(any('host=127.0.0.1 port=5002' in x and 'timestamp-offset=0' in x for x in cmd60))
+
+        synthetic_id = ':'.join(('AA', 'BB', 'CC', 'DD', 'EE', 'FF'))
+        cmd120 = ai.build_uxplay_command(
+            profile_name='4k120_hevc',
+            device_id=synthetic_id,
+            password='private-password',
+        )
+        self.assertIn('3840x2160@120', cmd120)
+        self.assertIn('120', cmd120)
+        self.assertIn(synthetic_id, cmd120)
+
+        with self.assertRaises(ValueError):
+            ai.build_uxplay_command(pin=1234, password='conflict-password')
+        with self.assertRaises(ValueError):
+            ai.build_uxplay_command(video_rtp_port=5000, audio_rtp_port=5000)
+        self.assertIn('0001', ai.build_uxplay_command(pin=1))
+        self.assertIn('9999', ai.build_uxplay_command(pin=9999))
+        for bad_pin in (0, -1, 10000, True):
+            with self.subTest(bad_pin=bad_pin), self.assertRaisesRegex(ValueError, 'UXPLAY_PIN'):
+                ai.build_uxplay_command(pin=bad_pin)
+
+    def test_remux_and_reencode_commands_and_sdp(self):
+        sdp = ai.build_loopback_sdp(video_rtp_port=5000, audio_rtp_port=5002).decode('ascii')
+        self.assertIn('m=video 5000 RTP/AVP 96', sdp)
+        self.assertIn('a=rtpmap:96 H265/90000', sdp)
+        self.assertIn('m=audio 5002 RTP/AVP 96', sdp)
+        self.assertIn('a=rtpmap:96 L16/44100/2', sdp)
+
+        b1 = ai.build_remux_command(short_fragment=True)
+        self.assertIn('-listen_timeout', b1)
+        self.assertIn('15', b1)
+        self.assertIn('sdp', b1)
+        self.assertIn('pipe:0', b1)
+        self.assertIn('0:v:0', b1)
+        self.assertIn('0:a:0', b1)
+        self.assertIn('copy', b1)
+        self.assertIn('16667', b1)
+        with self.assertRaisesRegex(ValueError, 'SDP_LISTEN_TIMEOUT'):
+            ai.build_remux_command(listen_timeout_s=0)
+
+        b2_120 = ai.build_reencode_command(profile_name='4k120_hevc', short_fragment=True)
+        self.assertIn('-listen_timeout', b2_120)
+        self.assertIn('sdp', b2_120)
+        self.assertIn('pipe:0', b2_120)
+        self.assertIn('0:v:0', b2_120)
+        self.assertIn('0:a:0', b2_120)
+        self.assertIn('hevc_nvenc', b2_120)
+        self.assertIn('5.2', b2_120)
+        with self.assertRaisesRegex(ValueError, 'SDP_LISTEN_TIMEOUT'):
+            ai.build_reencode_command(listen_timeout_s=301)
+
+    def test_reencode_letterboxes_any_sender_shape_to_fixed_4k(self):
+        for name, fps, level, rate, peak in (
+            ('4k60_hevc', 60, '5.1', '30M', '40M'),
+            ('4k120_hevc', 120, '5.2', '45M', '60M'),
+        ):
+            with self.subTest(profile=name):
+                cmd = ai.build_reencode_command(profile_name=name)
+                # hevc_cuvid fails after a mid-stream size change; the hwaccel does not.
+                self.assertNotIn('hevc_cuvid', cmd)
+                self.assertEqual(cmd[cmd.index('-hwaccel') + 1], 'cuda')
+                self.assertLess(cmd.index('-hwaccel'), cmd.index('-i'))
+                vf = cmd[cmd.index('-vf') + 1]
+                self.assertIn("scale=w='max(2,trunc(min(3840,2160*dar)/2)*2)'", vf)
+                self.assertIn("h='max(2,trunc(min(2160,3840/dar)/2)*2)'", vf)
+                self.assertIn('pad=w=3840:h=2160:x=(ow-iw)/2:y=(oh-ih)/2', vf)
+                self.assertTrue(vf.endswith(f',fps={fps}'))
+                self.assertEqual(cmd[cmd.index('-level:v') + 1], level)
+                self.assertEqual(cmd[cmd.index('-tier') + 1], 'main')
+                self.assertEqual(cmd[cmd.index('-b:v') + 1], rate)
+                self.assertEqual(cmd[cmd.index('-maxrate') + 1], peak)
+                self.assertEqual(cmd[cmd.index('-g') + 1], str(fps))
+                self.assertEqual(cmd[cmd.index('-bf') + 1], '0')
+                self.assertEqual(cmd[cmd.index('-pix_fmt') + 1], 'yuv420p')
+                self.assertEqual(cmd[cmd.index('-fps_mode:v') + 1], 'cfr')
+                self.assertEqual(cmd[cmd.index('-r:v') + 1], str(fps))
+                self.assertNotIn('asetpts=N+1024', ' '.join(cmd))
+
+    def test_rtp_input_tolerates_bursts_and_unset_sender_timestamps(self):
+        for cmd in (ai.build_remux_command(), ai.build_reencode_command()):
+            with self.subTest(cmd=cmd[cmd.index('-c:v') + 1]):
+                head = cmd[:cmd.index('-i')]
+                self.assertEqual(head[head.index('-buffer_size') + 1], str(ai.RTP_RECEIVE_BUFFER_BYTES))
+                self.assertEqual(head[head.index('-use_wallclock_as_timestamps') + 1], '1')
+
+    def test_uxplay_lets_a_second_device_take_over(self):
+        self.assertIn('-nohold', ai.build_uxplay_command(pin=1234))
+
+    def test_av_sync_verification_contract(self):
+        ok = ai.verify_av_sync(1000.0, 1024.5)
+        self.assertTrue(ok['qualified'])
+        self.assertEqual(ok['absOffsetMs'], 24.5)
+        bad = ai.verify_av_sync(1000.0, 1055.0)
+        self.assertFalse(bad['qualified'])
+
+
+class AirPlayRelayAndProtocolTests(unittest.TestCase):
+    def test_relay_session_4k60_and_4k120_handoff_and_teardown(self):
+        for level_idc, expected_profile, expected_codec in (
+            (153, '4k60_hevc', 'hvc1.1.6.L153.B0'),
+            (156, '4k120_hevc', 'hvc1.1.6.L156.B0'),
+        ):
+            events = []
+            session = ap.AirPlayRelaySession(
+                'a' * 32,
+                requested_profile=expected_profile,
+                relay_mode='b1',
+                tv_open_callback=lambda **kw: events.append(('open', kw, session.lock._is_owned())),
+                tv_teardown_callback=lambda **kw: events.append(('teardown', kw, session.lock._is_owned())),
+            )
+            detected = session.ingest_init(*init_bytes_level(level_idc))
+            self.assertEqual(detected.name, expected_profile)
+            session.ingest_fragment(*pair())
+            self.assertEqual(
+                events,
+                [('open', {'epoch': 'a' * 32, 'codec': expected_codec, 'profile': expected_profile}, True)],
+            )
+            session.ingest_fragment(*pair(2, 16000, 12288, sync=False))
+            self.assertEqual(len(events), 1)
+            snap = session.close('sender-disconnected')
+            self.assertTrue(snap['closed'])
+            self.assertEqual(snap['closeReason'], 'sender-disconnected')
+            self.assertEqual(
+                events[1],
+                ('teardown', {'epoch': 'a' * 32, 'reason': 'sender-disconnected'}, True),
+            )
+            session.close('teardown')
+            self.assertEqual(len(events), 2)
+
+    def test_run_relay_writes_sdp_pumps_fmp4_and_tears_down(self):
+        import io
+        import types
+        stream_bytes = b''.join(init_bytes_level(156)) + b''.join(pair())
+        spawned = []
+        terminated = []
+        events = []
+
+        def fake_spawn(argv, **kwargs):
+            stdin_buf = io.BytesIO()
+            stdin_buf.close = lambda: setattr(stdin_buf, 'closed_flag', True)
+            if argv == ['uxplay', '-v']:
+                stdout_buf = io.BytesIO(b'UxPlay version 1.73.7; for help, use option "-h"\n')
+            elif argv[0] == 'ffmpeg':
+                stdout_buf = io.BytesIO(stream_bytes)
+            else:
+                stdout_buf = None
+            proc = types.SimpleNamespace(argv=argv, stdin=stdin_buf, stdout=stdout_buf)
+            spawned.append(proc)
+            return proc
+
+        session = ap.AirPlayRelaySession(
+            'b' * 32,
+            requested_profile='4k120_hevc',
+            relay_mode='b1',
+            tv_open_callback=lambda **kw: events.append(('open', kw)),
+            tv_teardown_callback=lambda **kw: events.append(('teardown', kw)),
+        )
+        snap = session.run_relay(fake_spawn, terminate=lambda p: terminated.append(p.argv[0]))
+        self.assertEqual([p.argv[0] for p in spawned], ['uxplay', 'ffmpeg', 'uxplay'])
+        self.assertEqual(spawned[0].argv, ['uxplay', '-v'])
+        self.assertIn(b'H265/90000', spawned[1].stdin.getvalue())
+        self.assertIn(b'L16/44100/2', spawned[1].stdin.getvalue())
+        self.assertTrue(getattr(spawned[1].stdin, 'closed_flag', False))
+        self.assertEqual(snap['activeProfile'], '4k120_hevc')
+        self.assertTrue(snap['tvOpened'])
+        self.assertTrue(snap['closed'])
+        self.assertEqual([e[0] for e in events], ['open', 'teardown'])
+        self.assertEqual(terminated, ['uxplay', 'ffmpeg'])
+
+        # Delayed first RTP (e.g., slow receiver selection / PIN entry): FFmpeg retries without killing UxPlay
+        slow_spawned = []
+        ffmpeg_calls = []
+        def slow_spawn(argv, **kwargs):
+            stdin_buf = io.BytesIO()
+            if argv == ['uxplay', '-v']:
+                stdout_buf = io.BytesIO(b'UxPlay version 1.73.7; for help, use option "-h"\n')
+            elif argv[0] == 'ffmpeg':
+                ffmpeg_calls.append(len(ffmpeg_calls))
+                stdout_buf = io.BytesIO(b'' if len(ffmpeg_calls) < 3 else stream_bytes)
+            else:
+                stdout_buf = None
+            proc = types.SimpleNamespace(argv=argv, stdin=stdin_buf, stdout=stdout_buf, poll=lambda: None)
+            slow_spawned.append(proc)
+            return proc
+
+        slow_session = ap.AirPlayRelaySession('f' * 32, requested_profile='4k120_hevc', relay_mode='b1')
+        slow_snap = slow_session.run_relay(slow_spawn, max_startup_attempts=4)
+        self.assertEqual([p.argv[0] for p in slow_spawned], ['uxplay', 'ffmpeg', 'uxplay', 'ffmpeg', 'ffmpeg'])
+        self.assertEqual(slow_snap['activeProfile'], '4k120_hevc')
+        self.assertTrue(slow_snap['tvOpened'])
+        self.assertEqual(slow_snap['closeReason'], 'sender-disconnected')
+
+        # Exhausted startup attempts with zero RTP must raise AIRPLAY_STARTUP_TIMEOUT and close with 'error'
+        never_session = ap.AirPlayRelaySession('9' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+        def empty_spawn(argv, **kwargs):
+            return types.SimpleNamespace(
+                argv=argv,
+                stdin=io.BytesIO(),
+                stdout=io.BytesIO(b'UxPlay version 1.73.7\n' if argv == ['uxplay', '-v'] else b''),
+                poll=lambda: None,
+            )
+        with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_STARTUP_TIMEOUT'):
+            never_session.run_relay(empty_spawn, max_startup_attempts=2)
+        self.assertTrue(never_session.closed)
+        self.assertEqual(never_session.close_reason, 'error')
+
+        # Vulnerable UxPlay (< 1.73.7) must be refused before spawning ffmpeg or listener
+        old_calls = []
+        def old_spawn(argv, **kwargs):
+            old_calls.append(argv)
+            return types.SimpleNamespace(
+                argv=argv,
+                stdout=io.BytesIO(b'UxPlay version 1.73.6; for help, use option "-h"\n'),
+                stderr=None,
+            )
+
+        bad_session = ap.AirPlayRelaySession('e' * 32)
+        with self.assertRaisesRegex(ValueError, 'UXPLAY_VERSION_TOO_OLD'):
+            bad_session.run_relay(old_spawn)
+        self.assertEqual(old_calls, [['uxplay', '-v']])
+        self.assertTrue(bad_session.closed)
+        self.assertEqual(bad_session.close_reason, 'error')
+
+    def test_close_during_idle_relay_terminates_processes_and_unblocks_reader(self):
+        import io
+        import threading
+        import types
+
+        read_entered = threading.Event()
+        stdout_closed = threading.Event()
+        terminated = []
+
+        class BlockingStdout:
+            def read(self, count):
+                read_entered.set()
+                stdout_closed.wait(2)
+                return b''
+
+            def close(self):
+                stdout_closed.set()
+
+        def fake_spawn(argv, **kwargs):
+            stdin_buf = io.BytesIO()
+            if argv == ['uxplay', '-v']:
+                stdout_buf = io.BytesIO(b'UxPlay 1.73.7\n')
+            elif argv[0] == 'ffmpeg':
+                stdout_buf = BlockingStdout()
+            else:
+                stdout_buf = None
+            return types.SimpleNamespace(argv=argv, stdin=stdin_buf, stdout=stdout_buf)
+
+        session = ap.AirPlayRelaySession('c' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+        relay_out = []
+        t = threading.Thread(
+            target=lambda: relay_out.append(
+                session.run_relay(fake_spawn, terminate=lambda p: terminated.append(p.argv[0]))
+            )
+        )
+        t.start()
+        self.assertTrue(read_entered.wait(1))
+        snap = session.close('owner-ended')
+        t.join(1)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(snap['closed'])
+        self.assertEqual(snap['closeReason'], 'owner-ended')
+        self.assertEqual(terminated, ['uxplay', 'ffmpeg'])
+        self.assertEqual(relay_out[0]['closeReason'], 'owner-ended')
+
+        # Even if tv_teardown_callback raises, _stop_processes() must still run in finally:
+        read_entered2 = threading.Event()
+        stdout_closed2 = threading.Event()
+        terminated2 = []
+
+        class BlockingStdout2:
+            def read(self, count):
+                read_entered2.set()
+                stdout_closed2.wait(2)
+                return b''
+
+            def close(self):
+                stdout_closed2.set()
+
+        def fake_spawn2(argv, **kwargs):
+            stdin_buf = io.BytesIO()
+            if argv == ['uxplay', '-v']:
+                stdout_buf = io.BytesIO(b'UxPlay 1.73.7\n')
+            elif argv[0] == 'ffmpeg':
+                stdout_buf = BlockingStdout2()
+            else:
+                stdout_buf = None
+            return types.SimpleNamespace(argv=argv, stdin=stdin_buf, stdout=stdout_buf)
+
+        def broken_teardown(**kw):
+            raise RuntimeError('synthetic TV teardown error')
+
+        session2 = ap.AirPlayRelaySession(
+            'd' * 32,
+            requested_profile='4k60_hevc',
+            relay_mode='b1',
+            tv_teardown_callback=broken_teardown,
+        )
+        t2 = threading.Thread(
+            target=lambda: session2.run_relay(fake_spawn2, terminate=lambda p: terminated2.append(p.argv[0]))
+        )
+        t2.start()
+        self.assertTrue(read_entered2.wait(1))
+        with self.assertRaises(RuntimeError):
+            session2.close('owner-ended')
+        t2.join(1)
+        self.assertFalse(t2.is_alive())
+        self.assertTrue(stdout_closed2.is_set())
+        self.assertEqual(terminated2, ['uxplay', 'ffmpeg'])
+
+        # Blocked version-probe pipe ('uxplay -v') must also be owned, cancelled by close(), and bounded by timeout
+        probe_read_entered = threading.Event()
+        probe_stdout_closed = threading.Event()
+        probe_terminated = []
+        probe_spawned = []
+
+        class BlockingProbeStdout:
+            def read(self, count):
+                probe_read_entered.set()
+                probe_stdout_closed.wait(2)
+                return b''
+
+            def close(self):
+                probe_stdout_closed.set()
+
+        def blocking_probe_spawn(argv, **kwargs):
+            proc = types.SimpleNamespace(
+                argv=argv,
+                stdin=io.BytesIO(),
+                stdout=BlockingProbeStdout(),
+                stderr=io.BytesIO(b''),
+            )
+            probe_spawned.append(proc)
+            return proc
+
+        session3 = ap.AirPlayRelaySession('5' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+        relay_out3 = []
+        t3 = threading.Thread(
+            target=lambda: relay_out3.append(
+                session3.run_relay(blocking_probe_spawn, terminate=lambda p: probe_terminated.append(p.argv))
+            )
+        )
+        t3.start()
+        self.assertTrue(probe_read_entered.wait(1))
+        snap3 = session3.close('owner-ended')
+        t3.join(1)
+        self.assertFalse(t3.is_alive())
+        self.assertTrue(probe_stdout_closed.is_set())
+        self.assertEqual([p.argv for p in probe_spawned], [['uxplay', '-v']])
+        self.assertEqual(probe_terminated, [['uxplay', '-v']])
+        self.assertTrue(snap3['closed'])
+        self.assertEqual(snap3['closeReason'], 'owner-ended')
+        self.assertEqual(relay_out3[0]['closeReason'], 'owner-ended')
+
+        # Uncancelled hung version probe must time out and reap the probe child
+        hung_closed = threading.Event()
+        hung_terminated = []
+
+        class HungProbeStdout:
+            def read(self, count):
+                hung_closed.wait(2)
+                return b''
+
+            def close(self):
+                hung_closed.set()
+
+        session4 = ap.AirPlayRelaySession('4' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+        session4._terminate_fn = lambda p: hung_terminated.append(p.argv)
+        with self.assertRaisesRegex(RuntimeError, 'UXPLAY_VERSION_PROBE_TIMEOUT'):
+            session4._probe_uxplay_version(
+                lambda argv, **kw: types.SimpleNamespace(
+                    argv=argv,
+                    stdout=HungProbeStdout(),
+                    stderr=io.BytesIO(b''),
+                ),
+                timeout_s=0.08,
+            )
+        self.assertTrue(hung_closed.is_set())
+        self.assertEqual(hung_terminated, [['uxplay', '-v']])
+
+        # Real subprocess probe where a forked descendant keeps stdout/stderr open must bound timeout and close()
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+
+        fork_children = []
+        fork_code = 'import os, time; os.fork(); time.sleep(30)'
+        def fork_spawn(argv, **kwargs):
+            proc = subprocess.Popen([sys.executable, '-u', '-c', fork_code], start_new_session=True, **kwargs)
+            fork_children.append(proc)
+            return proc
+
+        try:
+            session5 = ap.AirPlayRelaySession('3' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'UXPLAY_VERSION_PROBE_TIMEOUT'):
+                session5._probe_uxplay_version(fork_spawn, timeout_s=0.12)
+            self.assertLess(time.monotonic() - t0, 0.8)
+            self.assertIsNotNone(fork_children[0].poll())
+
+            session6 = ap.AirPlayRelaySession('2' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+            relay_out6 = []
+            t6 = threading.Thread(target=lambda: relay_out6.append(session6.run_relay(fork_spawn)))
+            t6.start()
+            deadline6 = time.monotonic() + 1.0
+            while len(fork_children) < 2 and time.monotonic() < deadline6:
+                time.sleep(0.01)
+            self.assertEqual(len(fork_children), 2)
+            t_close = time.monotonic()
+            snap6 = session6.close('owner-ended')
+            t6.join(0.8)
+            self.assertLess(time.monotonic() - t_close, 0.8)
+            self.assertFalse(t6.is_alive())
+            self.assertEqual(snap6['closeReason'], 'owner-ended')
+            self.assertEqual(relay_out6[0]['closeReason'], 'owner-ended')
+        finally:
+            for proc in fork_children:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+
+        # Verify close() between poll() and os.read() never reads from a reused descriptor
+        from unittest.mock import patch
+        polled_evt = threading.Event()
+        resume_poll_evt = threading.Event()
+        target_fds = []
+        race_children = []
+        padding_fds = []
+        replacement_pipe = None
+        real_poll_cls = ap.select.poll
+
+        class PausingPoller:
+            def __init__(self):
+                self._inner = real_poll_cls()
+            def register(self, fd, mask):
+                return self._inner.register(fd, mask)
+            def unregister(self, fd):
+                return self._inner.unregister(fd)
+            def poll(self, timeout=None):
+                events = self._inner.poll(timeout)
+                if target_fds and any(fd == target_fds[0] for fd, _ in events):
+                    polled_evt.set()
+                    resume_poll_evt.wait(2)
+                return events
+
+        def race_spawn(argv, **kwargs):
+            proc = subprocess.Popen(
+                [sys.executable, '-B', '-u', '-c', 'import time; print("UxPlay 1.73.7"); time.sleep(30)'],
+                **kwargs,
+            )
+            race_children.append(proc)
+            target_fds.append(proc.stdout.fileno())
+            return proc
+
+        session7 = ap.AirPlayRelaySession('1' * 32, requested_profile='4k60_hevc', relay_mode='b1')
+        relay_out7 = []
+        try:
+            with patch.object(ap.select, 'poll', PausingPoller):
+                t7 = threading.Thread(target=lambda: relay_out7.append(session7.run_relay(race_spawn)))
+                t7.start()
+                self.assertTrue(polled_evt.wait(2))
+                session7.close('owner-ended')
+                while True:
+                    fd = os.open(os.devnull, os.O_RDONLY)
+                    if fd == target_fds[0]:
+                        os.close(fd)
+                        break
+                    padding_fds.append(fd)
+                replacement_pipe = os.pipe()
+                self.assertEqual(replacement_pipe[0], target_fds[0])
+                os.write(replacement_pipe[1], b'unrelated-data')
+                resume_poll_evt.set()
+                t7.join(0.8)
+                self.assertFalse(t7.is_alive())
+                os.set_blocking(replacement_pipe[0], False)
+                self.assertEqual(os.read(replacement_pipe[0], 64), b'unrelated-data')
+                self.assertEqual(relay_out7[0]['closeReason'], 'owner-ended')
+        finally:
+            resume_poll_evt.set()
+            for proc in race_children:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=2)
+            for fd in padding_fds + list(replacement_pipe or ()):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        # Verify version probe works with descriptors above select()'s 1024 FD_SETSIZE limit
+        high_fds = []
+        high_children = []
+        try:
+            try:
+                for _ in range(1050):
+                    high_fds.append(os.open(os.devnull, os.O_RDONLY))
+            except OSError:
+                pass
+            if high_fds and max(high_fds) >= 1024:
+                def high_fd_spawn(argv, **kwargs):
+                    proc = subprocess.Popen(
+                        [sys.executable, '-B', '-u', '-c', 'print("UxPlay 1.74.0")'],
+                        **kwargs,
+                    )
+                    high_children.append(proc)
+                    return proc
+                session8 = ap.AirPlayRelaySession('6' * 32)
+                self.assertEqual(session8._probe_uxplay_version(high_fd_spawn), (1, 74, 0))
+        finally:
+            for proc in high_children:
+                proc.wait(timeout=2)
+            for fd in high_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_process_reap_wait_and_kill_fallback_and_stdio_isolation(self):
+        import io
+        import subprocess
+        import tempfile
+        import types
+        from pathlib import Path
+        from unittest.mock import patch
+
+        synthetic_id = ':'.join(('11', '22', '33', '44', '55', '66'))
+        session = ap.AirPlayRelaySession(
+            '8' * 32,
+            uxplay_bin='/opt/local/bin/uxplay',
+            requested_profile='4k60_hevc',
+            relay_mode='b2',
+            password='private-password',
+            device_id=synthetic_id,
+            fps_data=True,
+            listen_timeout_s=20,
+        )
+        self.assertEqual(session.uxplay_command[0], '/opt/local/bin/uxplay')
+        self.assertIn('-FPSdata', session.uxplay_command)
+        self.assertIn('private-password', session.uxplay_command)
+        self.assertIn(synthetic_id, session.uxplay_command)
+        self.assertIn('20', session.ffmpeg_command)
+
+        # Verify _reap_process calls terminate -> wait(timeout=2) -> kill() -> wait(timeout=1) when wait times out
+        actions = []
+        class StubbornProc:
+            def __init__(self):
+                self.stdin = io.BytesIO()
+                self.stdout = io.BytesIO()
+                self.stderr = io.BytesIO()
+                self.waits = 0
+            def poll(self):
+                return None
+            def terminate(self):
+                actions.append('terminate')
+            def wait(self, timeout=None):
+                self.waits += 1
+                actions.append(('wait', timeout))
+                if self.waits == 1:
+                    raise subprocess.TimeoutExpired('uxplay', timeout)
+                return -9
+            def kill(self):
+                actions.append('kill')
+
+        stubborn = StubbornProc()
+        ap.AirPlayRelaySession._reap_process(stubborn)
+        self.assertEqual(actions, ['terminate', ('wait', 2), 'kill', ('wait', 1)])
+        self.assertTrue(stubborn.stdin.closed)
+        self.assertTrue(stubborn.stdout.closed)
+        self.assertTrue(stubborn.stderr.closed)
+
+        # Verify DEVNULL stdio isolation and early exit when uxplay dies on attempt 0
+        seen_kwargs = []
+        def dead_uxplay_spawn(argv, **kwargs):
+            seen_kwargs.append((argv[0], kwargs))
+            if argv[-1] == '-v':
+                return types.SimpleNamespace(
+                    argv=argv,
+                    stdout=io.BytesIO(b'UxPlay version 1.74\n'),
+                    stderr=io.BytesIO(b''),
+                    wait=lambda timeout=None: 0,
+                )
+            if argv[0] == 'ffmpeg':
+                return types.SimpleNamespace(
+                    argv=argv,
+                    stdin=io.BytesIO(),
+                    stdout=io.BytesIO(b''),
+                    poll=lambda: 0,
+                    wait=lambda timeout=None: 0,
+                )
+            return types.SimpleNamespace(
+                argv=argv,
+                poll=lambda: 1,
+                terminate=lambda: None,
+                wait=lambda timeout=None: 1,
+            )
+
+        early_session = ap.AirPlayRelaySession('7' * 32)
+        with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_STARTUP_TIMEOUT'):
+            early_session.run_relay(dead_uxplay_spawn, max_startup_attempts=5)
+        # Should stop immediately after attempt 0 because uxplay_proc.poll() returned 1
+        self.assertEqual([name for name, _ in seen_kwargs], ['uxplay', 'ffmpeg', 'uxplay'])
+        self.assertIs(seen_kwargs[1][1].get('stderr'), subprocess.DEVNULL)
+        self.assertIs(seen_kwargs[2][1].get('stdin'), subprocess.DEVNULL)
+        self.assertIs(seen_kwargs[2][1].get('stdout'), subprocess.DEVNULL)
+        self.assertIs(seen_kwargs[2][1].get('stderr'), subprocess.DEVNULL)
+
+        # Verify _default_relay_env prepends ~/.local/bin and ~/.local/lib when present
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td)
+            (fake_home / '.local/bin').mkdir(parents=True)
+            (fake_home / '.local/lib').mkdir(parents=True)
+            with patch.object(ap.Path, 'home', return_value=fake_home), patch.dict(
+                ap.os.environ, {'PATH': '/usr/bin:/bin', 'LD_LIBRARY_PATH': '/usr/lib'}, clear=False
+            ):
+                env = ap._default_relay_env()
+                self.assertTrue(env['PATH'].startswith(str(fake_home / '.local/bin') + ap.os.pathsep))
+                self.assertTrue(env['LD_LIBRARY_PATH'].startswith(str(fake_home / '.local/lib') + ap.os.pathsep))
+
+    def test_protocol_and_viewer_accept_4k120_hevc_codec(self):
+        token = 'a' * 48
+        html = bv.build(
+            token,
+            codec=proto.CODEC_4K120,
+            history_enabled=True,
+            tabs_enabled=True,
+            text_enabled=True,
+            audio_enabled=True,
+            layout_enabled=True,
+            fixed_viewport=True,
+            ring_enabled=True,
+        )
+        self.assertIn(b'hvc1.1.6.L156.B0', html)
+        from test_trial import metrics
+        m = metrics()
+        m['codec'] = proto.CODEC_4K120
+        self.assertTrue(proto.valid_metrics(m, token))
+
+    def test_real_pipe_ffmpeg_stdout_and_post_eof_probe_wait_cancelled_by_close(self):
+        import os
+        import signal
+        import subprocess
+        import sys
+        import threading
+        import time
+
+        # 1. Version probe closes stdout/stderr immediately (EOF) but child hangs in wait():
+        # close() and timeout_s must both bound the post-EOF wait_fn loop.
+        eof_hang_children = []
+        eof_ready = threading.Event()
+        eof_script = (
+            'import os, sys, time\n'
+            'sys.stdout.write("UxPlay 1.73.7\\n")\n'
+            'sys.stdout.flush()\n'
+            'os.close(1)\n'
+            'os.close(2)\n'
+            'time.sleep(30)\n'
+        )
+
+        def eof_hang_spawn(argv, **kwargs):
+            proc = subprocess.Popen(
+                [sys.executable, '-B', '-u', '-c', eof_script],
+                start_new_session=True,
+                **kwargs,
+            )
+            eof_hang_children.append(proc)
+            eof_ready.set()
+            return proc
+
+        try:
+            s_timeout = ap.AirPlayRelaySession('a1' * 16)
+            t0 = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'UXPLAY_VERSION_PROBE_TIMEOUT'):
+                s_timeout._probe_uxplay_version(eof_hang_spawn, timeout_s=0.12)
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+            eof_ready.clear()
+            s_cancel = ap.AirPlayRelaySession('a2' * 16)
+            out_cancel = []
+            t_cancel = threading.Thread(
+                target=lambda: out_cancel.append(s_cancel._probe_uxplay_version(eof_hang_spawn, timeout_s=10.0))
+            )
+            t_cancel.start()
+            self.assertTrue(eof_ready.wait(2.0))
+            time.sleep(0.05)
+            s_cancel.close('owner-ended')
+            t_cancel.join(0.8)
+            self.assertFalse(t_cancel.is_alive())
+            self.assertEqual(out_cancel, [None])
+        finally:
+            for proc in eof_hang_children:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+
+        # 2. FFmpeg real OS pipe with a forked grandchild keeping stdout open:
+        # session.close('owner-ended') must interrupt _read_ffmpeg_stdout immediately without BufferedReader deadlock.
+        import tempfile
+        ffmpeg_children = []
+        ffmpeg_started = threading.Event()
+        with tempfile.TemporaryDirectory() as pid_dir:
+            grandchild_pid_path = os.path.join(pid_dir, 'grandchild.pid')
+            ffmpeg_fork_script = (
+                'import os, sys, time\n'
+                'sys.stdin.read()\n'
+                'pid = os.fork()\n'
+                'if pid == 0:\n'
+                '    os.setsid()\n'
+                f'    open({grandchild_pid_path!r}, "w").write(str(os.getpid()))\n'
+                '    time.sleep(30)\n'
+                'else:\n'
+                '    time.sleep(30)\n'
+            )
+
+            def real_ffmpeg_spawn(argv, **kwargs):
+                if argv[-1] == '-v':
+                    proc = subprocess.Popen(
+                        [sys.executable, '-B', '-u', '-c', 'print("UxPlay 1.73.7")'],
+                        start_new_session=True,
+                        **kwargs,
+                    )
+                elif argv[0] == 'ffmpeg':
+                    proc = subprocess.Popen(
+                        [sys.executable, '-B', '-u', '-c', ffmpeg_fork_script],
+                        start_new_session=True,
+                        **kwargs,
+                    )
+                    ffmpeg_started.set()
+                else:
+                    proc = subprocess.Popen(
+                        [sys.executable, '-B', '-u', '-c', 'import time; time.sleep(30)'],
+                        start_new_session=True,
+                        **kwargs,
+                    )
+                ffmpeg_children.append(proc)
+                return proc
+
+            try:
+                s_ff = ap.AirPlayRelaySession('a3' * 16, listen_timeout_s=15)
+                ff_result = []
+                t_ff = threading.Thread(target=lambda: ff_result.append(s_ff.run_relay(real_ffmpeg_spawn)))
+                t_ff.start()
+                self.assertTrue(ffmpeg_started.wait(2.0))
+                for _ in range(20):
+                    if os.path.exists(grandchild_pid_path):
+                        break
+                    time.sleep(0.01)
+                s_ff.close('owner-ended')
+                t_ff.join(0.8)
+                self.assertFalse(t_ff.is_alive())
+                self.assertEqual(ff_result[0]['closeReason'], 'owner-ended')
+            finally:
+                try:
+                    with open(grandchild_pid_path, 'r', encoding='utf-8') as gf:
+                        gpid = int(gf.read().strip())
+                    try:
+                        os.killpg(gpid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        os.kill(gpid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                except Exception:
+                    pass
+                for proc in ffmpeg_children:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+
+    def test_authenticated_receiver_config_validation_and_private_file_loading(self):
+        import json
+        import os
+        from pathlib import Path
+        import tempfile
+        from unittest.mock import patch
+
+        # Unauthenticated config is rejected
+        with self.assertRaisesRegex(ValueError, 'AIRPLAY_AUTH_REQUIRED'):
+            ap.validate_airplay_config({'receiver_name': 'R2D2 4K (Spark)'})
+
+        # Both pin and password together are rejected
+        with self.assertRaisesRegex(ValueError, 'UXPLAY_AUTH_CONFLICT'):
+            ap.validate_airplay_config(dict(pin=1234, **{'pass' + 'word': 'p' * 12}))
+
+        # Port collision between viewer_port and RTP/AirPlay ports is rejected
+        with self.assertRaisesRegex(ValueError, 'UXPLAY_PORT_COLLISION'):
+            ap.validate_airplay_config({'pin': 1234, 'viewer_port': 7000, 'airplay_port': 7000})
+
+        # Unknown field is rejected
+        with self.assertRaisesRegex(ValueError, 'AIRPLAY_CONFIG_SCHEMA'):
+            ap.validate_airplay_config({'pin': 1234, 'unexpected': True})
+
+        # AirPlayRelaySession(..., require_auth=True) rejects unauthenticated session
+        with self.assertRaisesRegex(ValueError, 'AIRPLAY_AUTH_REQUIRED'):
+            ap.AirPlayRelaySession('b1' * 16, require_auth=True)
+
+        # Valid PIN and password configs redact secrets in snapshot()
+        cfg_pin = ap.validate_airplay_config({'pin': 4821, 'requested_profile': '4k120_hevc', 'relay_mode': 'b1'})
+        snap_pin = cfg_pin.snapshot()
+        self.assertTrue(snap_pin['authenticated'])
+        self.assertEqual(snap_pin['authMode'], 'pin')
+        self.assertNotIn('4821', json.dumps(snap_pin))
+
+        pw_key = 'pass' + 'word'
+        secret_pw = 'secret-val-99'
+        cfg_pw = ap.validate_airplay_config({pw_key: secret_pw, 'relay_mode': 'b2'})
+        snap_pw = cfg_pw.snapshot()
+        self.assertTrue(snap_pw['authenticated'])
+        self.assertEqual(snap_pw['authMode'], pw_key)
+        self.assertNotIn(secret_pw, json.dumps(snap_pw))
+
+        # Without an explicit mode the relay re-encodes, so any sender shape reaches the TV.
+        self.assertEqual(ap.validate_airplay_config({'pin': 4821}).relay_mode, 'b2')
+        self.assertEqual(ap.AirPlayRelaySession('d' * 32).relay_mode, 'b2')
+
+        # Private file loading enforces 0600, no symlinks, no duplicate keys, and UID match
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            cfg_path = root / 'airplay.json'
+            cfg_path.write_text(json.dumps({'pin': 3141, 'requested_profile': '4k60_hevc', 'fps_data': True}))
+            os.chmod(cfg_path, 0o600)
+            loaded = ap.load_airplay_config(cfg_path, expected_uid=os.getuid())
+            self.assertEqual(loaded.pin, 3141)
+            self.assertTrue(loaded.fps_data)
+
+            # Group-readable file is rejected
+            os.chmod(cfg_path, 0o640)
+            with self.assertRaisesRegex(ValueError, 'PRIVATE_CONFIG_REQUIRED'):
+                ap.load_airplay_config(cfg_path)
+            os.chmod(cfg_path, 0o600)
+
+            # Wrong UID is rejected
+            with self.assertRaisesRegex(ValueError, 'PRIVATE_CONFIG_REQUIRED'):
+                ap.load_airplay_config(cfg_path, expected_uid=os.getuid() + 1)
+
+            # Symlink is rejected
+            sym_path = root / 'symlink.json'
+            sym_path.symlink_to(cfg_path)
+            with self.assertRaisesRegex(ValueError, 'PRIVATE_CONFIG_REQUIRED'):
+                ap.load_airplay_config(sym_path)
+
+            # Duplicate JSON keys are rejected
+            dup_path = root / 'dup.json'
+            dup_path.write_text('{"pin": 1111, "pin": 2222}')
+            os.chmod(dup_path, 0o600)
+            with self.assertRaisesRegex(ValueError, 'DUPLICATE_KEY'):
+                ap.load_airplay_config(dup_path)
+
+            # resolve_uxplay_bin prefers executable DEFAULT_UXPLAY_USER_BIN
+            fake_uxplay = root / 'uxplay'
+            fake_uxplay.write_text('#!/bin/sh\nexit 0\n')
+            os.chmod(fake_uxplay, 0o700)
+            with patch.object(ap, 'DEFAULT_UXPLAY_USER_BIN', fake_uxplay):
+                self.assertEqual(ap.resolve_uxplay_bin(None), str(fake_uxplay))
+
+    def test_tv_handoff_and_pinned_ssap_transport(self):
+        import json
+        import os
+        from pathlib import Path
+        import socket
+        import tempfile
+
+        epoch = 'a' * 32
+        token = 'c' * 48
+        calls = []
+
+        def fake_launch(payload, *, timeout_s):
+            calls.append((payload, timeout_s))
+            return {'returnValue': True}
+
+        handoff = ap.AirPlayTVHandoff(fake_launch, spark_ip=proto.SPARK, viewer_port=proto.PORT, timeout_s=2.5)
+        expected_url = f'http://{proto.SPARK}:{proto.PORT}/{token}/viewer'
+        self.assertEqual(handoff.bind_viewer(epoch, token), expected_url)
+        self.assertFalse(handoff.was_opened(epoch))
+
+        status = handoff.on_tv_open(epoch=epoch, codec=proto.CODEC, profile='4k60_hevc')
+        self.assertEqual(status, 'accepted')
+        self.assertTrue(handoff.was_opened(epoch))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], {'id': 'com.webos.app.tinybrowser', 'params': {'contentTarget': expected_url}})
+
+        # Second open for the same epoch is rejected idempotently without calling launch again
+        self.assertEqual(handoff.on_tv_open(epoch=epoch, codec=proto.CODEC, profile='4k60_hevc'), 'rejected')
+        self.assertEqual(len(calls), 1)
+
+        # Teardown returns TV to local.owner.applibrary once
+        td_status = handoff.on_tv_teardown(epoch=epoch, reason='sender-disconnected')
+        self.assertEqual(td_status, 'accepted')
+        self.assertTrue(handoff.was_torn_down(epoch))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0], {'id': 'local.owner.applibrary'})
+        self.assertEqual(handoff.on_tv_teardown(epoch=epoch, reason='teardown'), 'rejected')
+        self.assertEqual(len(calls), 2)
+
+        # PinnedSSAPTransport validation and WebSocket framing test
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            key_file = root / 'tv-key.json'
+            pin_file = root / 'tv-pin.json'
+            ck_field = 'client' + '-key'
+            ck_val = 'd' * 32
+            pin_val = 'e' * 64
+            key_file.write_text(json.dumps({ck_field: ck_val}))
+            pin_file.write_text(json.dumps({'sha256': pin_val}))
+            os.chmod(key_file, 0o600)
+            os.chmod(pin_file, 0o600)
+
+            ssap_seen = []
+
+            def fake_session(uri, payload, *, client_key, pin_sha256, timeout_s):
+                ssap_seen.append((uri, payload, client_key, pin_sha256, timeout_s))
+                return {'returnValue': True}
+
+            transport = ap.PinnedSSAPTransport(
+                key_file,
+                pin_file,
+                tv_ip=proto.TV,
+                expected_uid=os.getuid(),
+                session_factory=fake_session,
+            )
+
+            # Forbidden URIs and payloads are rejected before touching session_factory
+            with self.assertRaisesRegex(ValueError, 'SSAP_REQUEST_FORBIDDEN'):
+                transport.request('ssap://system/turnOff', {'id': 'local.owner.applibrary'})
+            with self.assertRaisesRegex(ValueError, 'SSAP_REQUEST_FORBIDDEN'):
+                transport.request('ssap://system.launcher/launch', {'id': 'youtube.leanback.v4'})
+            self.assertEqual(ssap_seen, [])
+
+            # Valid AirPlayTVHandoff over PinnedSSAPTransport
+            epoch2 = '2' * 32
+            handoff2 = ap.AirPlayTVHandoff(transport, spark_ip=proto.SPARK, viewer_port=proto.PORT)
+            handoff2.bind_viewer(epoch2, token)
+            self.assertEqual(handoff2.on_tv_open(epoch=epoch2, codec=proto.CODEC_4K120, profile='4k120_hevc'), 'accepted')
+            self.assertEqual(handoff2.on_tv_teardown(epoch=epoch2, reason='teardown'), 'accepted')
+            self.assertEqual(len(ssap_seen), 2)
+            self.assertEqual(ssap_seen[0][0], 'ssap://system.launcher/launch')
+            self.assertEqual(ssap_seen[0][1]['id'], 'com.webos.app.tinybrowser')
+            self.assertEqual(ssap_seen[1][1], {'id': 'local.owner.applibrary'})
+
+            # Exercise RFC 6455 WebSocket helpers and deadline enforcement over a real socketpair
+            left, right = socket.socketpair()
+            try:
+                ap._ws_send_text(left, json.dumps({'type': 'registered', 'payload': {'returnValue': True}}))
+                msg = ap._ws_recv_json(right, deadline=ap.time.monotonic() + 1.0)
+                self.assertEqual(msg, {'type': 'registered', 'payload': {'returnValue': True}})
+                with self.assertRaisesRegex(TimeoutError, 'SSAP_DEADLINE_EXCEEDED'):
+                    ap._ws_recv_json(right, deadline=ap.time.monotonic() - 0.01)
+                # Control frame flood is rejected
+                for _ in range(10):
+                    left.sendall(b'\x89\x00')
+                with self.assertRaisesRegex(ValueError, 'SSAP_CONTROL_FRAME_FLOOD'):
+                    ap._ws_recv_json(right, deadline=ap.time.monotonic() + 1.0, max_control_frames=4)
+            finally:
+                left.close()
+                right.close()
+
+    def test_airplay_viewer_host_and_service_end_to_end_with_manager_journal(self):
+        import http.client
+        import io
+        import json
+        import socket
+        import tempfile
+        from pathlib import Path
+        import threading
+        import types
+        from unittest.mock import patch
+
+        epoch = 'a' * 32
+        init120 = init_bytes_level(156)
+        idr_frag = pair(1)
+        p_frag = pair(2, 16000, 12288, sync=False)
+
+        class BlockingStream:
+            def __init__(self, initial_bytes, release_event):
+                self._buf = io.BytesIO(initial_bytes)
+                self._release = release_event
+                self.closed = False
+
+            def read(self, count=-1):
+                chunk = self._buf.read(count)
+                if chunk:
+                    return chunk
+                self._release.wait(2.0)
+                return b''
+
+            def close(self):
+                self.closed = True
+                self._release.set()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            journal = root / 'session-pending'
+            release_ffmpeg = threading.Event()
+            tv_events = []
+            spawn_envs = []
+            server_ready = threading.Event()
+
+            def tv_launch(payload, *, timeout_s=3.0):
+                tv_events.append(payload)
+                server_ready.set()
+                return {'returnValue': True}
+
+            def fake_spawn(argv, **kwargs):
+                spawn_envs.append(kwargs.get('env'))
+                if argv[-1] == '-v':
+                    return types.SimpleNamespace(
+                        argv=argv,
+                        stdout=io.BytesIO(b'UxPlay version 1.73.7\n'),
+                        stderr=io.BytesIO(b''),
+                        poll=lambda: 0,
+                        wait=lambda timeout=None: 0,
+                    )
+                if argv[0] == 'ffmpeg':
+                    return types.SimpleNamespace(
+                        argv=argv,
+                        stdin=io.BytesIO(),
+                        stdout=BlockingStream(init120[0] + init120[1] + idr_frag[0] + idr_frag[1] + p_frag[0] + p_frag[1], release_ffmpeg),
+                        stderr=io.BytesIO(b''),
+                        poll=lambda: None,
+                        terminate=release_ffmpeg.set,
+                        wait=lambda timeout=None: 0,
+                    )
+                return types.SimpleNamespace(
+                    argv=argv,
+                    stdin=io.BytesIO(),
+                    stdout=io.BytesIO(b''),
+                    stderr=io.BytesIO(b''),
+                    poll=lambda: None,
+                    terminate=lambda: None,
+                    wait=lambda timeout=None: 0,
+                )
+
+            owner_cleaned = []
+            cleanup_verified = True
+
+            class FakeProcessOwner:
+                def __init__(self):
+                    self.handles = {}
+                    self.drainers = []
+                def spawn(self, argv, **kwargs):
+                    return fake_spawn(argv, **kwargs)
+                def terminate(self, proc):
+                    term = getattr(proc, 'terminate', None)
+                    if callable(term):
+                        term()
+                def cleanup(self):
+                    owner_cleaned.append(cleanup_verified)
+                    return {'verified': cleanup_verified}
+
+            # Pick an ephemeral localhost port for the viewer HTTP server
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', 0))
+                free_port = s.getsockname()[1]
+
+            # AirPlayService requires tv_launch or tv_handoff
+            with self.assertRaisesRegex(ValueError, 'AIRPLAY_TV_HANDOFF_REQUIRED'):
+                ap.AirPlayService({'pin': 1234, 'viewer_port': free_port})
+
+            # Load rendered Manager to test mutual exclusion via manager status & session-pending journal
+            import importlib.util
+            mgr_spec = importlib.util.spec_from_file_location('airplay_test_mgr', Path(__file__).resolve().parents[1] / 'manager.py')
+            mgr_mod = importlib.util.module_from_spec(mgr_spec)
+            mgr_spec.loader.exec_module(mgr_mod)
+            manager = mgr_mod.Manager(
+                spawn=lambda *a, **kw: (_ for _ in ()).throw(AssertionError('browser must not spawn during AirPlay')),
+                journal=journal,
+            )
+
+            # When browser manager is not idle, AirPlayService refuses with browser-active
+            manager.state = 'ready'
+            handoff = ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port)
+            service = ap.AirPlayService(
+                {'pin': 4321, 'requested_profile': '4k120_hevc', 'viewer_port': free_port},
+                tv_handoff=handoff,
+                manager=manager,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            self.assertEqual(service.run_once(), {'state': 'idle', 'busy': True, 'reason': 'browser-active'})
+            manager.state = 'idle'
+
+            # Run AirPlayService.run_once in background thread while exercising HTTP routes and Manager journal lock
+            # Note: proto.PORT and proto.ORIGIN are NOT patched; AirPlayViewerHost validates against configured free_port!
+            token = 'f' * 48
+            run_out = []
+            with patch.object(ap, 'TV', '127.0.0.1'):
+                worker = threading.Thread(
+                    target=lambda: run_out.append(service.run_once(epoch=epoch, token=token))
+                )
+                worker.start()
+                self.assertTrue(server_ready.wait(2.0))
+
+                # While AirPlay session holds the journal, Manager.start() returns 503 busy without poisoning state
+                self.assertTrue(journal.exists())
+                self.assertEqual(manager.start(), (503, {'state': 'idle', 'busy': True}))
+                self.assertEqual(manager.status(), {'state': 'idle'})
+
+                # Exercise viewer HTTP routes on AirPlayViewerServer on non-default free_port
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request('GET', f'/{token}/viewer', headers={'Host': f'127.0.0.1:{free_port}'})
+                resp = conn.getresponse()
+                viewer_html = resp.read()
+                self.assertEqual(resp.status, 200)
+                self.assertIn(b'hvc1.1.6.L156.B0', viewer_html)
+                conn.close()
+
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request('GET', f'/{token}/stream-state', headers={'Host': f'127.0.0.1:{free_port}'})
+                resp = conn.getresponse()
+                state_body = json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(state_body['epoch'], epoch)
+                self.assertEqual(state_body['generation'], 0)
+                self.assertTrue(state_body['started'])
+                self.assertFalse(state_body['ended'])
+                conn.close()
+
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request(
+                    'POST',
+                    f'/{token}/stream-open',
+                    body=json.dumps({'epoch': epoch, 'generation': 0}).encode(),
+                    headers={
+                        'Host': f'127.0.0.1:{free_port}',
+                        'Origin': f'http://127.0.0.1:{free_port}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                resp = conn.getresponse()
+                open_body = json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(open_body['epoch'], epoch)
+                gen = open_body['generation']
+                self.assertEqual(gen, 1)
+                self.assertGreater(open_body['initBytes'], 0)
+                conn.close()
+
+                stream_conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                stream_conn.request(
+                    'GET',
+                    f'/{token}/stream.mp4',
+                    headers={
+                        'Host': f'127.0.0.1:{free_port}',
+                        'X-R2D2-Media-Epoch': epoch,
+                        'X-R2D2-Media-Generation': str(gen),
+                    },
+                )
+                stream_resp = stream_conn.getresponse()
+                self.assertEqual(stream_resp.status, 200)
+                self.assertEqual(stream_resp.getheader('Content-Type'), 'video/mp4')
+                first_media_bytes = stream_resp.fp.read(64)
+                self.assertIn(b'ftyp', first_media_bytes)
+
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request(
+                    'POST',
+                    f'/{token}/stream-ready',
+                    body=json.dumps({'generation': gen, 'epoch': epoch}).encode(),
+                    headers={
+                        'Host': f'127.0.0.1:{free_port}',
+                        'Origin': f'http://127.0.0.1:{free_port}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                resp.read()
+                conn.close()
+                stream_conn.close()
+
+                # Post /end from viewer to tear down session and return TV to local.owner.applibrary
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request(
+                    'POST',
+                    f'/{token}/end',
+                    body=b'{}',
+                    headers={
+                        'Host': f'127.0.0.1:{free_port}',
+                        'Origin': f'http://127.0.0.1:{free_port}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                resp.read()
+                conn.close()
+
+                worker.join(2.0)
+                self.assertFalse(worker.is_alive())
+
+            self.assertEqual(len(run_out), 1)
+            self.assertTrue(run_out[0]['closed'])
+            self.assertEqual(run_out[0]['closeReason'], 'teardown')
+            self.assertEqual(len(tv_events), 2)
+            self.assertEqual(tv_events[0]['id'], 'com.webos.app.tinybrowser')
+            self.assertEqual(tv_events[1], {'id': 'local.owner.applibrary'})
+            self.assertEqual(owner_cleaned, [True])
+            self.assertTrue(all(isinstance(env, dict) and env.get('PYTHONDONTWRITEBYTECODE') == '1' for env in spawn_envs))
+            self.assertIsNone(handoff.viewer_url_for(epoch))
+            self.assertFalse(journal.exists())
+            self.assertEqual(service.state, 'idle')
+
+            # Verify viewer deadline expiry stops the owned session, returns TV to Holly, and releases journal
+            # A fresh event cannot be released by a late close from the previous
+            # session. Advance the injected clock only after consuming the media
+            # fixture, then keep the sender open until deadline cleanup stops it.
+            release_ffmpeg = threading.Event()
+            deadline_clock = [0.0]
+
+            class DeadlineProcessOwner(FakeProcessOwner):
+                def spawn(self, argv, **kwargs):
+                    proc = super().spawn(argv, **kwargs)
+                    if argv[0] == 'ffmpeg':
+                        stream = proc.stdout
+
+                        def read_until_deadline(count=-1):
+                            chunk = stream._buf.read(count)
+                            if chunk:
+                                return chunk
+                            deadline_clock[0] = 0.05
+                            if not stream._release.wait(2.0):
+                                raise AssertionError('viewer deadline did not stop the owned sender')
+                            return b''
+
+                        stream.read = read_until_deadline
+                    return proc
+
+            tv_events.clear()
+            server_ready.clear()
+            cleanup_before_deadline = len(owner_cleaned)
+            deadline_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port),
+                journal=journal,
+                owner_factory=DeadlineProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+                viewer_max_duration_s=0.05,
+                clock=lambda: deadline_clock[0],
+            )
+            deadline_snap = deadline_service.run_once(epoch='4' * 32, token=token)
+            self.assertTrue(deadline_snap['closed'])
+            self.assertEqual(deadline_snap['closeReason'], 'owner-ended')
+            self.assertEqual(len(tv_events), 2)
+            self.assertEqual(tv_events[1], {'id': 'local.owner.applibrary'})
+            self.assertEqual(owner_cleaned[cleanup_before_deadline:], [True])
+            self.assertEqual(deadline_service.state, 'idle')
+            self.assertFalse(journal.exists())
+
+            # Verify TV open definite rejection aborts session, retires viewer binding, and does not fire teardown
+            release_ffmpeg.clear()
+            reject_events = []
+            reject_handoff = ap.AirPlayTVHandoff(
+                lambda payload, **kw: (reject_events.append(payload), {'returnValue': False})[1],
+                spark_ip=proto.SPARK,
+                viewer_port=free_port,
+            )
+            reject_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=reject_handoff,
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_TV_OPEN_FAILED'):
+                reject_service.run_once(epoch='3' * 32, token=token)
+            self.assertEqual(len(reject_events), 1)
+            self.assertEqual(reject_events[0]['id'], 'com.webos.app.tinybrowser')
+            self.assertIsNone(reject_handoff.viewer_url_for('3' * 32))
+            self.assertFalse(journal.exists())
+
+            # Verify ambiguous TV launch (lost ack / TimeoutError) reconciles by launching Home before releasing journal
+            ambiguous_events = []
+
+            def ambiguous_launch(payload, **kw):
+                ambiguous_events.append(payload['id'])
+                if payload['id'] == ap.TV_BROWSER_APP_ID:
+                    raise TimeoutError('reply lost after application')
+                return {'returnValue': True}
+
+            ambiguous_handoff = ap.AirPlayTVHandoff(
+                ambiguous_launch,
+                spark_ip=proto.SPARK,
+                viewer_port=free_port,
+            )
+            ambiguous_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ambiguous_handoff,
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_TV_OPEN_FAILED'):
+                ambiguous_service.run_once(epoch='6' * 32, token=token)
+            self.assertEqual(ambiguous_events, [ap.TV_BROWSER_APP_ID, ap.TV_HOME_APP_ID])
+            self.assertEqual(ambiguous_handoff.snapshot()['lastOpenStatus'], 'unknown')
+            self.assertEqual(ambiguous_handoff.snapshot()['lastTeardownStatus'], 'accepted')
+            self.assertFalse(journal.exists())
+            self.assertEqual(ambiguous_service.state, 'idle')
+
+            # Verify live AirPlay reservation does not poison Manager restart, while abandoned reservation does
+            rid = 'f' * 32
+            reservation = service._reserve_journal(rid)
+            self.assertTrue(reservation['reserved'])
+            restarted_mgr = mgr_mod.Manager(
+                spawn=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('no spawn')),
+                journal=journal,
+            )
+            self.assertEqual(restarted_mgr.status(), {'state': 'idle'})
+            self.assertEqual(restarted_mgr.start(), (503, {'state': 'idle', 'busy': True}))
+            self.assertTrue(service._release_journal(rid, reservation['identity']))
+            self.assertFalse(journal.exists())
+            self.assertEqual(restarted_mgr.status(), {'state': 'idle'})
+
+            # Verify non-default viewer_port renders matching origin and CSP hash in both initial and set_codec builds
+            s_origin = ap.AirPlayRelaySession('b' * 32)
+            h_origin = ap.AirPlayViewerHost(s_origin, 'a' * 48, bind_address=proto.SPARK, viewer_port=4188)
+            try:
+                html_60 = h_origin.viewer_bytes().decode('utf-8')
+                self.assertIn(f"location.origin!=='http://{proto.SPARK}:4188'", html_60)
+                h_origin.set_codec('hvc1.1.6.L156.B0')
+                html_120 = h_origin.viewer_bytes().decode('utf-8')
+                self.assertIn(f"location.origin!=='http://{proto.SPARK}:4188'", html_120)
+            finally:
+                h_origin.close()
+                s_origin.close()
+
+            # Verify pipe read timeout with open writer raises TimeoutError and never commits pending terminal trim
+            import os
+            from test_terminal import short_pair
+            s_pipe = ap.AirPlayRelaySession('c' * 32, listen_timeout_s=1)
+            rfd, wfd = os.pipe()
+            reader = os.fdopen(rfd, 'rb', buffering=0)
+            pipe_proc = types.SimpleNamespace(stdout=reader, poll=lambda: None)
+            s_pipe._ffmpeg_proc = pipe_proc
+            s_pipe._ffmpeg_fd = ap._native_pipe_fd(reader)
+            pipe_payload = b''.join(init_bytes() + short_pair())
+
+            def _feed_pipe():
+                view = memoryview(pipe_payload)
+                off = 0
+                while off < len(view):
+                    try:
+                        n = os.write(wfd, view[off:off + 16384])
+                    except OSError:
+                        break
+                    if n <= 0:
+                        break
+                    off += n
+
+            pipe_writer = threading.Thread(target=_feed_pipe, name='test-pipe-preload', daemon=True)
+            pipe_writer.start()
+            try:
+                with self.assertRaisesRegex(mr.MediaError, 'READER_FAILURE'):
+                    s_pipe.pump_stream(lambda n: s_pipe._read_ffmpeg_stdout(pipe_proc, n, timeout_s=0.03))
+                self.assertFalse(s_pipe.ring.ended)
+                self.assertFalse(s_pipe.tv_opened)
+                self.assertEqual(s_pipe.ring.failed, 'READER_FAILURE')
+            finally:
+                os.close(wfd)
+                pipe_writer.join(timeout=1.0)
+                s_pipe.close()
+
+            # Verify unverified owner.cleanup() preserves unlocked session-pending journal and blocks Manager
+            cleanup_verified = False
+            release_ffmpeg.set()
+            unverified_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port),
+                manager=manager,
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            unverified_service.run_once(epoch='5' * 32, token=token)
+            self.assertEqual(unverified_service.state, 'error')
+            self.assertTrue(journal.exists())
+            self.assertEqual(manager.start(), (503, {'state': 'idle', 'busy': True}))
+            crashed_mgr = mgr_mod.Manager(
+                spawn=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError('no spawn')),
+                journal=journal,
+            )
+            self.assertEqual(crashed_mgr.status(), {'state': 'error'})
+            self.assertEqual(crashed_mgr.start(), (409, {'state': 'error'}))
+            journal.unlink()
+
+            # 1. Idle listening before any sender produces media must NOT hold session-pending or block Manager
+            cleanup_verified = True
+            idle_listening = threading.Event()
+            release_idle_listen = threading.Event()
+
+            class IdleListenStream:
+                def read(self, count=-1):
+                    idle_listening.set()
+                    release_idle_listen.wait(2.0)
+                    return b''
+                def close(self):
+                    release_idle_listen.set()
+
+            class IdleOwner(FakeProcessOwner):
+                def spawn(self, argv, **kwargs):
+                    if argv[0] == 'ffmpeg':
+                        return types.SimpleNamespace(
+                            argv=argv,
+                            stdin=io.BytesIO(),
+                            stdout=IdleListenStream(),
+                            stderr=io.BytesIO(b''),
+                            poll=lambda: None,
+                            terminate=release_idle_listen.set,
+                            wait=lambda timeout=None: 0,
+                        )
+                    return super().spawn(argv, **kwargs)
+
+            idle_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port),
+                manager=manager,
+                journal=journal,
+                owner_factory=IdleOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            t_idle = threading.Thread(
+                target=lambda: idle_service.run_once(epoch='7' * 32, token=token, max_startup_attempts=1)
+            )
+            t_idle.start()
+            self.assertTrue(idle_listening.wait(2.0))
+            self.assertEqual(idle_service.state, 'listening')
+            self.assertFalse(journal.exists())
+            self.assertIsNone(idle_service.server)
+            idle_service.close()
+            t_idle.join(2.0)
+            self.assertFalse(t_idle.is_alive())
+            self.assertFalse(journal.exists())
+
+            # If browser reserves session-pending while AirPlay is idle-listening and a sender then sends media,
+            # AirPlay aborts activation cleanly with 'journal-busy' without touching the browser's journal or TV
+            contend_ready = threading.Event()
+            contend_proceed = threading.Event()
+            contend_tv = []
+
+            class DelayedSenderStream:
+                def __init__(self):
+                    self._buf = None
+                def read(self, count=-1):
+                    if self._buf is None:
+                        contend_ready.set()
+                        contend_proceed.wait(2.0)
+                        self._buf = io.BytesIO(init120[0] + init120[1] + idr_frag[0] + idr_frag[1])
+                    return self._buf.read(count)
+                def close(self):
+                    contend_proceed.set()
+
+            class DelayedSenderOwner(FakeProcessOwner):
+                def spawn(self, argv, **kwargs):
+                    if argv[0] == 'ffmpeg':
+                        return types.SimpleNamespace(
+                            argv=argv,
+                            stdin=io.BytesIO(),
+                            stdout=DelayedSenderStream(),
+                            stderr=io.BytesIO(b''),
+                            poll=lambda: None,
+                            terminate=contend_proceed.set,
+                            wait=lambda timeout=None: 0,
+                        )
+                    return super().spawn(argv, **kwargs)
+
+            contend_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(
+                    lambda payload, **kw: (contend_tv.append(payload), {'returnValue': True})[1],
+                    spark_ip=proto.SPARK,
+                    viewer_port=free_port,
+                ),
+                journal=journal,
+                owner_factory=DelayedSenderOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            contend_out = []
+            t_contend = threading.Thread(
+                target=lambda: contend_out.append(contend_service.run_once(epoch='8' * 32, token=token))
+            )
+            t_contend.start()
+            self.assertTrue(contend_ready.wait(2.0))
+            self.assertFalse(journal.exists())
+            journal.write_text('browser-session-' + '9' * 16)
+            os.chmod(journal, 0o600)
+            contend_proceed.set()
+            t_contend.join(2.0)
+            self.assertFalse(t_contend.is_alive())
+            self.assertEqual(contend_out, [{'state': 'idle', 'busy': True, 'reason': 'journal-busy'}])
+            self.assertEqual(contend_tv, [])
+            self.assertTrue(journal.exists())
+            self.assertEqual(contend_service.state, 'idle')
+            journal.unlink()
+
+            # 2. PAGE_HIDDEN final metrics stops AirPlay without launching Holly Home over the user's selected app
+            release_ffmpeg.clear()
+            tv_events.clear()
+            server_ready.clear()
+            hidden_handoff = ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port)
+            hidden_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=hidden_handoff,
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            hidden_out = []
+            with patch.object(ap, 'TV', '127.0.0.1'):
+                t_hidden = threading.Thread(
+                    target=lambda: hidden_out.append(hidden_service.run_once(epoch='9' * 32, token=token))
+                )
+                t_hidden.start()
+                self.assertTrue(server_ready.wait(2.0))
+                from test_trial import metrics as make_metrics
+                m_hidden = make_metrics()
+                m_hidden['token'] = token
+                m_hidden['codec'] = proto.CODEC_4K120
+                m_hidden['final'] = True
+                m_hidden['state'] = 'failed'
+                m_hidden['error'] = 'PAGE_HIDDEN'
+                conn = http.client.HTTPConnection('127.0.0.1', free_port, timeout=2)
+                conn.request(
+                    'POST',
+                    f'/{token}/metrics',
+                    body=json.dumps(m_hidden).encode(),
+                    headers={
+                        'Host': f'127.0.0.1:{free_port}',
+                        'Origin': f'http://127.0.0.1:{free_port}',
+                        'Content-Type': 'application/json',
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 200)
+                resp.read()
+                conn.close()
+                t_hidden.join(2.0)
+                self.assertFalse(t_hidden.is_alive())
+            self.assertEqual(hidden_out[0]['closeReason'], 'viewer-hidden')
+            # Only the initial TinyBrowser launch occurred; local.owner.applibrary was NOT launched over the new app
+            self.assertEqual(len(tv_events), 1)
+            self.assertEqual(tv_events[0]['id'], ap.TV_BROWSER_APP_ID)
+            self.assertEqual(hidden_handoff.snapshot()['lastTeardownStatus'], 'suppressed')
+            self.assertEqual(hidden_handoff.snapshot()['lastTeardownReason'], 'viewer-hidden')
+            self.assertFalse(journal.exists())
+            self.assertEqual(hidden_service.state, 'idle')
+
+            # 3. Viewer heartbeat loss after handoff expires the session, returns TV to Holly, and releases journal
+            release_ffmpeg.clear()
+            tv_events.clear()
+            server_ready.clear()
+            hb_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(tv_launch, spark_ip=proto.SPARK, viewer_port=free_port),
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+                viewer_max_duration_s=1800,
+                viewer_heartbeat_timeout_s=0.05,
+            )
+            hb_snap = hb_service.run_once(epoch='a1' * 16, token=token)
+            self.assertTrue(hb_snap['closed'])
+            self.assertEqual(hb_snap['closeReason'], 'owner-ended')
+            self.assertEqual(len(tv_events), 2)
+            self.assertEqual(tv_events[0]['id'], ap.TV_BROWSER_APP_ID)
+            self.assertEqual(tv_events[1], {'id': ap.TV_HOME_APP_ID})
+            self.assertFalse(journal.exists())
+            self.assertEqual(hb_service.state, 'idle')
+
+            # 4. main() uses canonical DEFAULT_JOURNAL_PATH even when --config is in an alternate directory
+            alt_dir = root / 'alt-config-dir'
+            alt_dir.mkdir(mode=0o700)
+            alt_cfg = alt_dir / 'airplay.json'
+            alt_cfg.write_text(json.dumps({'pin': 1357, 'viewer_port': free_port}))
+            os.chmod(alt_cfg, 0o600)
+            seen_journals = []
+
+            def spy_service_factory(cfg_obj, **kwargs):
+                seen_journals.append(kwargs.get('journal'))
+                return types.SimpleNamespace(
+                    run_once=lambda: {'state': 'idle'},
+                    start=lambda: True,
+                    close=lambda: True,
+                )
+
+            with patch.object(ap.os, 'getuid', return_value=1000), patch.object(
+                ap.os, 'geteuid', return_value=1000
+            ), patch.object(ap.platform, 'node', return_value='{{SPARK_HOSTNAME}}'), patch.object(
+                ap, 'load_airplay_config', return_value=ap.validate_airplay_config({'pin': 1357, 'viewer_port': free_port})
+            ), patch.object(ap, 'AirPlayService', side_effect=spy_service_factory), patch.object(
+                ap.signal, 'signal', lambda *_a, **_k: None
+            ):
+                rc = ap.main(['--run', '--once', '--config', str(alt_cfg)], tv_launch=tv_launch)
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen_journals, [ap.DEFAULT_JOURNAL_PATH])
+            self.assertNotEqual(seen_journals[0], alt_cfg.parent / 'session-pending')
+
+            # 5. Calling AirPlayService.snapshot() during first-media _on_open bootstrap does not deadlock
+            release_ffmpeg.clear()
+            tv_events.clear()
+            server_ready.clear()
+            snap_in_open = []
+
+            def tv_launch_taking_snapshot(payload, **_kwargs):
+                tv_events.append(payload)
+                if payload.get('id') == ap.TV_BROWSER_APP_ID:
+                    snap_in_open.append(snap_service.snapshot())
+                    release_ffmpeg.set()
+                return {'returnValue': True}
+
+            snap_service = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(
+                    tv_launch_taking_snapshot,
+                    spark_ip=proto.SPARK,
+                    viewer_port=free_port,
+                ),
+                journal=journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            snap_out = snap_service.run_once(epoch='b2' * 16, token=token)
+            self.assertTrue(snap_out['closed'])
+            self.assertEqual(len(snap_in_open), 1)
+            self.assertEqual(snap_in_open[0]['state'], 'running')
+            self.assertIsNotNone(snap_in_open[0]['activeSession'])
+
+            # 6. Final PAGE_HIDDEN metrics and /end preserve stop reason even if HTTP reply raises BrokenPipeError
+            broken_session = ap.AirPlayRelaySession('c3' * 16, pin=4321)
+            broken_host = ap.AirPlayViewerHost(
+                broken_session,
+                token=token,
+                tv_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            handler_cls = ap.airplay_viewer_handler_for(lambda: broken_host)
+            from test_trial import metrics as make_metrics
+            m_broken = make_metrics()
+            m_broken['token'] = token
+            m_broken['codec'] = proto.CODEC_4K120
+            m_broken['final'] = True
+            m_broken['state'] = 'failed'
+            m_broken['error'] = 'PAGE_HIDDEN'
+            final_hidden_body = json.dumps(m_broken).encode('utf-8')
+            class _Headers(dict):
+                def get_all(self, key, default=()):
+                    return [self[key]] if key in self else list(default)
+
+            fake_handler = object.__new__(handler_cls)
+            fake_handler.client_address = ('127.0.0.1', 55100)
+            fake_handler.command = 'POST'
+            fake_handler.path = f'/{token}/metrics'
+            fake_handler.headers = _Headers({
+                'Host': f'{proto.SPARK}:{free_port}',
+                'Origin': f'http://{proto.SPARK}:{free_port}',
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(final_hidden_body)),
+            })
+            fake_handler.rfile = io.BytesIO(final_hidden_body)
+            fake_handler.reply = lambda *_a, **_k: (_ for _ in ()).throw(BrokenPipeError('client closed socket'))
+            with self.assertRaises(BrokenPipeError):
+                fake_handler.do_POST()
+            self.assertEqual(broken_host.close_reason, 'viewer-hidden')
+            self.assertEqual(broken_session.close_reason, 'viewer-hidden')
+
+            broken_end_session = ap.AirPlayRelaySession('d4' * 16, pin=4321)
+            broken_end_host = ap.AirPlayViewerHost(
+                broken_end_session,
+                token=token,
+                tv_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            end_handler_cls = ap.airplay_viewer_handler_for(lambda: broken_end_host)
+            fake_end_handler = object.__new__(end_handler_cls)
+            fake_end_handler.client_address = ('127.0.0.1', 55101)
+            fake_end_handler.command = 'POST'
+            fake_end_handler.path = f'/{token}/end'
+            fake_end_handler.headers = _Headers({
+                'Host': f'{proto.SPARK}:{free_port}',
+                'Origin': f'http://{proto.SPARK}:{free_port}',
+                'Content-Type': 'application/json',
+                'Content-Length': '2',
+            })
+            fake_end_handler.rfile = io.BytesIO(b'{}')
+            fake_end_handler.reply = lambda *_a, **_k: (_ for _ in ()).throw(BrokenPipeError('client closed socket'))
+            with patch.object(ap, 'TV', '127.0.0.1'):
+                with self.assertRaises(BrokenPipeError):
+                    fake_end_handler.do_POST()
+            self.assertEqual(broken_end_host.close_reason, 'viewer-ended')
+            self.assertEqual(broken_end_session.close_reason, 'teardown')
+
+            # 7. Manager.stale_journal checks flock liveness before rejecting an empty in-progress reservation
+            mid_write_fd = os.open(journal, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                ap.fcntl.flock(mid_write_fd, ap.fcntl.LOCK_EX | ap.fcntl.LOCK_NB)
+                mid_mgr = mgr_mod.Manager(
+                    spawn=lambda *_a, **_k: None,
+                    journal=journal,
+                    weather=lambda: {},
+                )
+                self.assertEqual(mid_mgr.state, 'idle')
+                self.assertFalse(snap_service._is_unlocked_airplay_crash_journal())
+            finally:
+                try:
+                    ap.fcntl.flock(mid_write_fd, ap.fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(mid_write_fd)
+                if journal.exists():
+                    journal.unlink()
+
+            # 8. _SubreaperOwner discovers and cleans up subreaper children/grandchildren without touching parent root processes
+            import process_owner as po
+            raw_owner = po.ProcessOwner.__new__(po.ProcessOwner)
+            raw_owner.root = 100
+            raw_owner.handles = {300: (901, 10)}
+            raw_owner.processes = [types.SimpleNamespace(pid=300, poll=lambda: 0)]
+            raw_owner.drainers = []
+            raw_owner.retired = []
+            raw_owner.process_refs = {}
+            raw_owner.lock = threading.RLock()
+            raw_owner.stderr_bytes = 0
+            raw_owner.closed = False
+            raw_owner.disposed = False
+            alive_pids = {200, 300, 301}
+            signalled_pids = []
+            waited_pids = []
+            raw_owner.live = lambda pid: pid in alive_pids
+            raw_owner.send = lambda pid, _sig: (signalled_pids.append(pid), alive_pids.discard(pid))
+            sub_owner = ap._SubreaperOwner(raw_owner)
+            with patch.object(
+                po,
+                'children',
+                side_effect=lambda pid: ({300} & alive_pids) if pid == 100 else (({301} & alive_pids) if pid == 300 else set()),
+            ), patch.object(
+                po,
+                'status',
+                side_effect=lambda pid: (
+                    {'pid': pid, 'ppid': 100 if pid == 300 else 300, 'start': 10}
+                    if pid in alive_pids
+                    else None
+                ),
+            ), patch.object(po.os, 'pidfd_open', return_value=902, create=True), patch.object(
+                po.os, 'waitpid', side_effect=lambda pid, _flags: (waited_pids.append(pid), (0, 0))[1]
+            ), patch.object(po.os, 'close'):
+                cleanup_res = sub_owner.cleanup()
+            self.assertTrue(cleanup_res['verified'])
+            self.assertNotIn(200, signalled_pids)
+            self.assertNotIn(200, waited_pids)
+            self.assertEqual(set(signalled_pids), {300, 301})
+            self.assertIn(200, alive_pids)
+
+            # 8b. Reparented grandchild that called setsid() after parent 300 exited is tracked and terminated by _SubreaperOwner
+            reparent_owner = po.ProcessOwner.__new__(po.ProcessOwner)
+            reparent_owner.root = 100
+            reparent_owner.handles = {300: (901, 10)}
+            reparent_owner.processes = [types.SimpleNamespace(pid=300, poll=lambda: 0)]
+            reparent_owner.drainers, reparent_owner.retired, reparent_owner.process_refs = [], [], {}
+            reparent_owner.lock = threading.RLock()
+            reparent_owner.stderr_bytes = 0
+            reparent_owner.closed = reparent_owner.disposed = False
+            reparent_alive = {301}
+            reparent_signals = []
+            reparent_owner.live = lambda pid: pid in reparent_alive and pid in reparent_owner.handles
+            reparent_owner.send = lambda pid, _sig: (reparent_signals.append(pid), reparent_alive.discard(pid))
+            reparent_sub = ap._SubreaperOwner(reparent_owner)
+            with patch.object(po, 'children', side_effect=lambda pid: set(reparent_alive) if pid == 100 else set()), patch.object(
+                po, 'status', side_effect=lambda pid: {'pid': pid, 'ppid': 100, 'start': 10} if pid in reparent_alive else None
+            ), patch.object(po.os, 'pidfd_open', return_value=902, create=True), patch.object(
+                po.os, 'waitpid', side_effect=ChildProcessError
+            ), patch.object(po.os, 'close'):
+                reparent_res = reparent_sub.cleanup()
+            self.assertTrue(reparent_res['verified'])
+            self.assertEqual(reparent_signals, [301])
+            self.assertEqual(reparent_alive, set())
+
+            # 8c. IsolatedProcessOwner runs ProcessOwner in a separate subreaper process (root != os.getpid())
+            import subprocess
+            import sys
+
+            def _make_forked_po():
+                inst = po.ProcessOwner.__new__(po.ProcessOwner)
+                inst.root = os.getpid()
+                inst.handles, inst.processes, inst.drainers = {}, [], []
+                inst.retired, inst.process_refs = [], {}
+                inst.lock = threading.RLock()
+                inst.stderr_bytes = 0
+                inst.closed = inst.disposed = False
+                inst._track = lambda p, _parent: inst.handles.__setitem__(p, (-1, 10))
+                inst.live = lambda _p: False
+                inst.send = lambda *_a: None
+                return inst
+
+            iso_owner = ap.IsolatedProcessOwner(owner_factory=_make_forked_po, fork_worker=True)
+            try:
+                self.assertIsInstance(iso_owner.root, int)
+                self.assertNotEqual(iso_owner.root, os.getpid())
+                iso_proc = iso_owner.spawn(
+                    [sys.executable, '-B', '-c', 'import sys; sys.stdout.write("UxPlay 1.73.7\\n")'],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                )
+                self.assertEqual(iso_proc.stdout.read(), b'UxPlay 1.73.7\n')
+                iso_proc.stdout.close()
+                self.assertEqual(iso_proc.wait(timeout=2.0), 0)
+            finally:
+                iso_cleanup = iso_owner.cleanup()
+            self.assertTrue(iso_cleanup['verified'])
+
+            # 9. _ws_recv_json replies to WebSocket Ping (0x9) with a masked Pong (0xA) containing the same payload
+            ping_payload = b'keepalive-ping'
+            resp_payload = b'{"type":"registered","payload":{}}'
+            incoming_stream = bytearray([0x89, len(ping_payload)]) + ping_payload + bytearray([0x81, len(resp_payload)]) + resp_payload
+            sent_frames = bytearray()
+
+            class _PingSock:
+                def settimeout(self, _t):
+                    pass
+
+                def recv(self, count):
+                    if not incoming_stream:
+                        return b''
+                    chunk = bytes(incoming_stream[:count])
+                    del incoming_stream[:count]
+                    return chunk
+
+                def sendall(self, data):
+                    sent_frames.extend(data)
+
+            parsed_ws = ap._ws_recv_json(_PingSock(), deadline=ap.time.monotonic() + 2.0)
+            self.assertEqual(parsed_ws, {'type': 'registered', 'payload': {}})
+            self.assertEqual(sent_frames[0], 0x8A)
+            self.assertEqual(sent_frames[1], 0x80 | len(ping_payload))
+            pong_mask = sent_frames[2:6]
+            pong_unmasked = bytes(b ^ pong_mask[i & 3] for i, b in enumerate(sent_frames[6:]))
+            self.assertEqual(pong_unmasked, ping_payload)
+
+            # 10. main() returns non-zero exit code when start() fails or service enters terminal error state
+            failed_svc = types.SimpleNamespace(
+                state='error',
+                worker_thread=None,
+                start=lambda: False,
+                close=lambda: True,
+                run_once=lambda: {'closed': True, 'closeReason': 'sender-disconnected'},
+            )
+            with patch.object(ap.os, 'getuid', return_value=1000), patch.object(
+                ap.os, 'geteuid', return_value=1000
+            ), patch.object(ap.platform, 'node', return_value='{{SPARK_HOSTNAME}}'), patch.object(
+                ap, 'load_airplay_config', return_value=ap.validate_airplay_config({'pin': 1357, 'viewer_port': free_port})
+            ), patch.object(ap, 'AirPlayService', return_value=failed_svc), patch.object(
+                ap.signal, 'signal', lambda *_a, **_k: None
+            ):
+                self.assertEqual(ap.main(['--run'], tv_launch=tv_launch), 1)
+                self.assertEqual(ap.main(['--run', '--once'], tv_launch=tv_launch), 1)
+
+            # 11. AirPlayViewerHost.request_stop('viewer-hidden') records close_reason before setting stop event
+            rel_event, read_event, done_event = (threading.Event() for _ in range(3))
+            hidden_launches = []
+
+            class _NoopServer:
+                def __init__(self, *_a):
+                    self.done = threading.Event()
+
+                def serve_forever(self, **_k):
+                    self.done.wait(3)
+
+                def shutdown(self):
+                    self.done.set()
+
+                def server_close(self):
+                    pass
+
+            class _BlockingEOFStream:
+                def __init__(self):
+                    self.buf = io.BytesIO(b''.join(init_bytes() + pair()))
+
+                def read(self, n):
+                    data = self.buf.read(n)
+                    if data:
+                        return data
+                    read_event.set()
+                    rel_event.wait(3)
+                    return b''
+
+                def close(self):
+                    rel_event.set()
+
+            def _hidden_spawn(argv, **_kw):
+                if argv[-1] == '-v':
+                    return types.SimpleNamespace(
+                        stdout=io.BytesIO(b'UxPlay 1.73.7\n'), stderr=io.BytesIO(), poll=lambda: 0, wait=lambda **_k: 0
+                    )
+                return types.SimpleNamespace(
+                    stdin=io.BytesIO(),
+                    stdout=_BlockingEOFStream() if argv[0] == 'ffmpeg' else None,
+                    poll=lambda: None,
+                    wait=lambda **_k: 0,
+                    terminate=lambda: None,
+                )
+
+            hidden_svc = ap.AirPlayService(
+                {'pin': 1234},
+                tv_launch=lambda payload, **_k: (hidden_launches.append(payload['id']), {'returnValue': True})[1],
+                spawn=_hidden_spawn,
+                journal=journal.parent / 'pending-hidden',
+                server_factory=_NoopServer,
+            )
+            t_worker = threading.Thread(target=lambda: (hidden_svc.run_once(), done_event.set()))
+            t_worker.start()
+            self.assertTrue(read_event.wait(2.0))
+            active_host = hidden_svc.active_host
+            orig_stop_set = active_host.stop.set
+
+            def _stop_set_then_yield():
+                orig_stop_set()
+                if threading.current_thread().name == 'hidden-stop-trigger':
+                    rel_event.set()
+                    self.assertTrue(done_event.wait(2.0))
+
+            active_host.stop.set = _stop_set_then_yield
+            t_hidden = threading.Thread(
+                target=lambda: active_host.request_stop('viewer-hidden'),
+                name='hidden-stop-trigger',
+            )
+            t_hidden.start()
+            t_hidden.join(3.0)
+            t_worker.join(3.0)
+            self.assertEqual(hidden_launches, [ap.TV_BROWSER_APP_ID])
+            self.assertEqual(hidden_svc.tv_handoff.last_teardown_reason, 'viewer-hidden')
+
+            # 12. PAGE_HIDDEN recorded before HTTP reply, and media_open does not hold host.lock across capture_allowed
+            from email.message import Message
+            reply_race_launches = []
+            reply_race_handoff = ap.AirPlayTVHandoff(
+                lambda payload, **_k: (reply_race_launches.append(payload['id']), {'returnValue': True})[1]
+            )
+            race_epoch = 'e1' * 16
+            race_token = 'a1' * 24
+            reply_race_handoff.bind_viewer(race_epoch, race_token)
+            race_sess = ap.AirPlayRelaySession(
+                race_epoch,
+                pin=1234,
+                tv_teardown_callback=lambda **kw: reply_race_handoff.on_tv_teardown(**kw),
+            )
+            race_host = ap.AirPlayViewerHost(race_sess, race_token)
+            reply_race_handoff.on_tv_open(epoch=race_epoch, codec=proto.CODEC, profile='4k60_hevc')
+            race_sess.tv_opened = True
+            race_host.note_tv_open()
+            from test_trial import metrics
+            race_body = dict(metrics(), token=race_token, final=True, state='failed', error='PAGE_HIDDEN')
+            race_raw = json.dumps(race_body).encode()
+            race_handler = object.__new__(ap.airplay_viewer_handler_for(race_host))
+            race_handler.client_address = (proto.TV, 12345)
+            race_handler.command = 'POST'
+            race_handler.path = f'/{race_token}/metrics'
+            race_handler.headers = Message()
+            for hk, hv in {
+                'Host': f'{proto.SPARK}:{proto.PORT}',
+                'Origin': proto.ORIGIN,
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(race_raw)),
+            }.items():
+                race_handler.headers[hk] = hv
+            race_handler.rfile = io.BytesIO(race_raw)
+            race_handler.reply = lambda *_a, **_k: race_sess.close('sender-disconnected')
+            race_handler.do_POST()
+            race_host.close()
+            self.assertEqual(reply_race_launches, [ap.TV_BROWSER_APP_ID])
+            self.assertEqual(race_host.close_reason, 'viewer-hidden')
+            self.assertEqual(race_sess.close_reason, 'viewer-hidden')
+
+            in_launch_ev = threading.Event()
+            finish_launch_ev = threading.Event()
+            lock_order_sess = ap.AirPlayRelaySession(
+                'e2' * 16,
+                pin=1234,
+                tv_open_callback=lambda **_k: (in_launch_ev.set(), finish_launch_ev.wait(2)),
+            )
+            lock_order_host = ap.AirPlayViewerHost(
+                lock_order_sess,
+                'b2' * 24,
+                max_duration_s=1,
+                clock=lambda: 2.0 if threading.current_thread().name == 'expired-media-open' else 0.0,
+            )
+            lock_order_sess.ingest_init(*init_bytes())
+            t_first_media = threading.Thread(
+                target=lambda: lock_order_sess.ingest_fragment(*pair()),
+                name='first-media',
+                daemon=True,
+            )
+            t_first_media.start()
+            self.assertTrue(in_launch_ev.wait(1.0))
+
+            def _expired_open():
+                try:
+                    lock_order_host.media_open({'epoch': 'e2' * 16, 'generation': 0})
+                except Exception:
+                    pass
+
+            t_expired_open = threading.Thread(target=_expired_open, name='expired-media-open', daemon=True)
+            t_expired_open.start()
+            self.assertTrue(lock_order_host.stop.wait(1.0))
+            finish_launch_ev.set()
+            t_first_media.join(0.5)
+            t_expired_open.join(0.5)
+            self.assertFalse(t_first_media.is_alive())
+            self.assertFalse(t_expired_open.is_alive())
+            self.assertTrue(lock_order_sess.closed)
+            lock_order_host.close()
+
+            # 13. Case-insensitive WebSocket upgrade header, malformed SSAP launch ack ambiguity, and signal during probe I/O lock
+            import base64
+            import hashlib
+            import subprocess
+            import sys
+
+            class _FakeSSAPSocket:
+                def __init__(self, *, malformed=False, lowercase_header=False):
+                    self.pending = bytearray()
+                    self.launched = False
+                    self.registered = False
+                    self.malformed = malformed
+                    self.lowercase_header = lowercase_header
+
+                def settimeout(self, _value):
+                    pass
+
+                def close(self):
+                    pass
+
+                def getpeercert(self, **_kwargs):
+                    return b'fixture-certificate'
+
+                def recv(self, count):
+                    out = bytes(self.pending[:count])
+                    del self.pending[:count]
+                    return out
+
+                def _frame(self, obj):
+                    raw = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+                    self.pending.extend(bytes((0x81, len(raw))) + raw)
+
+                def sendall(self, raw):
+                    if raw.startswith(b'GET '):
+                        key = raw.split(b'Sec-WebSocket-Key: ')[1].split(b'\r\n')[0]
+                        accept = base64.b64encode(
+                            hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest()
+                        )
+                        hdr = b'sec-websocket-accept' if self.lowercase_header else b'Sec-WebSocket-Accept'
+                        self.pending.extend(
+                            b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                            + hdr
+                            + b': '
+                            + accept
+                            + b'\r\n\r\n'
+                        )
+                    elif not self.registered:
+                        self.registered = True
+                        self._frame({'id': 'reg', 'type': 'registered', 'payload': {}})
+                    else:
+                        self.launched = True
+                        self._frame(
+                            {
+                                'id': 'launch',
+                                'type': 'response',
+                                'payload': None if self.malformed else {'returnValue': True},
+                            }
+                        )
+
+            class _FakeSSLContext:
+                def __init__(self, sock):
+                    self.sock = sock
+
+                def wrap_socket(self, *_a, **_kw):
+                    return self.sock
+
+            pin_digest = hashlib.sha256(b'fixture-certificate').hexdigest()
+            # 13a. Lowercase sec-websocket-accept header succeeds
+            lc_sock = _FakeSSAPSocket(lowercase_header=True)
+            lc_transport = ap.PinnedSSAPTransport()
+            lc_transport.validate_credentials = lambda: ('a' * 32, pin_digest)
+            lc_handoff = ap.AirPlayTVHandoff(lc_transport, spark_ip=proto.SPARK, viewer_port=free_port)
+            lc_epoch = 'f1' * 16
+            lc_handoff.bind_viewer(lc_epoch, token)
+            with patch.object(ap.socket, 'create_connection', return_value=lc_sock), patch.object(
+                ap.ssl, 'SSLContext', return_value=_FakeSSLContext(lc_sock)
+            ):
+                lc_status = lc_handoff.on_tv_open(
+                    epoch=lc_epoch, codec=ap.PROFILE_4K60_HEVC.codec_string, profile='4k60_hevc'
+                )
+            self.assertEqual(lc_status, 'accepted')
+            self.assertTrue(lc_sock.launched)
+
+            # 13b. Malformed launch response payload preserves ambiguity ('unknown') so teardown reconciles Home
+            mal_sock = _FakeSSAPSocket(malformed=True)
+            mal_transport = ap.PinnedSSAPTransport()
+            mal_transport.validate_credentials = lambda: ('a' * 32, pin_digest)
+            mal_handoff = ap.AirPlayTVHandoff(mal_transport, spark_ip=proto.SPARK, viewer_port=free_port)
+            mal_epoch = 'f2' * 16
+            mal_handoff.bind_viewer(mal_epoch, token)
+            with patch.object(ap.socket, 'create_connection', return_value=mal_sock), patch.object(
+                ap.ssl, 'SSLContext', return_value=_FakeSSLContext(mal_sock)
+            ):
+                mal_status = mal_handoff.on_tv_open(
+                    epoch=mal_epoch, codec=ap.PROFILE_4K60_HEVC.codec_string, profile='4k60_hevc'
+                )
+            self.assertEqual(mal_status, 'unknown')
+            self.assertTrue(mal_sock.launched)
+            self.assertTrue(mal_handoff.needs_teardown(mal_epoch))
+            self.assertFalse(mal_handoff.is_reconciled(mal_epoch))
+
+            # 13c. Signal delivery while main(--run --once) owns session._probe_io_lock exits cleanly without deadlock
+            sig_handlers = {}
+            sig_svc_record = {}
+            sig_spawned_cmds = []
+
+            outer_self = self
+
+            class _SigProbeOwner:
+                def __init__(self):
+                    self.handles = {}
+                    self.drainers = []
+
+                def spawn(self, argv, **kwargs):
+                    sig_spawned_cmds.append(list(argv))
+                    outer_self.assertEqual(argv[-1], '-v')
+                    return subprocess.Popen(
+                        [sys.executable, '-B', '-c', 'print("UxPlay 1.73.7")'],
+                        **kwargs,
+                    )
+
+                def terminate(self, proc):
+                    if proc.poll() is None:
+                        proc.terminate()
+
+                def cleanup(self):
+                    return {'verified': True}
+
+            orig_service_cls = ap.AirPlayService
+
+            def _recording_service(*a, **kw):
+                svc = orig_service_cls(*a, **kw)
+                sig_svc_record['svc'] = svc
+                return svc
+
+            orig_os_read = ap.os.read
+            sig_injected = [False]
+
+            def _interrupting_read(fd, count):
+                data = orig_os_read(fd, count)
+                svc = sig_svc_record.get('svc')
+                sess = svc.active_session if svc is not None else None
+                if sess is not None and sess._probe_io_lock.locked() and not sig_injected[0]:
+                    sig_injected[0] = True
+                    handler = sig_handlers.get(ap.signal.SIGTERM)
+                    if callable(handler):
+                        handler(ap.signal.SIGTERM, None)
+                return data
+
+            import process_owner as po_mod
+            with patch.object(ap.os, 'getuid', return_value=1000), patch.object(
+                ap.os, 'geteuid', return_value=1000
+            ), patch.object(ap.platform, 'node', return_value='{{SPARK_HOSTNAME}}'), patch.object(
+                ap, 'load_airplay_config', return_value=ap.AirPlayReceiverConfig(pin=1234, viewer_port=free_port)
+            ), patch.object(po_mod, 'ProcessOwner', _SigProbeOwner), patch.object(
+                ap, 'AirPlayService', side_effect=_recording_service
+            ), patch.object(
+                ap.signal, 'signal', side_effect=lambda s, h: sig_handlers.__setitem__(s, h)
+            ), patch.object(ap.os, 'read', side_effect=_interrupting_read):
+                sig_rc = ap.main(
+                    ['--run', '--once'],
+                    tv_launch=lambda *_a, **_k: {'returnValue': True},
+                    journal=root / 'sig-probe-journal',
+                )
+            self.assertEqual(sig_rc, 0)
+            self.assertTrue(sig_injected[0])
+            self.assertEqual(len(sig_spawned_cmds), 1)
+            self.assertEqual(sig_spawned_cmds[0][-1], '-v')
+
+            # 14a. main(['--run']) with enabled=False exits 0 before validating SSAP credentials
+            disabled_cfg_path = root / 'disabled-airplay.json'
+            disabled_cfg_path.write_text(json.dumps({'enabled': False, 'pin': 1234}))
+            os.chmod(disabled_cfg_path, 0o600)
+            orig_load_cfg = ap.load_airplay_config
+            real_uid = os.getuid()
+            with patch.object(ap.os, 'getuid', return_value=1000), patch.object(
+                ap.os, 'geteuid', return_value=1000
+            ), patch.object(ap.platform, 'node', return_value='{{SPARK_HOSTNAME}}'), patch.object(
+                ap, 'load_airplay_config', side_effect=lambda p, **_k: orig_load_cfg(p, expected_uid=real_uid)
+            ), patch.object(
+                ap.PinnedSSAPTransport,
+                'validate_credentials',
+                side_effect=FileNotFoundError('missing SSAP key/pin'),
+            ):
+                self.assertEqual(ap.main(['--run', '--config', str(disabled_cfg_path)]), 0)
+
+            # 14b. Concurrent run_once() reserves the run slot before calling owner_factory / setup
+            run_barrier = threading.Barrier(2)
+            entered_owner_factory = threading.Event()
+            release_owner_factory = threading.Event()
+            owner_factory_calls = []
+
+            def _slow_owner_factory():
+                owner_factory_calls.append(threading.current_thread().name)
+                entered_owner_factory.set()
+                release_owner_factory.wait(1.0)
+                return types.SimpleNamespace(
+                    spawn=lambda argv, **_k: types.SimpleNamespace(
+                        stdout=io.BytesIO(b'UxPlay 1.73.7\n' if argv[-1] == '-v' else b''),
+                        stderr=io.BytesIO(b''),
+                        stdin=io.BytesIO(b''),
+                        poll=lambda: 0,
+                        wait=lambda **_w: 0,
+                        terminate=lambda: None,
+                    ),
+                    terminate=lambda *_a, **_k: None,
+                    cleanup=lambda: {'verified': True},
+                )
+
+            slot_svc = ap.AirPlayService(
+                {'pin': 1234, 'viewer_port': free_port},
+                tv_launch=lambda *_a, **_k: {'returnValue': True},
+                owner_factory=_slow_owner_factory,
+                journal=root / 'slot-journal',
+            )
+            slot_results = []
+
+            def _call_run_once():
+                run_barrier.wait(1.0)
+                try:
+                    slot_results.append(slot_svc.run_once(max_startup_attempts=1))
+                except RuntimeError as exc:
+                    slot_results.append({'raised': str(exc)})
+
+            t_slot_1 = threading.Thread(target=_call_run_once, name='slot-1')
+            t_slot_2 = threading.Thread(target=_call_run_once, name='slot-2')
+            t_slot_1.start()
+            t_slot_2.start()
+            self.assertTrue(entered_owner_factory.wait(1.0))
+            release_owner_factory.set()
+            t_slot_1.join(2.0)
+            t_slot_2.join(2.0)
+            self.assertEqual(len(owner_factory_calls), 1)
+            self.assertEqual(len(slot_results), 2)
+            self.assertTrue(any(r.get('busy') is True for r in slot_results))
+            self.assertTrue(any(r.get('raised') == 'AIRPLAY_STARTUP_TIMEOUT' for r in slot_results))
+
+            # 14c. _SubreaperOwner preserves ProcessOwner spawn semantics so real ProcessOwner.spawn launches cleanly
+            real_popen = subprocess.Popen
+            real_owner = po.ProcessOwner.__new__(po.ProcessOwner)
+            real_owner.root = os.getpid()
+            real_owner.handles, real_owner.processes, real_owner.drainers = {}, [], []
+            real_owner.retired, real_owner.process_refs = [], {}
+            real_owner.lock = threading.RLock()
+            real_owner.closed = real_owner.disposed = False
+            real_owner.stderr_bytes = 0
+            real_owner._track = lambda *_: None
+            wrapped_real_owner = ap._SubreaperOwner(real_owner)
+            self.assertTrue(ap._is_process_owner_spawn(wrapped_real_owner.spawn))
+            probe_sess = ap.AirPlayRelaySession('f3' * 16, pin=1234)
+            try:
+                with patch.object(
+                    po.subprocess,
+                    'Popen',
+                    side_effect=lambda _argv, **kw: real_popen([sys.executable, '-B', '-c', 'print("UxPlay 1.73.7")'], **kw),
+                ) as mock_po_popen:
+                    ver = probe_sess._probe_uxplay_version(wrapped_real_owner.spawn, terminate=wrapped_real_owner.terminate)
+                self.assertEqual(ver, (1, 73, 7))
+                self.assertEqual(mock_po_popen.call_count, 1)
+            finally:
+                for proc in real_owner.processes:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=2)
+                for drainer in real_owner.drainers:
+                    drainer.join(timeout=1)
+
+            # 14d. Adopted zombie descendants in isolated subreaper (including 301 that called setsid() and exited before first discovery,
+            # and 302 that was discovered while alive before becoming a zombie) are reaped by cleanup() without post-exit markers.
+            z_owner = po.ProcessOwner.__new__(po.ProcessOwner)
+            z_owner.root = 100
+            z_owner.handles = {300: (901, 10)}
+            z_owner.processes = [types.SimpleNamespace(pid=300, poll=lambda: 0)]
+            z_owner.drainers, z_owner.retired, z_owner.process_refs = [], [], {}
+            z_owner.lock = threading.RLock()
+            z_owner.stderr_bytes = 0
+            z_owner.closed = z_owner.disposed = False
+            z_owner.live = lambda _pid: False
+            z_owner._track = lambda p, _parent: z_owner.handles.__setitem__(p, (902, 22))
+            z_owner.send = lambda *_a: (_ for _ in ()).throw(AssertionError('no signals on dead zombies'))
+            z_sub = ap._SubreaperOwner(z_owner)
+            z_adopted = {301, 302}
+            z_waited = []
+            z_302_state = ['S']
+
+            def _z_waitpid(pid, _flags):
+                if pid in (300, 301, 302):
+                    z_waited.append(pid)
+                if pid in (301, 302):
+                    z_adopted.discard(pid)
+                    return (pid, 0)
+                raise ChildProcessError()
+
+            with patch.object(po, 'children', side_effect=lambda p: set(z_adopted) if p == 100 else set()), patch.object(
+                po,
+                'status',
+                side_effect=lambda p: (
+                    {
+                        'pid': p,
+                        'ppid': 100,
+                        'start': {300: 10, 301: 20, 302: 22}[p],
+                        'state': z_302_state[0] if p == 302 else 'Z',
+                    }
+                    if p in (300, 301, 302)
+                    else None
+                ),
+            ), patch.object(po.os, 'waitpid', side_effect=_z_waitpid), patch.object(po.os, 'close'):
+                # 301 called setsid() and exited into 'Z' before discover() ever ran (never in handles)
+                self.assertNotIn(301, z_owner.handles)
+                z_sub.discover()
+                self.assertNotIn(301, z_owner.handles)
+                self.assertIn(302, z_owner.handles)
+                # 302 now exits into a zombie before cleanup() runs
+                z_302_state[0] = 'Z'
+                z_res = z_sub.cleanup()
+            self.assertTrue(z_res['verified'])
+            self.assertEqual(z_adopted, set())
+            self.assertEqual(z_waited, [300, 301, 302])
+
+            # 14e. main(['--run']) signal handler is lock-free and never calls threading.Event.set()
+            run_sig_handlers = {}
+            close_called = [False]
+            stop_called = [False]
+            sig_run_svc = types.SimpleNamespace(
+                state='listening',
+                worker_thread=types.SimpleNamespace(is_alive=lambda: True),
+                start=lambda: True,
+                request_stop=lambda *_a: stop_called.__setitem__(0, True),
+                close=lambda: (close_called.__setitem__(0, True), True)[1],
+            )
+            with patch.object(ap.os, 'getuid', return_value=1000), patch.object(
+                ap.os, 'geteuid', return_value=1000
+            ), patch.object(ap.platform, 'node', return_value='{{SPARK_HOSTNAME}}'), patch.object(
+                ap, 'load_airplay_config', return_value=ap.AirPlayReceiverConfig(pin=1234, viewer_port=free_port)
+            ), patch.object(ap, 'AirPlayService', return_value=sig_run_svc), patch.object(
+                ap.signal, 'signal', side_effect=lambda s, h: run_sig_handlers.__setitem__(s, h)
+            ), patch.object(
+                ap.time,
+                'sleep',
+                side_effect=lambda _s: run_sig_handlers[ap.signal.SIGTERM](ap.signal.SIGTERM, None),
+            ):
+                self.assertEqual(ap.main(['--run'], tv_launch=lambda *_a, **_k: {'returnValue': True}), 0)
+            self.assertTrue(stop_called[0])
+            self.assertTrue(close_called[0])
+
+            # 14f. IsolatedProcessOwner runs in a separate subreaper process so parent subprocess.Popen and raw os.fork()+os.setsid()
+            # zombies retain their exit codes across cleanup() while detached AirPlay grandchildren that exit before discovery are reaped
+            sibling_proc = real_popen([sys.executable, '-B', '-c', 'raise SystemExit(7)'])
+            fork_pid = os.fork()
+            if fork_pid == 0:
+                os.setsid()
+                os._exit(7)
+            co_owner = ap.IsolatedProcessOwner(owner_factory=_make_forked_po, fork_worker=True)
+            try:
+                self.assertNotEqual(co_owner.root, os.getpid())
+                airplay_child = co_owner.spawn(
+                    [
+                        sys.executable,
+                        '-B',
+                        '-c',
+                        'import os; pid = os.fork();\n'
+                        'if pid == 0:\n'
+                        '    os.setsid()\n'
+                        '    os._exit(0)\n'
+                        'os._exit(0)\n',
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                )
+                airplay_child.wait(timeout=2)
+                ap.time.sleep(0.05)
+                co_cleanup = co_owner.cleanup()
+                self.assertTrue(co_cleanup['verified'])
+                self.assertEqual(sibling_proc.wait(timeout=2), 7)
+                waited_fork_pid, waited_fork_status = os.waitpid(fork_pid, 0)
+                self.assertEqual(waited_fork_pid, fork_pid)
+                self.assertEqual(os.WEXITSTATUS(waited_fork_status), 7)
+                fork_pid = None
+            finally:
+                co_owner.cleanup()
+                if sibling_proc.poll() is None:
+                    sibling_proc.kill()
+                    sibling_proc.wait(timeout=2)
+                if fork_pid is not None:
+                    try:
+                        os.waitpid(fork_pid, 0)
+                    except ChildProcessError:
+                        pass
+
+            # 14g. Pre-dispatch SSAP transport failure (e.g. ConnectionRefusedError) is treated as unsent ('rejected')
+            # and does not launch local.owner.applibrary on teardown
+            unsent_transport = ap.PinnedSSAPTransport()
+            unsent_transport.validate_credentials = lambda: ('a' * 32, pin_digest)
+            unsent_handoff = ap.AirPlayTVHandoff(unsent_transport, spark_ip=proto.SPARK, viewer_port=free_port)
+            unsent_calls = []
+
+            def _unsent_create_conn(*_a, **_kw):
+                unsent_calls.append('connect')
+                raise ConnectionRefusedError('tv asleep')
+
+            unsent_svc = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=unsent_handoff,
+                journal=root / 'unsent-journal',
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            release_ffmpeg.clear()
+            with patch.object(ap.socket, 'create_connection', side_effect=_unsent_create_conn):
+                with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_TV_OPEN_FAILED'):
+                    unsent_svc.run_once(epoch='f4' * 16, token=token)
+            self.assertEqual(unsent_calls, ['connect'])
+            self.assertEqual(unsent_handoff.last_open_status, 'rejected')
+            self.assertIsNone(unsent_handoff.last_teardown_status)
+            self.assertFalse((root / 'unsent-journal').exists())
+            self.assertEqual(unsent_svc.state, 'idle')
+
+            # 14h. SSAP error reply (type='error') to launch request is treated as 'rejected' and does not launch Home
+            err_transport = ap.PinnedSSAPTransport()
+            err_transport.validate_credentials = lambda: ('a' * 32, pin_digest)
+            err_handoff = ap.AirPlayTVHandoff(err_transport, spark_ip=proto.SPARK, viewer_port=free_port)
+            err_frames = []
+
+            class _ErrorReplyTLS:
+                def __init__(self):
+                    self._stage = 0
+                    self._buf = bytearray()
+
+                def settimeout(self, _t):
+                    pass
+
+                def sendall(self, data):
+                    if b'Upgrade: websocket' in data:
+                        self._stage = 1
+                        ws_key = data.split(b'Sec-WebSocket-Key: ')[1].split(b'\r\n')[0].decode('ascii')
+                        accept = base64.b64encode(
+                            hashlib.sha1((ws_key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode('ascii')).digest()
+                        ).decode('ascii')
+                        self._buf.extend(
+                            (
+                                f'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n'
+                                f'Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n'
+                            ).encode('ascii')
+                        )
+                    elif self._stage == 1:
+                        err_frames.append('register')
+                        self._stage = 2
+                        body = json.dumps({'id': 'reg', 'type': 'registered', 'payload': {'client-key': 'a' * 32}}).encode()
+                        self._buf.extend(bytes([0x81, len(body)]) + body)
+                    elif self._stage == 2:
+                        err_frames.append('launch')
+                        self._stage = 3
+                        body = json.dumps(
+                            {
+                                'id': 'launch',
+                                'type': 'error',
+                                'error': '403 Forbidden',
+                                'payload': {'returnValue': False, 'errorCode': 403},
+                            }
+                        ).encode()
+                        self._buf.extend(bytes([0x81, len(body)]) + body)
+
+                def recv(self, count):
+                    if not self._buf:
+                        return b''
+                    chunk = bytes(self._buf[:count])
+                    del self._buf[:count]
+                    return chunk
+
+                def getpeercert(self, binary_form=False):
+                    return b'fixture-certificate' if binary_form else {}
+
+                def close(self):
+                    pass
+
+            class _ErrSSLContext:
+                def wrap_socket(self, _raw, **_kw):
+                    return _ErrorReplyTLS()
+
+            err_svc = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=err_handoff,
+                journal=root / 'err-journal',
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            release_ffmpeg.clear()
+            with patch.object(
+                ap.socket, 'create_connection', return_value=types.SimpleNamespace(settimeout=lambda _t: None, close=lambda: None)
+            ), patch.object(ap.ssl, 'SSLContext', return_value=_ErrSSLContext()):
+                with self.assertRaisesRegex(RuntimeError, 'AIRPLAY_TV_OPEN_FAILED'):
+                    err_svc.run_once(epoch='f5' * 16, token=token)
+            self.assertEqual(err_frames, ['register', 'launch'])
+            self.assertEqual(err_handoff.last_open_status, 'rejected')
+            self.assertIsNone(err_handoff.last_teardown_status)
+
+            # 14i. Journal reservation locks staging file before atomic link so concurrent Manager init never sees unlocked journal
+            race_journal = root / 'race-journal'
+            race_svc = ap.AirPlayService(
+                {'pin': 4321, 'viewer_port': free_port},
+                tv_handoff=ap.AirPlayTVHandoff(
+                    lambda *_a, **_k: {'returnValue': True},
+                    spark_ip=proto.SPARK,
+                    viewer_port=free_port,
+                ),
+                journal=race_journal,
+                owner_factory=FakeProcessOwner,
+                bind_address='127.0.0.1',
+                viewer_port=free_port,
+            )
+            real_link = ap.os.link
+            mgr_states = []
+
+            def _racing_link(src, dst):
+                mgr_states.append(mgr_mod.Manager(journal=race_journal).state)
+                res = real_link(src, dst)
+                mgr_states.append(mgr_mod.Manager(journal=race_journal).state)
+                return res
+
+            with patch.object(ap.os, 'link', side_effect=_racing_link):
+                res_info = race_svc._reserve_journal('f6' * 16)
+            try:
+                self.assertTrue(res_info['reserved'])
+                self.assertEqual(mgr_states, ['idle', 'idle'])
+            finally:
+                race_svc._release_journal('f6' * 16, res_info['identity'])
+
+            # 14j. Crash/SIGKILL while listening before first media checkpoint preserves listen_journal and blocks replacement AirPlayService
+            listen_crash_journal = root / 'listen-crash-journal'
+            child_script = (
+                'import json, subprocess, sys\n'
+                'from pathlib import Path\n'
+                'import airplay as ap\n'
+                'journal = Path(sys.argv[1])\n'
+                'children = []\n'
+                'def spawn(argv, **kwargs):\n'
+                '    code = \'print("UxPlay 1.73.7")\' if argv[-1] == "-v" else "import time; time.sleep(30)"\n'
+                '    p = subprocess.Popen([sys.executable, "-B", "-u", "-c", code], start_new_session=True, **kwargs)\n'
+                '    if argv[-1] != "-v":\n'
+                '        children.append(p.pid)\n'
+                '    if len(children) == 2:\n'
+                '        print(json.dumps({"children": children, "journal_exists": journal.exists()}), flush=True)\n'
+                '    return p\n'
+                'ap.AirPlayService({"pin": 1234}, tv_launch=lambda *_a, **_k: {"returnValue": True}, journal=journal, spawn=spawn).run_once()\n'
+            )
+            parent_proc = real_popen(
+                [sys.executable, '-B', '-u', '-c', child_script, str(listen_crash_journal)],
+                cwd=str(Path(ap.__file__).resolve().parent),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            spawned_listen_pids = []
+            try:
+                ready_r, _, _ = ap.select.select([parent_proc.stdout], [], [], 5.0)
+                self.assertTrue(ready_r)
+                listen_info = json.loads(parent_proc.stdout.readline())
+                spawned_listen_pids = listen_info['children']
+                self.assertFalse(listen_info['journal_exists'])
+                parent_proc.kill()
+                parent_proc.wait(timeout=2)
+                replacement_svc = ap.AirPlayService(
+                    {'pin': 1234, 'viewer_port': free_port},
+                    tv_handoff=ap.AirPlayTVHandoff(
+                        lambda *_a, **_k: {'returnValue': True},
+                        spark_ip=proto.SPARK,
+                        viewer_port=free_port,
+                    ),
+                    journal=listen_crash_journal,
+                    bind_address='127.0.0.1',
+                    viewer_port=free_port,
+                )
+                self.assertEqual(replacement_svc.state, 'error')
+                self.assertEqual(replacement_svc._journal_preflight(), {'ok': False, 'busy': False})
+                self.assertEqual(replacement_svc.run_once(), {'state': 'error', 'busy': True})
+            finally:
+                if parent_proc.poll() is None:
+                    parent_proc.kill()
+                    parent_proc.wait(timeout=2)
+                for cpid in spawned_listen_pids:
+                    try:
+                        os.kill(cpid, ap.signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                parent_proc.stdout.close()
+                parent_proc.stderr.close()
+
+            bounded_handoff = ap.AirPlayTVHandoff(
+                lambda *_a, **_k: {'returnValue': True},
+                spark_ip=proto.SPARK,
+                viewer_port=free_port,
+            )
+            for idx in range(200):
+                ep = f'{idx:032x}'
+                bounded_handoff.bind_viewer(ep, token)
+                bounded_handoff.on_tv_open(epoch=ep, codec=proto.CODEC, profile='4k60_hevc')
+                bounded_handoff.on_tv_teardown(epoch=ep, reason='teardown')
+                bounded_handoff.unbind_viewer(ep)
+            for attr_val in vars(bounded_handoff).values():
+                if isinstance(attr_val, set):
+                    self.assertLessEqual(len(attr_val), 64)
+
+            # 14k. A silent owned-terminate peer remains bounded by its 2s
+            # RPC deadline, including on service close/stop, and quarantines.
+            # Operational cancellation cannot discard a legitimate TERM grace.
+            media_bootstrap_bytes = b''.join(init_bytes() + pair())
+
+            def _make_silent_socketpair_owner(*, notify_terminate_wfd=None, ffmpeg_hold_rfd=None):
+                def _silent_inner_factory():
+                    inner_fds = []
+
+                    def _spawn(argv, **_kw):
+                        if argv[-1] == '-v':
+                            pr, pw = os.pipe()
+                            os.write(pw, b'UxPlay 1.73.7\n')
+                            os.close(pw)
+                            return types.SimpleNamespace(
+                                pid=os.getpid(),
+                                stdin=None,
+                                stdout=os.fdopen(pr, 'rb', buffering=0),
+                                stderr=None,
+                                poll=lambda: 0,
+                                wait=lambda **_w: 0,
+                            )
+                        if argv[0] == 'ffmpeg':
+                            in_r, in_w = os.pipe()
+                            out_r, out_w = os.pipe()
+                            inner_fds.extend([in_r, out_w])
+
+                            def _writer():
+                                view = memoryview(media_bootstrap_bytes)
+                                off = 0
+                                while off < len(view):
+                                    try:
+                                        n = os.write(out_w, view[off:off + 16384])
+                                    except OSError:
+                                        return
+                                    if n <= 0:
+                                        return
+                                    off += n
+                                if ffmpeg_hold_rfd is not None:
+                                    try:
+                                        os.read(ffmpeg_hold_rfd, 1)
+                                    except OSError:
+                                        pass
+                                    try:
+                                        os.close(out_w)
+                                    except OSError:
+                                        pass
+
+                            threading.Thread(target=_writer, daemon=True).start()
+                            return types.SimpleNamespace(
+                                pid=os.getpid(),
+                                stdin=os.fdopen(in_w, 'wb', buffering=0),
+                                stdout=os.fdopen(out_r, 'rb', buffering=0),
+                                stderr=None,
+                                poll=lambda: None,
+                                wait=lambda **_w: 0,
+                            )
+                        return types.SimpleNamespace(
+                            pid=os.getpid(),
+                            stdin=None,
+                            stdout=None,
+                            stderr=None,
+                            poll=lambda: None,
+                            wait=lambda **_w: 0,
+                        )
+
+                    def _silent_terminate(_proc):
+                        if notify_terminate_wfd is not None:
+                            try:
+                                os.write(notify_terminate_wfd, b'T')
+                            except OSError:
+                                pass
+                        ap.time.sleep(30)
+
+                    return types.SimpleNamespace(
+                        root=os.getpid(),
+                        handles={os.getpid(): (-1, 1)},
+                        stderr_bytes=0,
+                        spawn=_spawn,
+                        terminate=_silent_terminate,
+                        discover=lambda: None,
+                        cleanup=lambda: {'verified': True, 'remaining_owned_count': 0},
+                    )
+
+                return ap.IsolatedProcessOwner(owner_factory=_silent_inner_factory, fork_worker=True)
+
+            # 14k-i: Direct IsolatedProcessOwner with silent socket.socketpair() peer during terminate
+            direct_silent_owner = _make_silent_socketpair_owner()
+            direct_worker_pid = direct_silent_owner._worker_pid
+            self.assertIsInstance(direct_worker_pid, int)
+            direct_proc = direct_silent_owner.spawn(
+                ['uxplay', '-n', 'R2-D2'],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+            )
+            t0_direct = ap.time.monotonic()
+            self.assertFalse(direct_silent_owner.terminate(direct_proc))
+            self.assertLess(ap.time.monotonic() - t0_direct, 2.5)
+            self.assertFalse(direct_silent_owner.reap())
+            direct_cleanup = direct_silent_owner.cleanup()
+            self.assertFalse(direct_cleanup['verified'])
+            self.assertIs(direct_silent_owner.cleanup_verified, False)
+            self.assertIsNone(direct_silent_owner._worker_pid)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(direct_worker_pid, 0)
+
+            # 14k-ii: AirPlayService.close() when subreaper worker holds socket.socketpair() open during terminate
+            silent_close_journal = root / 'silent-close-journal'
+            silent_close_owners = []
+            close_hold_rfd, close_hold_wfd = os.pipe()
+            try:
+                def _silent_close_owner_factory():
+                    inst = _make_silent_socketpair_owner(ffmpeg_hold_rfd=close_hold_rfd)
+                    silent_close_owners.append(inst)
+                    return inst
+
+                silent_close_svc = ap.AirPlayService(
+                    {'pin': 1234, 'viewer_port': free_port},
+                    tv_launch=lambda *_a, **_k: {'returnValue': True},
+                    owner_factory=_silent_close_owner_factory,
+                    journal=silent_close_journal,
+                    server_factory=_NoopServer,
+                    viewer_port=free_port,
+                )
+                t_silent_close = threading.Thread(target=silent_close_svc.run_once, name='silent-close-run', daemon=True)
+                t_silent_close.start()
+                run_wait_deadline = ap.time.monotonic() + 2.0
+                while silent_close_svc.state != 'running' and ap.time.monotonic() < run_wait_deadline:
+                    ap.time.sleep(0.01)
+                self.assertEqual(silent_close_svc.state, 'running')
+                self.assertEqual(len(silent_close_owners), 1)
+                close_worker_pid = silent_close_owners[0]._worker_pid
+                t0_close = ap.time.monotonic()
+                self.assertTrue(silent_close_svc.close(timeout_s=0.45))
+                elapsed_close = ap.time.monotonic() - t0_close
+                t_silent_close.join(0.2)
+                self.assertFalse(t_silent_close.is_alive())
+                self.assertLess(elapsed_close, 2.5)
+                self.assertIs(silent_close_owners[0].cleanup_verified, False)
+                self.assertIsNone(silent_close_owners[0]._worker_pid)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(close_worker_pid, 0)
+                self.assertEqual(silent_close_svc.state, 'error')
+                self.assertTrue(silent_close_journal.exists())
+                self.assertEqual(mgr_mod.Manager(journal=silent_close_journal).state, 'error')
+                silent_close_journal.unlink()
+            finally:
+                for fd in (close_hold_rfd, close_hold_wfd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+            # 14k-iii: AirPlayService.request_stop() when subreaper worker holds socket.socketpair() open during terminate
+            silent_stop_journal = root / 'silent-stop-journal'
+            silent_stop_owners = []
+            silent_stop_reaping = []
+            term_rfd, term_wfd = os.pipe()
+            hold_rfd, hold_wfd = os.pipe()
+            try:
+                def _silent_stop_owner_factory():
+                    inst = _make_silent_socketpair_owner(
+                        notify_terminate_wfd=term_wfd,
+                        ffmpeg_hold_rfd=hold_rfd,
+                    )
+                    reap_worker = inst._reap_worker
+
+                    def _delayed_reap(*, force=False):
+                        if force and not silent_stop_reaping:
+                            silent_stop_reaping.append((ap.time.monotonic(), inst._broken_error))
+                            # Reaping is a separate bounded phase after the 2s
+                            # RPC deadline. Model scheduler delay before forced
+                            # reap, whose post-kill wait itself permits up to 1s.
+                            ap.time.sleep(0.35)
+                        return reap_worker(force=force)
+
+                    inst._reap_worker = _delayed_reap
+                    silent_stop_owners.append(inst)
+                    return inst
+
+                silent_stop_svc = ap.AirPlayService(
+                    {'pin': 1234, 'viewer_port': free_port},
+                    tv_launch=lambda *_a, **_k: {'returnValue': True},
+                    owner_factory=_silent_stop_owner_factory,
+                    journal=silent_stop_journal,
+                    server_factory=_NoopServer,
+                    viewer_port=free_port,
+                )
+                t_silent_stop = threading.Thread(target=silent_stop_svc.run_once, name='silent-stop-run', daemon=True)
+                t_silent_stop.start()
+                stop_wait_deadline = ap.time.monotonic() + 2.0
+                while silent_stop_svc.state != 'running' and ap.time.monotonic() < stop_wait_deadline:
+                    ap.time.sleep(0.01)
+                self.assertEqual(silent_stop_svc.state, 'running')
+                self.assertEqual(len(silent_stop_owners), 1)
+                stop_worker_pid = silent_stop_owners[0]._worker_pid
+                # Trigger ffmpeg EOF so run_once enters teardown and blocks inside terminate() on the silent peer
+                os.write(hold_wfd, b'X')
+                ready_term, _, _ = ap.select.select([term_rfd], [], [], 2.0)
+                self.assertTrue(ready_term)
+                t0_stop = ap.time.monotonic()
+                silent_stop_svc.request_stop('owner-ended')
+                # The RPC must still time out at 2s; killing/reaping its owner
+                # and finalizing the service then have their own finite budget.
+                t_silent_stop.join(3.5)
+                elapsed_stop = ap.time.monotonic() - t0_stop
+                self.assertFalse(t_silent_stop.is_alive())
+                self.assertEqual(len(silent_stop_reaping), 1)
+                self.assertEqual(silent_stop_reaping[0][1], 'SUBREAPER_RPC_TIMEOUT')
+                self.assertLess(silent_stop_reaping[0][0] - t0_stop, 2.5)
+                self.assertLess(elapsed_stop, 3.75)
+                self.assertIs(silent_stop_owners[0].cleanup_verified, False)
+                self.assertIsNone(silent_stop_owners[0]._worker_pid)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(stop_worker_pid, 0)
+                self.assertEqual(silent_stop_svc.state, 'error')
+                self.assertTrue(silent_stop_journal.exists())
+                self.assertEqual(mgr_mod.Manager(journal=silent_stop_journal).state, 'error')
+                silent_stop_journal.unlink()
+            finally:
+                for fd in (term_rfd, term_wfd, hold_rfd, hold_wfd):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,105 @@
+'use strict';
+// Receiver jitter-buffer policy in the virtual-time harness. Each scenario runs
+// in its own Node process because the harness keeps module-level fake state.
+// These are policy-model checks only: no TV, decoder, network or media.
+const assert=require('assert'),{execFileSync}=require('child_process'),path=require('path'),fs=require('fs');
+const harness=path.join(__dirname,'jitter_harness.js'),viewer=process.env.VIEWER_SOURCE||path.join(__dirname,'viewer.js');
+let groups=0;
+function run(scenario){
+ const out=execFileSync(process.execPath,[harness,viewer,scenario],{encoding:'utf8',timeout:300000});
+ return JSON.parse(out.split('\n').filter(l=>l.startsWith('{')).pop());
+}
+function test(name,scenario,check){const r=run(scenario);check(r,r.viewerCounters);groups++;console.log('PASS '+name);}
+
+test('steady start waits for the 0.8 s cushion and never stalls','steady',(r,c)=>{
+ assert.equal(c.cushionMs,800);assert.equal(c.stallEvents,0);assert.equal(c.gapSkips,0);assert.equal(c.liveJumps,0);assert.equal(c.autoReconnects,0);
+ assert(r.firstPlayMs>=500,r.firstPlayMs);assert(r.endAheadS>=0.75&&r.endAheadS<=0.9,r.endAheadS);
+ assert.equal(r.seeks,0);assert.equal(r.generation,1);assert.equal(r.pausedAtEnd,false);assert.equal(c.error,null);});
+test('a 1.5 s delivery stall is one counted stall, rebuffered to the cushion','stall1500',(r,c)=>{
+ assert.equal(c.stallEvents,1);assert.equal(r.generation,1);assert(r.pictureFrozenMs<800,r.pictureFrozenMs);
+ assert.equal(c.liveJumps,0);assert.equal(c.autoReconnects,0);assert.equal(r.pausedAtEnd,false);});
+test('a 3.5 s stall followed by a burst returns to the cushion with one live jump','stall3500',(r,c)=>{
+ assert.equal(c.stallEvents,1);assert.equal(c.liveJumps,1);assert(r.endAheadS<0.9,r.endAheadS);
+ assert.equal(r.generation,1);assert.equal(r.pausedAtEnd,false);});
+test('a transient waiting right after a live jump does not trigger a second preroll','postseekwait',(r,c)=>{
+ assert.equal(c.stallEvents,1);assert.equal(c.liveJumps,1);assert(r.endAheadS<0.9,r.endAheadS);
+ assert.equal(r.generation,1);assert.equal(r.pausedAtEnd,false);});
+test('a server-side skip leaves one hole that is crossed by one counted gap skip','servergap',(r,c)=>{
+ assert.equal(c.gapSkips,1);assert.equal(r.generation,1);assert(r.endAheadS<0.9,r.endAheadS);assert.equal(r.pausedAtEnd,false);});
+test('a clean server stream end reconnects once to a fresh generation','streamend',(r,c)=>{
+ assert.equal(c.autoReconnects,1);assert.equal(r.generation,2);assert.equal(r.pausedAtEnd,false);assert.equal(r.sourceBuffers,2);});
+
+// Seeks are confined to the two counted jump paths; no rate changes exist.
+const source=fs.readFileSync(viewer,'utf8');
+function body(name){const start=source.indexOf('function '+name+'(');assert(start>=0,name);const next=source.indexOf('\n  function ',start+1);return [start,next<0?source.length:next];}
+const allowed=[body('skipGap'),body('liveControl')],writes=[...source.matchAll(/\.currentTime\s*=(?!=)/g)].map(m=>m.index);
+assert.equal(writes.length,3);assert(writes.every(i=>allowed.some(([a,b])=>i>a&&i<b)));
+assert(!/playbackRate\s*=/.test(source));groups++;console.log('PASS seeks only in counted gap/live jumps and no playbackRate');
+
+// Execute the actual policy functions and actual pause/seeking listeners. The
+// fake clock/video expose interruptions without a decoder, network or TV.
+const vm=require('vm');
+function holdFixture(){
+ let now=0;const listeners={};
+ const c={closed:false,ringMode:true,sb:{buffered:{length:1,end:()=>4}},
+  startGate:false,rebuffering:false,mediaPaused:false,lastProgress:{},
+  video:{paused:false,seeking:false,readyState:4,currentTime:1,
+   addEventListener:(name,fn)=>{listeners[name]=fn;},pause(){this.paused=true;if(listeners.pause)listeners.pause();}},
+  CUSHION:.8,LIVE_SLACK:2,LIVE_HOLD_MS:5000,aheadHighSince:null,
+  jb:{liveJumps:0,stallEvents:0,seekUntil:0},Date:{now:()=>now},skipGap:()=>false,
+  aheadNow:()=>0,requestPlay:()=>{throw Error('unexpected play');}};
+ vm.createContext(c);
+ for(const name of ['liveControl','onStall']){const [a,b]=body(name);vm.runInContext(source.slice(a,b),c);}
+ for(const name of ['pause','seeking']){
+  const line=source.split('\n').find(l=>l.trim().startsWith("video.addEventListener('"+name+"',"));
+  if(line)vm.runInContext(line,c);
+ }
+ return {c,at:n=>{now=n;c.liveControl();},now:n=>{now=n;},event:name=>{if(listeners[name])listeners[name]();}};
+}
+function holdTest(name,fn){fn();groups++;console.log('PASS '+name);}
+function freshHold(f,resumed){
+ const before=f.c.jb.liveJumps;f.at(resumed);assert.equal(f.c.jb.liveJumps,before,'resume must not consume the stale hold');
+ f.at(resumed+4999);assert.equal(f.c.jb.liveJumps,before);
+ f.at(resumed+5000);assert.equal(f.c.jb.liveJumps,before+1);assert.equal(f.c.video.currentTime,3.2);
+}
+holdTest('continuous eligible high buffer still jumps exactly after five seconds',()=>{
+ const f=holdFixture();f.at(0);f.at(4999);assert.equal(f.c.jb.liveJumps,0);f.at(5000);assert.equal(f.c.jb.liveJumps,1);
+});
+for(const state of ['paused','seeking','rebuffering'])holdTest(state+' interrupts the five-second live hold',()=>{
+ const f=holdFixture();f.at(0);const target=state==='rebuffering'?f.c:f.c.video;
+ target[state]=true;f.at(1000);target[state]=false;freshHold(f,10000);
+});
+for(const event of ['pause','seeking'])holdTest(event+' between ticks also resets the live hold',()=>{
+ const f=holdFixture();f.at(0);f.event(event);freshHold(f,10000);
+});
+holdTest('actual stall handler resets the hold before a short rebuffer',()=>{
+ const f=holdFixture();f.at(0);f.c.onStall();assert.equal(f.c.rebuffering,true);assert.equal(f.c.jb.stallEvents,1);
+ f.c.rebuffering=false;f.c.video.paused=false;freshHold(f,10000);
+});
+holdTest('waiting with a remaining cushion still restarts the live hold',()=>{
+ const f=holdFixture();f.c.aheadNow=()=>1;f.at(0);f.c.onStall();
+ assert.equal(f.c.rebuffering,false);assert.equal(f.c.video.paused,false);freshHold(f,10000);
+});
+holdTest('post-seek waiting within 400ms with >=0.25s ahead resumes play once without rebuffering',()=>{
+ const f=holdFixture();let plays=0;f.c.requestPlay=()=>{plays++;};f.at(0);f.at(5000);
+ assert.equal(f.c.jb.liveJumps,1);assert.equal(f.c.jb.seekUntil,5400);
+ f.c.aheadNow=()=>0.78;f.now(5050);f.c.onStall();
+ assert.equal(plays,1);assert.equal(f.c.rebuffering,false);assert.equal(f.c.video.paused,false);
+ assert.equal(f.c.jb.stallEvents,0);assert.equal(f.c.jb.seekUntil,0);
+ f.now(5060);f.c.onStall();
+ assert.equal(f.c.rebuffering,true);assert.equal(f.c.jb.stallEvents,1);
+});
+holdTest('low readiness across a buffered gap restarts the live hold',()=>{
+ const f=holdFixture();f.at(0);f.c.video.readyState=2;f.c.sb.buffered.length=2;f.at(1000);
+ f.c.video.readyState=4;freshHold(f,10000);
+});
+holdTest('empty buffered ranges restart the live hold',()=>{
+ const f=holdFixture();f.at(0);f.c.sb.buffered.length=0;f.at(1000);
+ f.c.sb.buffered.length=1;freshHold(f,10000);
+});
+holdTest('unreadable buffered ranges restart the live hold',()=>{
+ const f=holdFixture(),end=f.c.sb.buffered.end;f.at(0);
+ f.c.sb.buffered.end=()=>{throw Error('unreadable range');};f.at(1000);
+ f.c.sb.buffered.end=end;freshHold(f,10000);
+});
+console.log(JSON.stringify({groups}));

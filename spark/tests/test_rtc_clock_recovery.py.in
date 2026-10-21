@@ -1,0 +1,92 @@
+"""Clock-slew and stale-frame recovery regressions; no capture or network."""
+import os
+import struct
+import threading
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from rtc import au_recovery, capture_clock, live_source, rtp_pacing
+
+
+def keyframe():
+    bits = '10000010' + format(0x498342, '024b') + '0010'
+    bits += format(3839, '016b') + format(2159, '016b') + '0'
+    bits += '0' * (-len(bits) % 8)
+    return int(bits, 2).to_bytes(len(bits) // 8, 'big')
+
+
+class ClockRecovery(unittest.TestCase):
+    def mapping(self):
+        mono = iter((1_000_000_000, 1_000_000_000))
+        return capture_clock.ClockMap(mono=lambda: next(mono),
+            real=lambda: 1_000_000_000_000, real_quantum_ns=0, mono_quantum_ns=0)
+
+    def test_live_source_accepts_slew_inside_mapping_envelope(self):
+        # A 15 ms wall-clock slew is admitted by ClockMap. Previously the live
+        # sender reserved only 10 ms, then killed the same stream as inconsistent.
+        mapping = self.mapping()
+        owner = SimpleNamespace(live=lambda pid: True)
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, 'rb')
+        child = SimpleNamespace(stdout=stream)
+        trial = SimpleNamespace(owner=owner, ready_at=1, deadline=60, display=':77',
+            capture_allowed=lambda: True, spawn=lambda *a, **kw: child)
+        try:
+            with patch.object(live_source.capture, 'authority', return_value=({}, ())):
+                source = live_source.OwnedLive4K(trial, SimpleNamespace(pid=7),
+                    duration=10, max_frames=1, mapping=mapping,
+                    ns=lambda: 2_050_000_000, clock=lambda: 1)
+                source.start()
+            mapping.observe(2_000_000_000, 1_001_015_000_000, 2_000_000_000)
+            raw = keyframe()
+            chunks = iter((struct.pack('<IHHIHHIIII', 0x46494b44, 0, 32,
+                0x30395056, 3840, 2160, 1000000, 1, 1, 0),
+                struct.pack('<IQ', len(raw), 1_001_015_000), bytearray(raw)))
+            source.exact = lambda size: next(chunks)
+            units = source.units()
+            stamp, data, key = next(units)
+            self.assertTrue(key)
+            self.assertEqual(bytes(data), raw)
+            self.assertGreaterEqual(source.ns() - stamp, 50_000_000)
+            with self.assertRaises(StopIteration): next(units)
+            self.assertEqual(source.counters()['accepted']['frames'], 1)
+            self.assertEqual(data, bytearray())
+        finally:
+            stream.close()
+            os.close(write_fd)
+
+    def test_clock_rejects_slew_outside_envelope(self):
+        mapping = self.mapping()
+        mapping.sample()
+        with self.assertRaisesRegex(capture_clock.ClockError, 'CAPTURE_CLOCK_STEP'):
+            mapping.observe(2_000_000_000, 1_001_021_000_000, 2_000_000_000)
+
+    def test_stale_frame_recovery_requires_newer_key(self):
+        now = [4_000_000_000]
+        recovery = au_recovery.Recovery(lambda: True, clock=lambda: now[0])
+        stale = now[0] - capture_clock.MAX_AGE_NS - 1
+        self.assertFalse(recovery.begin(stale, 100, True))
+        recovery.source_drop(now[0] - 30_000_000, 'AU_TOO_OLD')
+        self.assertFalse(recovery.begin(now[0] - 40_000_000, 100, True))
+        self.assertFalse(recovery.begin(now[0] - 20_000_000, 100, False))
+        self.assertTrue(recovery.begin(now[0] - 10_000_000, 100, True))
+        recovery.end(now[0] - 10_000_000, True)
+        state = au_recovery.validate(recovery.snapshot())
+        self.assertFalse(state['waitingForKey'])
+        self.assertEqual(state['resumedKeys'], 1)
+
+    def test_stale_packet_is_recoverable_and_never_emitted(self):
+        now = 4_000_000_000
+        pacer = rtp_pacing.PacketPacer(threading.Event(), lambda: True,
+            clock=lambda: now, recover_age=True)
+        emitted = []
+        with self.assertRaises(rtp_pacing.RecoverableAge):
+            pacer.send(100, lambda: emitted.append(True),
+                arrived_ns=now-capture_clock.MAX_AGE_NS-1)
+        self.assertEqual(emitted, [])
+        self.assertIsNone(pacer.failure)
+        self.assertTrue(pacer.send(100, lambda: True, arrived_ns=now-1_000_000))
+
+
+if __name__ == '__main__': unittest.main()

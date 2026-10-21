@@ -1,0 +1,48 @@
+{
+ "schema": 1,
+ "about": "Trial /metrics reply bytes from one synthetic utterance through the real VoiceStatus, Manager/Trial channel and mirror (voice/backend/test_voice_e2e.py asserts them), and what the viewer must render for each (spark/tests/test_viewer.js.in).",
+ "replies": [
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":0,\"badge\":null,\"detail\":\"\",\"dwellMs\":null,\"echo\":null,\"headline\":\"\",\"meter\":null,\"meterMs\":null,\"mood\":\"idle\",\"phase\":\"idle\",\"seq\":2,\"tone\":\"ready\",\"v\":1,\"word\":\"\"}}",
+   "shown": false,
+   "title": "",
+   "detail": "",
+   "word": ""
+  },
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":0,\"badge\":null,\"detail\":\"Working on it...\",\"dwellMs\":null,\"echo\":null,\"headline\":\"Got it.\",\"meter\":\"sweep\",\"meterMs\":null,\"mood\":\"thinking\",\"phase\":\"released\",\"seq\":5,\"tone\":\"work\",\"v\":1,\"word\":\"THINKING\"}}",
+   "shown": true,
+   "title": "Got it.",
+   "detail": "Working on it...",
+   "word": ""
+  },
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":0,\"badge\":null,\"detail\":\"\",\"dwellMs\":null,\"echo\":null,\"headline\":\"Searching YouTube...\",\"meter\":\"sweep\",\"meterMs\":null,\"mood\":\"thinking\",\"phase\":\"doing\",\"seq\":6,\"tone\":\"work\",\"v\":1,\"word\":\"ON IT\"}}",
+   "shown": true,
+   "title": "Searching YouTube...",
+   "detail": "",
+   "word": ""
+  },
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":0,\"badge\":\"sent\",\"detail\":\"\",\"dwellMs\":4000,\"echo\":\"lo-fi music\",\"headline\":\"Searching YouTube...\",\"meter\":null,\"meterMs\":null,\"mood\":\"idle\",\"phase\":\"result\",\"seq\":7,\"tone\":\"sent\",\"v\":1,\"word\":\"SENT\"}}",
+   "shown": true,
+   "title": "Searching YouTube...",
+   "detail": "\u201clo-fi music\u201d",
+   "word": "Sent"
+  },
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":4100,\"badge\":null,\"detail\":\"\",\"dwellMs\":null,\"echo\":null,\"headline\":\"\",\"meter\":null,\"meterMs\":null,\"mood\":\"idle\",\"phase\":\"idle\",\"seq\":8,\"tone\":\"ready\",\"v\":1,\"word\":\"\"}}",
+   "shown": false,
+   "title": "",
+   "detail": "",
+   "word": ""
+  },
+  {
+   "reply": "{\"ok\":true,\"voice\":{\"ageMs\":0,\"badge\":\"nothing\",\"detail\":\"Hold the mic button while you speak.\",\"dwellMs\":5000,\"echo\":null,\"headline\":\"I didn\\u2019t hear anything.\",\"meter\":null,\"meterMs\":null,\"mood\":\"idle\",\"phase\":\"result\",\"seq\":11,\"tone\":\"nothing\",\"v\":1,\"word\":\"NOTHING DONE\"}}",
+   "shown": true,
+   "title": "I didn\u2019t hear anything.",
+   "detail": "Hold the mic button while you speak.",
+   "word": "Nothing done"
+  }
+ ]
+}

@@ -1,0 +1,9 @@
+{
+  "profile": "webos-tv",
+  "spark_ip": "192.0.2.10",
+  "tv_ip": "192.0.2.20",
+  "spark_user": "tvhost",
+  "spark_hostname": "tv-compute",
+  "spark_uid": 1000,
+  "weather": {"enabled": false}
+}

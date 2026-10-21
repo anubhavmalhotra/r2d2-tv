@@ -1,0 +1,146 @@
+/* Example default catalog; every launch requires a fresh TV listApps result.
+   No logos ship: tiles show their text mark unless a private build supplies
+   logos (--home-logos-file), embedded locally so no asset request leaves the TV. */
+window.OwnerCatalog = {
+  "appId": "local.owner.applibrary",
+  "browser": {"origin":"http://{{SPARK_IP}}:4181","key":null},
+  "logos":{},
+  "favorites": [
+    {
+      "id": "netflix",
+      "title": "Netflix",
+      "mark": "Netflix",
+      "tone": "netflix",
+      "headline": "Movies and\nseries.",
+      "description": "Open Netflix to browse movies and series.",
+      "tag": "Movies & series"
+    },
+    {
+      "id": "com.apple.appletv",
+      "title": "Apple TV",
+      "mark": "Apple TV",
+      "tone": "apple",
+      "headline": "Movies and\nseries.",
+      "description": "Open Apple TV to browse movies and series.",
+      "tag": "Movies & series"
+    },
+    {
+      "id": "com.tubitv.ott.tubi",
+      "title": "Tubi",
+      "mark": "Tubi",
+      "tone": "tubi",
+      "headline": "Movies and\nshows.",
+      "description": "Open Tubi to browse movies and shows.",
+      "tag": "Movies & shows"
+    },
+    {
+      "id": "youtube.leanback.v4",
+      "title": "YouTube",
+      "mark": "YouTube",
+      "tone": "youtube",
+      "headline": "Videos and\nchannels.",
+      "description": "Open YouTube to browse videos and channels.",
+      "tag": "Videos"
+    },
+    {
+      "id": "amazon",
+      "title": "Prime Video",
+      "mark": "Prime Video",
+      "tone": "prime",
+      "headline": "Movies and\nseries.",
+      "description": "Open Prime Video to browse movies and series.",
+      "tag": "Movies & series"
+    },
+    {
+      "id": "com.disney.disneyplus-prod",
+      "title": "Disney+",
+      "mark": "Disney+",
+      "tone": "disney",
+      "headline": "Movies and\nseries.",
+      "description": "Open Disney+ to browse movies and series.",
+      "tag": "Movies & series"
+    },
+    {
+      "id": "com.wbd.stream",
+      "title": "HBO Max",
+      "mark": "HBO Max",
+      "tone": "max",
+      "headline": "Movies and\nseries.",
+      "description": "Open HBO Max to browse movies and series.",
+      "tag": "Movies & series"
+    },
+    {
+      "id": "com.apple.applemusic",
+      "title": "Apple Music",
+      "mark": "Music",
+      "tone": "music",
+      "headline": "Music and\nradio.",
+      "description": "Open Apple Music to play music and radio.",
+      "tag": "Music"
+    },
+    {
+      "id": "hulu",
+      "title": "Hulu",
+      "mark": "Hulu",
+      "tone": "hulu",
+      "headline": "Shows and\nmovies.",
+      "description": "Open Hulu to browse shows and movies.",
+      "tag": "Shows & movies"
+    },
+    {
+      "id": "com.movenetworks.app.sling-tv-sling-production",
+      "title": "Sling TV",
+      "mark": "Sling",
+      "tone": "sling",
+      "headline": "Live TV\nchannels.",
+      "description": "Open Sling TV to watch live channels.",
+      "tag": "Live TV"
+    }
+  ],
+  "library": [
+    "netflix",
+    "com.apple.appletv",
+    "com.wbd.stream",
+    "com.tubitv.ott.tubi",
+    "amazon",
+    "com.apple.applemusic",
+    "com.disney.disneyplus-prod",
+    "com.movenetworks.app.sling-tv-sling-production",
+    "hulu",
+    "youtube.leanback.v4"
+  ],
+  "shortcuts": [
+    {"id":"com.webos.app.discovery","title":"App Store","kind":"store"},
+    {"id":"com.webos.app.tinybrowser","title":"Chromium receiver","kind":"internal"},
+    {
+      "id": "com.webos.app.hdmi1",
+      "title": "HDMI 1",
+      "symbol": "01",
+      "kind": "input"
+    },
+    {
+      "id": "com.webos.app.hdmi2",
+      "title": "HDMI 2",
+      "symbol": "02",
+      "kind": "input"
+    },
+    {
+      "id": "com.webos.app.hdmi3",
+      "title": "HDMI 3",
+      "symbol": "03",
+      "kind": "input"
+    },
+    {
+      "id": "com.webos.app.hdmi4",
+      "title": "HDMI 4",
+      "symbol": "04",
+      "kind": "input"
+    },
+    {
+      "id": "airplay",
+      "title": "AirPlay",
+      "symbol": "\u25b3",
+      "kind": "feature"
+    }
+  ]
+};

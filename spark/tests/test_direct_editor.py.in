@@ -1,0 +1,186 @@
+import copy
+import json
+import subprocess
+import unittest
+from unittest.mock import Mock
+from pathlib import Path
+import direct_editor as d
+import protocol
+import trial
+from test_trial import headers
+
+FID, FIELD, OID = '1'*16, '2'*16, '3'*16
+
+
+def body(value='ab水😀', seq=1, action='replace'):
+    end = len(value.encode('utf-16-le'))//2
+    return dict(action=action,id=OID,seq=seq,focusId=FID,fieldId=FIELD,value=value,
+        selectionStart=end,selectionEnd=end,selectionDirection='none')
+
+
+def focus():
+    return dict(state='editable',kind='text',multiline=False,focusId=FID,fieldId=FIELD,value='',
+        selectionStart=0,selectionEnd=0,selectionDirection='none',maxLength=2048,rect=dict(x=.1,y=.2,width=.3,height=.04))
+
+
+def tr():
+    value=trial.Trial(Path('/synthetic-only'), 'a'*48, Mock())
+    value.page_ready=True;value.capture_allowed=Mock(return_value=True)
+    value.direct_state=focus()
+    return value
+
+
+class Contract(unittest.TestCase):
+    def test_empty_and_unicode_replacement(self):
+        for text in ('','é水😀','a\nb\t','😀'*1024):self.assertTrue(d.valid_edit(body(text)))
+    def test_invalid_values_capabilities_and_utf16_boundaries(self):
+        cases=[dict(body(),value='x\x00'),dict(body(),value='\ud800'),dict(body(),value='x'*1025),
+               dict(body(),seq=True),dict(body(),extra=0),dict(body(),fieldId='stale'),
+               dict(body('😀'),selectionStart=1,selectionEnd=1),dict(body(),selectionEnd=1000),
+               dict(body(),selectionStart=None)]
+        for value in cases:self.assertFalse(d.valid_edit(value))
+    def test_email_null_selection(self):
+        self.assertTrue(d.valid_edit(dict(body('a@b.c'),selectionStart=None,selectionEnd=None,selectionDirection=None)))
+    def test_projection_bounds(self):
+        self.assertTrue(d.valid_snapshot(focus()))
+        for value in [dict(focus(),rect=dict(x=.9,y=0,width=.2,height=.1)),dict(focus(),kind='password'),
+                      dict(focus(),rect=dict(x=float('nan'),y=0,width=.2,height=.1)),dict(focus(),extra='secret')]:
+            self.assertFalse(d.valid_snapshot(value))
+    def test_password_projection_never_value(self):
+        self.assertTrue(d.valid_snapshot(d.empty('unavailable','password')))
+        self.assertFalse(d.valid_snapshot(dict(d.empty('unavailable','password'),value='secret')))
+    def test_routes_same_tv_peer_only(self):
+        for route in ('editor','presentation'):
+            for method in ('GET','POST'):
+                path='/'+'a'*48+'/'+route
+                self.assertEqual(protocol.route_request(protocol.TV,method,path,headers(),'a'*48),route)
+                self.assertIsNone(protocol.route_request(protocol.SPARK,method,path,headers(),'a'*48))
+
+
+class Queue(unittest.TestCase):
+    def test_exact_duplicate_no_replay_and_changed_payload_conflict(self):
+        value=tr();request=body();self.assertTrue(d.queue_direct(value,request))
+        self.assertTrue(d.queue_direct(value,request));self.assertEqual(value.direct_next_seq,2)
+        self.assertFalse(d.queue_direct(value,dict(request,value='different')))
+        value.direct_pending=None;value.direct_records[1]['status']='applied'
+        self.assertTrue(d.queue_direct(value,request));self.assertIsNone(value.direct_pending)
+    def test_unknown_is_never_replayed(self):
+        value=tr();request=body();self.assertTrue(d.queue_direct(value,request))
+        value.direct_records[1]['status']='unknown';value.direct_pending=None
+        self.assertFalse(d.queue_direct(value,request));self.assertIsNone(value.direct_pending)
+    def test_gap_sequence_refused(self):
+        value=tr();self.assertFalse(d.queue_direct(value,body(seq=2)));self.assertEqual(value.direct_next_seq,1)
+    def test_stale_field_and_token_refused(self):
+        for key in ('focusId','fieldId'):
+            value=tr();self.assertFalse(d.queue_direct(value,dict(body(),**{key:'a'*16})))
+    def test_tab_navigation_and_edit_are_serialized(self):
+        value=tr();value.navigation_active=True;self.assertFalse(d.queue_direct(value,body()))
+        value.navigation_active=False;self.assertTrue(d.queue_direct(value,body()))
+        self.assertFalse(value.queue_navigation({'url':'https://example.com/'}))
+    def test_record_contains_digest_and_status_no_field_value(self):
+        value=tr();self.assertTrue(d.queue_direct(value,body('PRIVATE_SYNTHETIC')))
+        self.assertNotIn('PRIVATE_SYNTHETIC',json.dumps(value.direct_records))
+        self.assertEqual(set(value.direct_records[1]),{'id','digest','status'})
+    def test_close_clears_ram_state(self):
+        value=tr();d.queue_direct(value,body());value.request_stop('viewer-ended')
+        self.assertIsNone(value.direct_pending);self.assertEqual(value.direct_records,{})
+        self.assertEqual(value.direct_state,d.empty('unavailable'))
+    def test_service_matching_ack_and_fresh_capability(self):
+        value=tr();d.queue_direct(value,body());page=Mock()
+        page.direct_apply.return_value='applied';page.direct_probe.return_value=dict(focus(),focusId='a'*16)
+        page.presentation.return_value=False;d.service_direct(value,page,Mock())
+        self.assertEqual(value.direct_result,dict(id=OID,seq=1,status='applied'))
+        self.assertEqual(value.direct_state['focusId'],'a'*16);self.assertFalse(value.direct_active)
+
+    def test_concurrent_click_invalidation_discards_stale_probe(self):
+        value=tr();value.direct_probe_requested=True;page=Mock();page.presentation.return_value=False
+        def slow_probe(force=False):
+            self.assertFalse(force)
+            value.invalidate_text()
+            return dict(focus(),focusId='b'*16)
+        page.direct_probe.side_effect=slow_probe
+        d.service_direct(value,page,Mock())
+        self.assertEqual(value.direct_state,d.empty('pending'))
+        self.assertTrue(value.direct_probe_requested)
+
+    def test_stop_during_probe_discards_result(self):
+        value=tr();value.direct_probe_requested=True;page=Mock();page.presentation.return_value=False
+        def slow_probe(force=False):
+            value.request_stop('viewer-ended')
+            return dict(focus(),focusId='b'*16)
+        page.direct_probe.side_effect=slow_probe
+        d.service_direct(value,page,Mock())
+        self.assertEqual(value.direct_state,d.empty('unavailable'))
+        self.assertFalse(value.direct_probe_requested)
+
+    def test_periodic_presentation_poll_does_not_take_input_io_lock(self):
+        value=tr();value.direct_probe_requested=False;value.presentation_at=0
+        page=Mock();page.presentation.return_value=True
+        class GuardLock:
+            def __enter__(self):raise AssertionError('input_io_lock must not be acquired for read-only presentation poll')
+            def __exit__(self,*_):return False
+        value.input_io_lock=GuardLock()
+        d.service_direct(value,page,Mock())
+        page.presentation.assert_called_once_with(False)
+        self.assertEqual(value.presentation_state,dict(fullscreen=True,revision=1))
+
+
+JS_SETUP=r"""
+const vm=require('node:vm');const data=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
+class Evt{constructor(type,init={}){this.type=type;Object.assign(this,init);this.defaultPrevented=false}preventDefault(){if(this.cancelable)this.defaultPrevented=true}}
+const document={activeElement:null,hasFocus:()=>true};
+class Field{
+ constructor(){this.tagName='INPUT';this.type='text';this.isConnected=true;this.disabled=false;this.readOnly=false;this.ownerDocument=document;this._value='';this.selectionStart=0;this.selectionEnd=0;this.selectionDirection='none';this.events={};this.writes=0}
+ get value(){return this._value}set value(v){this._value=v;this.writes++}
+ getBoundingClientRect(){return {left:100,top:100,right:400,bottom:140}}
+ setSelectionRange(a,b,c){if(this.type==='email')throw Error('unsupported');this.selectionStart=a;this.selectionEnd=b;this.selectionDirection=c}
+ dispatchEvent(ev){for(const fn of(this.events[ev.type]||[]))fn(ev);return !ev.defaultPrevented}
+}
+const field=new Field(),other=new Field();document.activeElement=field;
+const context={document,HTMLInputElement:Field,HTMLTextAreaElement:Field,InputEvent:Evt,Event:Evt,TextEncoder,innerWidth:1920,innerHeight:1080};
+vm.createContext(context);vm.runInContext(data.probe,context);
+const state=()=>({value:field.value,writes:field.writes,selection:field.selectionStart,other:other.value});
+if(data.mode==='maxlength')field.maxLength=3;
+if(data.mode==='maxlength-changed')field.events.beforeinput=[()=>field.maxLength=3];
+if(data.mode==='cancel')field.events.beforeinput=[e=>e.preventDefault()];
+if(data.mode==='focus-moved')field.events.beforeinput=[()=>document.activeElement=other];
+if(data.mode==='type-changed')field.events.beforeinput=[()=>field.type='password'];
+if(data.mode==='node-replaced')field.events.beforeinput=[()=>{field.isConnected=false;document.activeElement=other}];
+if(data.mode==='framework')field.events.input=[()=>{context.frameworkSaw=field.value}];
+if(data.mode==='stale-document')field.ownerDocument={};
+const first=vm.runInContext(data.edit,context),second=vm.runInContext(data.edit,context);
+process.stdout.write(JSON.stringify({first,second,...state(),frameworkSaw:context.frameworkSaw}));
+"""
+
+
+class AtomicDOM(unittest.TestCase):
+    def run_js(self,mode='normal',request=None):
+        payload=dict(mode=mode,probe=d.probe_expression(FIELD,FID),edit=d.edit_expression({},request or body()))
+        proc=subprocess.run(['node','-e',JS_SETUP],input=json.dumps(payload).encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
+        self.assertEqual(proc.returncode,0,proc.stderr.decode()[:600]);return json.loads(proc.stdout)
+    def test_native_value_and_selection_once(self):
+        value=self.run_js();self.assertEqual(value['first'],'applied');self.assertEqual(value['second'],'rejected')
+        self.assertEqual(value['value'],'ab水😀');self.assertEqual(value['selection'],5);self.assertEqual(value['writes'],1)
+    def test_current_maxlength_enforced_before_write(self):
+        value=self.run_js('maxlength');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_beforeinput_maxlength_change_enforced_before_write(self):
+        value=self.run_js('maxlength-changed');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_cancelable_beforeinput_no_write(self):
+        value=self.run_js('cancel');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_focus_move_in_beforeinput_no_write_any_node(self):
+        value=self.run_js('focus-moved');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0);self.assertEqual(value['other'],'')
+    def test_password_transition_no_write(self):
+        value=self.run_js('type-changed');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_replaced_node_no_write(self):
+        value=self.run_js('node-replaced');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_stale_document_no_write(self):
+        value=self.run_js('stale-document');self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+    def test_framework_input_observes_native_setter(self):
+        value=self.run_js('framework');self.assertEqual(value['frameworkSaw'],'ab水😀')
+    def test_enter_intent_is_one_shot(self):
+        value=self.run_js(request=body(action='replace-enter'));self.assertEqual(value['first'],'enter');self.assertEqual(value['second'],'rejected')
+    def test_wrong_field_never_writes(self):
+        value=self.run_js(request=dict(body(),fieldId='c'*16));self.assertEqual(value['first'],'rejected');self.assertEqual(value['writes'],0)
+
+
+if __name__=='__main__':unittest.main()

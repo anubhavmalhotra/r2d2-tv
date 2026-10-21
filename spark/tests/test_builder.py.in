@@ -1,0 +1,141 @@
+import base64,hashlib,re,unittest
+from html.parser import HTMLParser
+from build_viewer import build,STYLE
+class Tags(HTMLParser):
+ def __init__(self):super().__init__();self.nodes=[];self.stack=[];self.ancestors={};self.text={}
+ def handle_starttag(self,name,attrs):
+  a=dict(attrs);self.nodes.append((name,a))
+  if 'id'in a:self.ancestors[a['id']]=tuple(item[1]for item in self.stack if item[1]);self.text[a['id']]=''
+  if name not in ('area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'):self.stack.append((name,a.get('id')))
+ def handle_endtag(self,name):
+  for i in range(len(self.stack)-1,-1,-1):
+   if self.stack[i][0]==name:self.stack=self.stack[:i];break
+ def handle_data(self,data):
+  for _,node in self.stack:
+   if node:self.text[node]+=data
+
+def rule(selector):
+ result={};found=False
+ for match in re.finditer(r'([^{}]+)\{([^{}]*)\}',STYLE):
+  if selector in [s.strip()for s in match[1].split(',')]:
+   found=True
+   for part in match[2].split(';'):
+    if ':'in part:
+     key,value=part.split(':',1);result.setdefault(key,value)
+ if not found:raise AssertionError('Missing CSS selector '+selector)
+ return result
+class Builder(unittest.TestCase):
+ def test_exact_inline_script_csp_and_no_capability_history_by_default(self):
+  page=build('a'*48).decode();script=re.search(r'<script>([\s\S]*)</script>',page).group(1);digest=base64.b64encode(hashlib.sha256(script.encode()).digest()).decode();self.assertIn("script-src 'sha256-"+digest+"'",page);self.assertIn('"history":false',script);self.assertNotIn(':4181',page);self.assertNotIn('restartUrl',page)
+ def test_history_requires_explicit_boolean_build_enable(self):
+  self.assertIn('"history":true',build('a'*48,history_enabled=True).decode())
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,history_enabled=value)
+  for token in ('a'*47,'A'*48,'/x','a'*49):
+   with self.assertRaises(ValueError):build(token)
+ def test_controls_have_names_and_content_is_outside_toolbar(self):
+  page=build('a'*48).decode();p=Tags();p.feed(page);ids={a.get('id'):(n,a)for n,a in p.nodes if 'id'in a}
+  for name in ['back','forward','reload','address','go','mic','browse-page','end-session','state-panel','page','video']:self.assertIn(name,ids)
+  self.assertLess(page.index('</header>'),page.index('<main id="page"'))
+  self.assertIn('Close browser',page);self.assertNotIn('>End<',page);self.assertEqual(ids['address'][1]['placeholder'],'Google')
+  self.assertEqual(ids['address'][1]['autocomplete'],'off');self.assertEqual(ids['address'][1]['maxlength'],'1600')
+ def test_compact_toolbar_has_named_icon_actions_and_no_wordmark(self):
+  p=Tags();p.feed(build('a'*48).decode());ids={a.get('id'):(n,a)for n,a in p.nodes if 'id'in a}
+  for name in ('back','forward','reload','go','mic','browse-page','end-session','new-tab'):
+   self.assertEqual(ids[name][0],'button');self.assertTrue(ids[name][1].get('aria-label'))
+  self.assertEqual(p.text['go'],'');self.assertNotIn('R2D2',p.text['toolbar'])
+  self.assertEqual(ids['browse-page'][1]['aria-label'],'Fullscreen page')
+  self.assertEqual(ids['end-session'][1]['aria-label'],'Close browser and return Home')
+  self.assertEqual(ids['mic'][1]['type'],'button');self.assertEqual(ids['mic'][1]['aria-pressed'],'false')
+  self.assertEqual(ids['mic'][1]['aria-label'],'Voice input');self.assertNotIn('disabled',ids['mic'][1])
+  self.assertIn('hidden',ids['voice-status'][1]);self.assertEqual(p.text['voice-label'],'')
+  self.assertEqual(ids['voice-label'][1]['aria-live'],'polite')
+ def test_chrome_reserves_space_and_video_has_no_layout_animation(self):
+  self.assertEqual(rule('body')['display'],'flex');self.assertEqual(rule('body')['flex-direction'],'column')
+  self.assertEqual(rule('.toolbar')['position'],'relative');self.assertEqual(rule('.toolbar')['flex'],'0 0 auto')
+  self.assertEqual(rule('.chrome-bottom')['min-height'],'0');self.assertEqual(rule('.chrome-bottom')['padding'],'0');self.assertEqual(rule('.chrome-bottom')['border'],'0')
+  self.assertEqual(rule('.page')['flex'],'1');self.assertEqual(rule('.page')['min-height'],'0');self.assertEqual(rule('.page')['overflow'],'hidden')
+  self.assertEqual(rule('.page video')['object-fit'],'contain')
+  for selector in ('.page','.page video'):
+   self.assertFalse({'transform','transition','animation'}.intersection(rule(selector)))
+  self.assertEqual(rule('button')['min-height'],'44px');self.assertEqual(rule('button')['min-width'],'44px')
+  self.assertEqual(rule('.tab-close')['flex'],'0 0 44px');self.assertEqual(rule('.new-tab')['min-width'],'44px')
+ def test_motion_is_transform_only_and_has_reduced_motion_and_hidden_page_rules(self):
+  self.assertIn('transform 170ms',rule('button')['transition']);self.assertNotIn('all',rule('button')['transition'])
+  self.assertIn('@media(prefers-reduced-motion:reduce)',STYLE)
+  self.assertEqual(rule('.page-inactive button')['transition'],'none')
+  self.assertEqual(rule('.page-inactive .spinner')['animation-play-state'],'paused')
+  self.assertEqual(rule('.direct-editor')['position'],'fixed');self.assertEqual(rule('.direct-editor[hidden]')['display'],'none')
+ def test_voice_card_is_inert_top_center_receipt_inside_page(self):
+  page=build('a'*48).decode();p=Tags();p.feed(page);ids={a.get('id'):(n,a)for n,a in p.nodes if 'id'in a}
+  self.assertIn('page',p.ancestors['voice-card']);self.assertNotIn('chrome-bottom',p.ancestors['voice-card'])
+  self.assertLess(page.index('id="status"'),page.index('id="voice-card"'));self.assertIn("img-src 'none'",page)
+  card=ids['voice-card'][1];self.assertIn('hidden',card);self.assertEqual((card['role'],card['aria-live']),('status','polite'))
+  markup=page[page.index('<div id="voice-card"'):page.index('<div class="focus-hint"')]
+  for unwanted in ('tabindex','<button','<img','<input','url('):self.assertNotIn(unwanted,markup)
+  for svg in re.findall(r'<svg[^>]*>',markup):self.assertIn('aria-hidden="true"',svg)
+  self.assertEqual(set(re.findall(r'data-glyph="([a-z]+)"',markup)),{'mic','dots','check','arrow','question','dash','cross','hourglass','dot'})
+  for name in ('voice-card-title','voice-card-detail','voice-card-badge','voice-card-word'):self.assertEqual(p.text[name],'')
+  self.assertIn('hidden',ids['voice-card-badge'][1]);self.assertIn('hidden',ids['voice-card-detail'][1])
+  r=rule('.voice-card')
+  self.assertEqual((r['position'],r['pointer-events'],r['top'],r['height'],r['border-radius']),('absolute','none','18px','112px','24px'))
+  self.assertGreater(int(r['z-index']),int(rule('.toast')['z-index']));self.assertEqual(r['background'],'#0b1119f2');self.assertEqual(r['border'],'2px solid #ffffff20')
+  self.assertEqual((r['min-width'],r['max-width']),('min(560px,calc(100% - 32px))','min(960px,calc(100% - 32px))'))
+  self.assertTrue(r['font-family'].startswith('Arial'));self.assertIn('180ms',r['animation']);self.assertNotIn('transition',r)
+  self.assertEqual(rule('.voice-card[hidden]')['display'],'none');self.assertEqual(rule('.voice-card[data-lines="2"]')['height'],'156px')
+  self.assertIn('180ms',rule('.voice-card[data-exit="1"]')['animation'])
+  for mode in ('.page-mode','.remote-fullscreen'):self.assertEqual(rule(mode+' .voice-card')['top'],'54px')
+  self.assertEqual((rule('.voice-disc')['width'],rule('.voice-disc')['height']),('56px','56px'))
+  self.assertEqual((rule('.voice-title')['font-size'],rule('.voice-title')['font-weight'],rule('.voice-detail')['font-size']),('34px','700','26px'))
+  self.assertEqual(rule('.voice-badge[hidden]')['display'],'none');self.assertEqual(rule('.voice-detail[hidden]')['display'],'none')
+  for tone in ('idle','ready','listen','work','done','sent','unsure','nothing','failed','ask'):self.assertIn('.voice-card[data-tone='+tone+'] .voice-disc [data-glyph=',STYLE)
+  for badge in ('confirmed','sent','unconfirmed','nothing','changed','failed','waiting'):self.assertIn('.voice-badge[data-badge='+badge+'] [data-glyph=',STYLE)
+  reduced=STYLE[STYLE.index('@media(prefers-reduced-motion:reduce)'):]
+  self.assertIn('.voice-card,.voice-card[data-exit="1"]{animation:none}',reduced)
+ def test_tabs_explicit_enable_and_strict_flag(self):
+  self.assertIn('"tabs":false',build('a'*48).decode())
+  self.assertIn('"tabs":true',build('a'*48,history_enabled=True,tabs_enabled=True).decode())
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,tabs_enabled=value)
+ def test_tabs_are_separate_row_and_keep_content_mapping(self):
+  page=build('a'*48,tabs_enabled=True).decode()
+  self.assertLess(page.index('</header>'),page.index('<nav id="tabstrip"'))
+  self.assertLess(page.index('<nav id="tabstrip"'),page.index('<main id="page"'))
+  self.assertIn('role="tablist"',page);self.assertIn('id="new-tab"',page)
+  p=Tags();p.feed(page)
+  self.assertIn('chrome-bottom',p.ancestors['tabstrip']);self.assertIn('chrome-bottom',p.ancestors['voice-status'])
+  self.assertNotIn('chrome-bottom',p.ancestors['page']);self.assertNotIn('toolbar',p.ancestors['editor-form'])
+  self.assertEqual(rule('.tabstrip[hidden]')['display'],'none');self.assertEqual(rule('.voice-status[hidden]')['display'],'none')
+ def test_keyboard_explicit_enable_and_strict_flag(self):
+  self.assertIn('"text":false',build('a'*48).decode())
+  self.assertIn('"text":true',build('a'*48,text_enabled=True).decode())
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,text_enabled=value)
+ def test_address_native_url_keyboard_without_html_constraint_rejection(self):
+  p=Tags();p.feed(build('a'*48,text_enabled=True).decode());ids={a.get('id'):(n,a)for n,a in p.nodes if 'id'in a}
+  self.assertEqual(ids['address'][1]['type'],'url');self.assertIn('novalidate',ids['address-form'][1])
+  for field in ('address','editor-input'):
+   self.assertEqual(ids[field][1]['autocomplete'],'off');self.assertEqual(ids[field][1]['spellcheck'],'false')
+ def test_direct_editor_has_no_composer_or_custom_keys(self):
+  page=build('a'*48,text_enabled=True).decode()
+  for unwanted in ('id="composer"','id="compose-send"','id="type-page"','keyboard-keys'):self.assertNotIn(unwanted,page)
+  self.assertIn('id="editor-form"',page);self.assertIn('enterkeyhint="go"',page);self.assertIn('.remote-fullscreen .toolbar',STYLE)
+ def test_audio_is_explicit_and_unmuted_when_enabled(self):
+  self.assertIn('autoplay muted playsinline',build('a'*48).decode())
+  self.assertIn('autoplay playsinline',build('a'*48,audio_enabled=True).decode())
+  self.assertIn('"audio":true',build('a'*48,audio_enabled=True).decode())
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,audio_enabled=value)
+ def test_layout_explicit_flag_and_whole_screen_page_mode(self):
+  self.assertIn('"layout":true',build('a'*48,layout_enabled=True).decode())
+  self.assertEqual(rule('.page-mode .chrome-bottom')['display'],'none');self.assertEqual(rule('.remote-fullscreen .chrome-bottom')['display'],'none')
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,layout_enabled=value)
+ def test_fixed_viewport_requires_layout_revision_contract_and_boolean(self):
+  page=build('a'*48,layout_enabled=True,fixed_viewport=True).decode()
+  self.assertIn('"fixedViewport":true',page);self.assertIn('"layout":true',page)
+  for value in ('true',1,None):
+   with self.assertRaises(ValueError):build('a'*48,layout_enabled=True,fixed_viewport=value)
+  with self.assertRaises(ValueError):build('a'*48,fixed_viewport=True)
+if __name__=='__main__':unittest.main()
+

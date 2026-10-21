@@ -1,0 +1,13 @@
+"""Closed RTC client diagnostics only; no exception text or SDP is accepted."""
+STAGES = frozenset(('new','api-check','stream-state','stream-open','stream-open-validate','config','offer-fetch','offer-verify','peer-create','set-remote','transceivers','create-answer','set-local','ice-gather','answer-filter','answer-verify','send-answer','connect','play','first-frame','receiving','stream-ready','track','datachannel'))
+CODES = frozenset(('UNCLASSIFIED','UNSUPPORTED_API','MEDIA_CONTRACT','RTC_REPLAY','RTC_CONFIG','RTC_API','RTC_CLOSED','RTC_PHASE','RTC_OFFER','RTC_TRANSCEIVERS','RTC_ANSWER','RTC_CONNECTION','RTC_STATE','RTC_ENCODING','RTC_RESPONSE','RTC_BOUND','RTC_TRACK','RTC_DATA_CHANNEL','SIGNAL_SCOPE','SIGNAL_AUTH','CONFIG_SCOPE','SDP_SCOPE','SDP_FINGERPRINT','SDP_CODEC','SDP_MEDIA','SDP_LAN','SDP_CANDIDATE','SDP_DUPLICATE','SDP_ICE','SDP_ROLE','SDP_DIRECTION','ICE_NO_EXACT_UDP_HOST'))
+NAMES = frozenset(('Error','TypeError','SyntaxError','InvalidStateError','OperationError','NotSupportedError','SecurityError','AbortError','NetworkError','TimeoutError','NotAllowedError','Other'))
+ROUTES = frozenset(('stream-state','stream-open','rtc-offer','rtc-answer','stream-ready'))
+def valid_client_diagnostic(value):
+    if type(value) is not dict or set(value) != {'schema','stage','errorCode','errorName','httpRoute','httpStatus','apiMask'}:
+        return False
+    return (type(value['schema']) is int and value['schema'] == 1
+        and (value['apiMask'] is None or type(value['apiMask']) is int and 0 <= value['apiMask'] <= 15)
+        and type(value['stage']) is str and value['stage'] in STAGES
+        and (value['errorCode'] is None and value['errorName'] is None or type(value['errorCode']) is str and value['errorCode'] in CODES and type(value['errorName']) is str and value['errorName'] in NAMES)
+        and (value['httpRoute'] is None and value['httpStatus'] is None or type(value['httpRoute']) is str and value['httpRoute'] in ROUTES and (value['httpStatus'] is None or type(value['httpStatus']) is int and (value['httpStatus']==0 or 100 <= value['httpStatus'] <= 599))))

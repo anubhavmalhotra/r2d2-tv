@@ -1,0 +1,29 @@
+{
+  "id": "local.owner.applibrary",
+  "version": "0.2.3",
+  "vendor": "R2D2",
+  "type": "web",
+  "main": "index.html",
+  "title": "R2D2",
+  "appCategory": [
+    "home"
+  ],
+  "appDescription": "Your apps. Your space. Make yourself at home.",
+  "icon": "icon.png",
+  "largeIcon": "large-icon.png",
+  "resolution": "1920x1080",
+  "disableBackHistoryAPI": true,
+  "handlesRelaunch": false,
+  "requiredPermissions": [
+    "applications.internal",
+    "applications.launch"
+  ],
+  "requiredACG": [
+    "applications.internal",
+    "applications.launch"
+  ],
+  "developerOptions": {
+    "skipDRM": true
+  },
+  "visible": false
+}

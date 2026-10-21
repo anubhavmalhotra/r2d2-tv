@@ -1,0 +1,152 @@
+"""Owned AirPlay pidfd and stderr-drain boundaries; no device or media process."""
+import signal
+import threading
+import time
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+import airplay as ap
+import process_owner as po
+
+
+class SubreaperBoundaries(unittest.TestCase):
+    def owner(self):
+        raw = po.ProcessOwner.__new__(po.ProcessOwner)
+        raw.root = 100
+        raw.handles, raw.processes, raw.drainers = {}, [], []
+        raw.retired, raw.process_refs = [], {}
+        raw.lock = threading.RLock()
+        raw.stderr_bytes = 0
+        raw.closed = raw.disposed = False
+        return raw, ap._SubreaperOwner(raw)
+
+    def cleanup(self, wrapper):
+        # The real cleanup/discovery methods run; only the Linux census/reaper
+        # syscalls are inert so these controls are portable and cannot reap peers.
+        fake_os = types.SimpleNamespace(WNOHANG=1, waitpid=Mock(side_effect=ChildProcessError), close=Mock())
+        with patch.object(po, 'children', return_value=set()), patch.object(po, 'os', fake_os):
+            return wrapper.cleanup()
+
+    def test_cleanup_waits_for_normal_delayed_stderr_drain(self):
+        raw, wrapper = self.owner()
+        ready, release, ended = threading.Event(), threading.Event(), threading.Event()
+        def drain():
+            ready.set()
+            release.wait()
+            ended.set()
+        thread = threading.Thread(target=drain)
+        raw.drainers.append(thread)
+        thread.start()
+        self.assertTrue(ready.wait(1))
+        timer = threading.Timer(0.06, release.set)
+        timer.start()
+        try:
+            result = self.cleanup(wrapper)
+            self.assertTrue(result['verified'])
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(ended.is_set())
+            self.assertTrue(raw.disposed)
+        finally:
+            release.set()
+            thread.join(1)
+            timer.join(1)
+
+    def test_cleanup_cannot_verify_an_unjoined_stderr_drainer(self):
+        raw, wrapper = self.owner()
+        release = threading.Event()
+        thread = threading.Thread(target=release.wait)
+        raw.drainers.append(thread)
+        thread.start()
+        try:
+            started = time.monotonic()
+            result = self.cleanup(wrapper)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertFalse(result['verified'])
+            self.assertEqual(result['error'], 'STDERR_DRAINER_ALIVE')
+            self.assertTrue(thread.is_alive())
+            self.assertTrue(raw.disposed)
+        finally:
+            release.set()
+            thread.join(1)
+
+    def test_fast_terminate_uses_retained_handle_even_if_pid_map_changed(self):
+        raw, wrapper = self.owner()
+        proc = types.SimpleNamespace(pid=300, poll=lambda: 0)
+        raw.processes = [proc]
+        raw.handles = {300: (902, 22)}
+        raw.process_refs[id(proc)] = (901, 11)
+        wrapper.discover = Mock()
+        with patch.object(ap.signal, 'pidfd_send_signal', create=True) as send, patch.object(
+            ap.select, 'select', return_value=([901], [], [])
+        ):
+            wrapper.terminate(proc)
+        send.assert_called_once_with(901, signal.SIGTERM, None, 0)
+
+    def test_stderr_join_grace_is_shared_and_clipped_to_cleanup_deadline(self):
+        for process_elapsed, expected in ((0.0, 0.2), (6.95, 0.05)):
+            with self.subTest(process_elapsed=process_elapsed):
+                raw, wrapper = self.owner()
+                clock = [0.0]
+                calls = []
+                def discover():
+                    clock[0] = max(clock[0], process_elapsed)
+                def join(timeout):
+                    calls.append(timeout)
+                    clock[0] += timeout
+                wrapper.discover = discover
+                raw.drainers = [types.SimpleNamespace(join=join, is_alive=lambda: True) for _ in range(3)]
+                with patch.object(ap.time, 'monotonic', side_effect=lambda: clock[0]):
+                    result = self.cleanup(wrapper)
+                self.assertFalse(result['verified'])
+                self.assertAlmostEqual(sum(calls), expected)
+                self.assertAlmostEqual(calls[0], expected)
+                self.assertEqual(calls[1:], [0.0, 0.0])
+
+    def test_disposed_owner_never_signals_a_reused_descriptor(self):
+        raw, wrapper = self.owner()
+        proc = types.SimpleNamespace(pid=300, poll=lambda: 0)
+        raw.processes = [proc]
+        raw.process_refs[id(proc)] = (901, 11)
+        raw.disposed = True
+        wrapper.discover = Mock()
+        with patch.object(ap.signal, 'pidfd_send_signal', create=True) as send:
+            wrapper.terminate(proc)
+        send.assert_not_called()
+
+    def test_exited_pidfd_does_not_escalate(self):
+        raw, wrapper = self.owner()
+        proc = types.SimpleNamespace(pid=300, poll=lambda: 0)
+        raw.processes = [proc]
+        raw.process_refs[id(proc)] = (901, 11)
+        wrapper.discover = Mock()
+        with patch.object(ap.signal, 'pidfd_send_signal', side_effect=ProcessLookupError, create=True) as send, patch.object(
+            ap.select, 'select', return_value=([901], [], [])
+        ):
+            wrapper.terminate(proc)
+        self.assertEqual(send.call_count, 1)
+
+    def test_top_level_termination_excludes_live_other_tree(self):
+        raw, wrapper = self.owner()
+        proc = types.SimpleNamespace(pid=300, poll=lambda: 0)
+        other = types.SimpleNamespace(pid=400, poll=lambda: None)
+        raw.processes = [proc, other]
+        raw.handles = {301: (901, 1), 401: (902, 2)}
+        raw.process_refs[id(proc)] = None  # Top child has already exited.
+        raw.live = lambda pid: pid in raw.handles
+        raw.send = Mock()
+        wrapper.discover = Mock()
+        wrapper._parent_of = {301: 300, 401: 400}
+        with patch.object(po, 'status', return_value={'state': 'S'}):
+            wrapper.terminate(proc)
+        self.assertEqual(raw.send.call_args_list, [
+            unittest.mock.call(301, signal.SIGTERM), unittest.mock.call(301, signal.SIGKILL)])
+
+    def test_default_branding_changes_no_transport_or_auth_scope(self):
+        self.assertEqual(ap.validate_airplay_config({'pin': 1234}).receiver_name, 'R2D2 4K (Spark)')
+        with self.assertRaisesRegex(ValueError, 'AIRPLAY_AUTH_REQUIRED'):
+            ap.validate_airplay_config({})
+
+
+if __name__ == '__main__':
+    unittest.main()

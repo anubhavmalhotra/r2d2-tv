@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src http://{{SPARK_IP}}:4181; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>R2D2 · Home</title>
+  <link rel="icon" href="icon.png" type="image/png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="has-mascot">
+<div id="screen">
+  <div class="landscape" aria-hidden="true"><div class="sun-halo"></div><div class="sun"></div><div class="sea"></div><div class="reflection"></div><div class="grain"></div></div>
+  <div id="mascot-slot" class="mascot-slot" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 640" role="img" aria-labelledby="r2-title r2-desc" class="r2-art">
+  <title id="r2-title">A friendly home robot</title>
+  <desc id="r2-desc">An original cream and slate vector robot with a screen face, a small antenna and softly blinking lights.</desc>
+  <defs>
+    <linearGradient id="r2-shell"><stop stop-color="#a99f8d"/><stop offset=".2" stop-color="#e9e3d6"/><stop offset=".5" stop-color="#fbf9f4"/><stop offset=".8" stop-color="#ddd5c6"/><stop offset="1" stop-color="#9a907e"/></linearGradient>
+    <linearGradient id="r2-slate" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#4b616c"/><stop offset="1" stop-color="#1c2a33"/></linearGradient>
+    <linearGradient id="r2-screen" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1d3440"/><stop offset=".55" stop-color="#0f1b24"/><stop offset="1" stop-color="#080d13"/></linearGradient>
+    <radialGradient id="r2-shadow"><stop stop-color="#050712" stop-opacity=".65"/><stop offset="1" stop-color="#050712" stop-opacity="0"/></radialGradient>
+    <radialGradient id="r2-glow"><stop stop-color="#83ecff" stop-opacity=".45"/><stop offset="1" stop-color="#83ecff" stop-opacity="0"/></radialGradient>
+    <clipPath id="r2-body-clip"><rect x="204" y="228" width="232" height="224" rx="64"/></clipPath>
+  </defs>
+
+  <ellipse cx="320" cy="560" rx="196" ry="28" fill="url(#r2-shadow)"/>
+  <g class="r2-idle" stroke-linejoin="round">
+    <!-- Rolling base: a slate skirt over two small wheels. -->
+    <path d="M234 436h172l28 80q3 13-11 13H217q-14 0-11-13Z" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="3"/>
+    <path d="M238 470h164" stroke="#5d7480" stroke-width="3"/>
+    <circle cx="262" cy="532" r="22" fill="#121b22" stroke="#4b616c" stroke-width="4"/><circle cx="378" cy="532" r="22" fill="#121b22" stroke="#4b616c" stroke-width="4"/>
+    <circle cx="262" cy="532" r="8" fill="#e3bd92"/><circle cx="378" cy="532" r="8" fill="#e3bd92"/>
+    <!-- Short arms, angled out from round shoulder joints. -->
+    <g transform="rotate(12 206 270)"><rect x="174" y="256" width="40" height="128" rx="20" fill="url(#r2-shell)" stroke="#8f8676" stroke-width="3"/><circle cx="194" cy="390" r="19" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/></g>
+    <g transform="rotate(-12 434 270)"><rect x="426" y="256" width="40" height="128" rx="20" fill="url(#r2-shell)" stroke="#8f8676" stroke-width="3"/><circle cx="446" cy="390" r="19" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/></g>
+    <!-- Neck and rounded torso with a gold band and a small status panel. -->
+    <rect x="292" y="204" width="56" height="34" rx="10" fill="url(#r2-slate)"/>
+    <rect x="204" y="228" width="232" height="224" rx="64" fill="url(#r2-shell)" stroke="#8f8676" stroke-width="3"/>
+    <rect x="204" y="404" width="232" height="16" fill="#e3bd92" clip-path="url(#r2-body-clip)"/>
+    <path d="M204 421h232" stroke="#a8865f" stroke-width="2" clip-path="url(#r2-body-clip)"/>
+    <path d="M230 266q-6 64 2 124" stroke="#fff" stroke-width="4" fill="none" opacity=".55" stroke-linecap="round"/>
+    <rect x="258" y="262" width="124" height="104" rx="24" fill="url(#r2-screen)" stroke="#26363f" stroke-width="4"/>
+    <path d="M282 290h42m-42 14h42m-42 14h42m-42 14h28" stroke="#4b616c" stroke-width="6" stroke-linecap="round"/>
+    <circle class="r2-led" cx="354" cy="292" r="10" fill="#83ecff"/>
+    <circle cx="354" cy="332" r="9" fill="#e3bd92" stroke="#a8865f" stroke-width="2"/>
+    <circle cx="208" cy="272" r="18" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/><circle cx="432" cy="272" r="18" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/>
+    <circle cx="208" cy="272" r="7" fill="#e3bd92"/><circle cx="432" cy="272" r="7" fill="#e3bd92"/>
+    <!-- Tilting screen head: two eyes and a smile, side speakers and an antenna light. -->
+    <g class="r2-head">
+      <!-- Voice listening waves around the antenna; hidden unless a voice mood shows them. -->
+      <g class="r2-halo" fill="none" stroke="#83ecff" stroke-linecap="round"><path class="r2-arc" d="M341.4 6a28 28 0 0 1 0 36M298.6 42a28 28 0 0 1 0-36" stroke-width="5"/><path class="r2-arc r2-arc-outer" d="M355.2-5.6a46 46 0 0 1 0 59.2M284.8 53.6a46 46 0 0 1 0-59.2" stroke-width="4"/></g>
+      <path d="M320 58V32" stroke="#34464d" stroke-width="6" stroke-linecap="round"/>
+      <rect x="302" y="52" width="36" height="12" rx="6" fill="url(#r2-slate)"/>
+      <circle class="r2-led-secondary" cx="320" cy="24" r="11" fill="#ee664e"/>
+      <circle cx="164" cy="138" r="20" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/><circle cx="476" cy="138" r="20" fill="url(#r2-slate)" stroke="#1c2a33" stroke-width="2"/>
+      <circle cx="164" cy="138" r="8" fill="#e3bd92"/><circle cx="476" cy="138" r="8" fill="#e3bd92"/>
+      <rect x="168" y="60" width="304" height="156" rx="52" fill="url(#r2-shell)" stroke="#8f8676" stroke-width="3"/>
+      <path d="M226 70q94-7 188 0" stroke="#fff" stroke-width="3" fill="none" opacity=".7" stroke-linecap="round"/>
+      <rect x="194" y="84" width="252" height="108" rx="34" fill="url(#r2-screen)" stroke="#26363f" stroke-width="4"/>
+      <ellipse class="r2-lens-glow" cx="320" cy="138" rx="110" ry="48" fill="url(#r2-glow)"/>
+      <rect class="r2-lens" x="258" y="110" width="34" height="46" rx="17" fill="#83ecff"/>
+      <rect class="r2-lens" x="348" y="110" width="34" height="46" rx="17" fill="#83ecff"/>
+      <rect x="265" y="117" width="9" height="13" rx="4.5" fill="#fff" opacity=".7"/><rect x="355" y="117" width="9" height="13" rx="4.5" fill="#fff" opacity=".7"/>
+      <path d="M298 168q22 13 44 0" stroke="#83ecff" stroke-width="6" stroke-linecap="round" fill="none" opacity=".85"/>
+      <path d="M216 102q16-12 44-14" stroke="#fff" stroke-width="4" fill="none" opacity=".12" stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>
+</div>
+  <header class="topbar">
+    <button id="search-open" class="search-button" data-navrow="top" aria-label="Search your apps"><span class="icon icon-search" aria-hidden="true"></span><span>Search your apps</span></button>
+    <div id="voice-chip" class="voice-chip" role="status" aria-live="polite" hidden><span class="voice-chip-icon" aria-hidden="true"><svg class="voice-glyph" viewBox="0 0 24 24"><path d="M9 6a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0Z"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/><path class="voice-chip-slash" d="M3 3l18 18"/></svg><i class="voice-chip-dot"></i></span><span id="voice-chip-label"></span></div>
+    <div class="topbar-right"><span class="home-name">R2D2</span><span id="weather" class="weather" role="status" aria-live="polite" aria-label="Weather unavailable"><span id="weather-icon" class="weather-icon" aria-hidden="true"></span><span id="weather-label">Weather unavailable</span></span><time id="date"></time><time id="clock"></time><button id="inputs-open" class="round-button" data-navrow="top" aria-label="Inputs & AirPlay"><span class="icon icon-screen" aria-hidden="true"></span></button><button id="preferences-open" class="round-button" data-navrow="top" aria-label="Home preferences"><span class="icon icon-sliders" aria-hidden="true"><i></i><i></i><i></i></span></button><button id="profile-open" class="round-button profile-button" data-navrow="top" aria-label="Remote & help"><span class="icon icon-help" aria-hidden="true"></span></button></div>
+  </header>
+  <main>
+    <section class="hero" aria-labelledby="hero-title">
+      <p class="eyebrow"><span id="hero-brand">R2D2</span><span class="bullet">•</span><span id="hero-kicker">PICK YOUR NEXT ESCAPE</span></p>
+      <h1 id="hero-title">Your apps.<br>Your space.</h1>
+      <p id="hero-description" class="hero-description">Everything you love, a little closer.</p>
+      <div class="hero-tags" id="hero-tags"><span>Your evening starts here</span></div>
+    </section>
+    <section id="voice-stage" class="voice-stage voice-view" role="status" aria-live="polite" aria-label="R2D2 voice" hidden>
+      <p class="voice-eyebrow" aria-hidden="true"><span>R2D2 VOICE</span><span id="voice-bullet" class="bullet">•</span><span id="voice-word" class="voice-word"></span></p>
+      <p id="voice-headline" class="voice-headline"></p>
+      <p id="voice-detail" class="voice-detail"></p>
+      <div id="voice-meter" class="voice-meter" aria-hidden="true" hidden></div>
+      <span id="voice-badge" class="voice-badge" hidden></span>
+    </section>
+    <section class="apps-section" aria-labelledby="apps-title"><div class="section-heading"><h2 id="apps-title">Apps</h2><span>Pick something good.</span></div><nav id="dock" class="dock" aria-label="Apps"></nav></section>
+    <div id="status" class="status" role="status" aria-live="polite">Getting your apps...</div>
+  </main>
+  <div id="overlay" class="overlay" hidden><section id="panel" class="panel" role="dialog" aria-modal="true" aria-labelledby="panel-title" aria-describedby="panel-description"><header class="panel-header"><div><p class="panel-eyebrow">R2D2</p><h2 id="panel-title">All apps</h2></div><button id="panel-close" class="round-button close-button" aria-label="Close">×</button></header><p id="panel-description" class="panel-description"></p><p id="panel-feedback" class="panel-feedback" role="alert" hidden></p><div id="search-wrap" class="search-wrap" hidden><label for="search-input">Search your apps</label><input id="search-input" type="search" autocomplete="off" spellcheck="false" placeholder="Try Netflix, HBO Max or music" maxlength="100"></div><div id="panel-content" class="panel-content"></div><p id="panel-empty" class="panel-empty" hidden>No apps found.</p><div class="panel-footer"><span><kbd>↑ ↓ ← →</kbd> Move</span><span><kbd>OK</kbd> Open</span><span><kbd>Back</kbd> Return</span></div></section></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <section id="voice-card" class="voice-card voice-view" role="status" aria-live="polite" aria-label="R2D2 voice" hidden><span class="voice-disc" aria-hidden="true"><svg class="voice-glyph" viewBox="0 0 24 24"><path d="M9 6a3 3 0 0 1 6 0v5a3 3 0 0 1-6 0Z"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21M8.5 21h7"/></svg></span><span class="voice-card-text"><span id="voice-card-headline" class="voice-card-headline"></span><span id="voice-card-detail" class="voice-card-detail"></span></span><span id="voice-card-badge" class="voice-badge" hidden></span></section>
+  <div id="preview-label" class="preview-label" hidden>LOCAL PREVIEW · App launches are simulated</div>
+</div>
+<script src="catalog.js"></script><script src="core.js"></script><script src="app.js"></script>
+</body>
+</html>

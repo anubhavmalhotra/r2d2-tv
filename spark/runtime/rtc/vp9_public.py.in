@@ -1,0 +1,108 @@
+"""Finite authored 4K60 VP9 clip; no native work on import or construction.
+
+One owned FFmpeg subprocess produces sixty profile-0 frames in memory. This
+pre-encoded source can qualify decoder admission, never live encoder speed.
+"""
+import os,select,struct,subprocess,threading,time
+from .signal_protocol import need
+
+MAX_BYTES=8*1024*1024
+MAX_FRAME=2*1024*1024
+FRAMES=60
+
+def argv():
+    return ['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin',
+        '-f','lavfi','-i','testsrc2=size=3840x2160:rate=60',
+        '-frames:v','60','-an','-map_metadata','-1','-c:v','libvpx-vp9',
+        '-profile:v','0','-pix_fmt','yuv420p','-deadline','realtime','-cpu-used','8',
+        '-threads','16','-row-mt','1','-tile-columns','3','-lag-in-frames','0',
+        '-auto-alt-ref','0','-error-resilient','1','-g','6','-keyint_min','6',
+        '-b:v','18M','-maxrate','24M','-bufsize','1M','-f','ivf','pipe:1']
+
+class Bits:
+    def __init__(self,raw):self.raw=raw;self.at=0
+    def take(self,n):
+        need(self.at+n<=len(self.raw)*8,'VP9_FRAME_HEADER');v=0
+        for _ in range(n):v=(v<<1)|((self.raw[self.at//8]>>(7-self.at%8))&1);self.at+=1
+        return v
+
+def keyframe(raw):
+    b=Bits(raw);need(b.take(2)==2,'VP9_FRAME_HEADER')
+    profile=b.take(1)+(b.take(1)<<1);need(profile==0,'VP9_FRAME_PROFILE')
+    need(b.take(1)==0,'VP9_SHOW_EXISTING_REFUSED')
+    key=b.take(1)==0;need(b.take(1)==1,'VP9_HIDDEN_FRAME_REFUSED');b.take(1)
+    if key:
+        need(b.take(24)==0x498342,'VP9_KEY_SYNC')
+        need(b.take(3)!=7,'VP9_FRAME_PROFILE');b.take(1)
+        need((b.take(16)+1,b.take(16)+1)==(3840,2160),'VP9_4K_REQUIRED')
+        if b.take(1):need((b.take(16)+1,b.take(16)+1)==(3840,2160),'VP9_4K_REQUIRED')
+    return key
+
+def decode_ivf_header(raw):
+    need(type(raw)in(bytes,bytearray)and len(raw)==32,'VP9_IVF_HEADER')
+    values=struct.unpack('<IHHIHHIIII',raw)
+    return dict(zip(('magicTag','version','headerBytes','codecTag','width','height','rate','scale','declaredFrames','unused'),values))
+
+def validate_ivf_header(header,expected_frames):
+    # FFmpeg ivfenc.c writes UINT32_MAX until its seekable-only trailer rewrite.
+    # The sentinel is metadata, never authority to skip actual frame counting.
+    need(header==dict(magicTag=0x46494b44,version=0,headerBytes=32,codecTag=0x30395056,
+        width=3840,height=2160,rate=60,scale=1,declaredFrames=header['declaredFrames'],unused=0)
+        and header['declaredFrames']in(0,expected_frames,0xffffffff),'VP9_IVF_HEADER')
+
+def parse_ivf(raw):
+    need(type(raw)in(bytes,bytearray)and 32<len(raw)<=MAX_BYTES,'VP9_IVF_BOUND')
+    validate_ivf_header(decode_ivf_header(raw[:32]),FRAMES)
+    at=32;units=[];last_key=None
+    while at<len(raw):
+        need(len(units)<FRAMES and len(raw)-at>=12,'VP9_IVF_FRAME_COUNT')
+        size,stamp=struct.unpack('<IQ',raw[at:at+12]);at+=12
+        need(1<=size<=MAX_FRAME and size<=len(raw)-at,'VP9_IVF_BOUND')
+        need(stamp==len(units),'VP9_IVF_TIMESTAMP')
+        data=bytearray(raw[at:at+size]);at+=size;k=keyframe(data)
+        if k:last_key=len(units)
+        need(last_key is not None and len(units)-last_key<6,'VP9_KEY_INTERVAL')
+        units.append((data,k))
+    need(len(units)==FRAMES,'VP9_IVF_FRAME_COUNT');return units
+
+class PublicClip4K:
+    width=3840;height=2160
+    def __init__(self):
+        self.stop=threading.Event();self.child=None;self.owner=None;self.frames=None;self.lock=threading.RLock()
+    def prepare(self,owner,guard,seconds=15):
+        need(type(seconds)is int and 1<=seconds<=15 and self.frames is None and self.child is None and not self.stop.is_set()and guard()is True,'VP9_CLIP_REPLAY')
+        raw=bytearray();child=None
+        try:
+            with self.lock:
+                need(not self.stop.is_set(),'OWNER_GUARD');self.owner=owner
+                child=owner.spawn(argv(),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C'});self.child=child
+            need(child.stdout is not None,'VP9_CLIP_PIPE');fd=child.stdout.fileno();os.set_blocking(fd,False);end=time.monotonic()+seconds
+            while True:
+                need(not self.stop.is_set()and guard()is True,'OWNER_GUARD');left=end-time.monotonic();need(left>0,'VP9_CLIP_DEADLINE')
+                if not select.select([fd],[],[],min(.1,left))[0]:continue
+                try:block=os.read(fd,min(65536,MAX_BYTES+1-len(raw)))
+                except BlockingIOError:continue
+                if not block:break
+                raw.extend(block);need(len(raw)<=MAX_BYTES,'VP9_IVF_BOUND')
+            need(child.wait(timeout=max(.001,min(1,end-time.monotonic())))==0,'VP9_CLIP_ENCODER')
+            need(time.monotonic()<end and guard()is True and not self.stop.is_set(),'VP9_CLIP_DEADLINE')
+            units=parse_ivf(raw)
+            with self.lock:
+                if self.stop.is_set()or time.monotonic()>=end or guard()is not True:
+                    for data,key in units:data[:]=b'\0'*len(data)
+                    raise ValueError('VP9_CLIP_DEADLINE')
+                self.frames=units
+            return {'width':3840,'height':2160,'sourceFps':60,'profile':0,'encodedFrames':FRAMES,'preEncodedOnly':True,'liveEncoderThroughputProven':False}
+        finally:
+            raw[:]=b'\0'*len(raw)
+            if child is not None:
+                if child.poll()is None:owner.terminate(child)
+                child.wait(timeout=2)
+                if child.stdout is not None:child.stdout.close()
+    def close(self):
+        self.stop.set()
+        with self.lock:
+            if self.child is not None and self.child.poll()is None:self.owner.terminate(self.child)
+            if self.frames is not None:
+                for data,key in self.frames:data[:]=b'\0'*len(data)
+                self.frames=None

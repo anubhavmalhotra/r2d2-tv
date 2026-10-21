@@ -1,0 +1,4 @@
+/* Authored GPL-3.0-or-later. Known-source containers only; no broad .ad/role selector. */
+iframe[src^="https://googleads.g.doubleclick.net/"],
+iframe[src^="https://tpc.googlesyndication.com/safeframe/"],
+ins.adsbygoogle[data-ad-status="filled"] { display: none !important; }

@@ -1,0 +1,200 @@
+"""Real disposable files and staged bundle; no Chromium, network or device calls.
+
+Only the target's fixed paths, UID and mount-information assumptions are mapped
+to a temporary host fixture. These tests do not prove native preference effects.
+"""
+import copy
+from contextlib import ExitStack
+import json
+import os
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+import private_profile as private
+import profile_stage as stage
+
+
+PRIVACY_KEYS = (
+    ('search', 'suggest_enabled'),
+    ('signin', 'allowed'),
+    ('signin', 'allowed_on_next_startup'),
+    ('credentials_enable_service',),
+    ('credentials_enable_autosignin',),
+)
+
+
+def set_preference(preferences, path, value, *, remove=False):
+    parent = preferences
+    for key in path[:-1]:
+        parent = parent[key]
+    if remove:
+        del parent[path[-1]]
+    else:
+        parent[path[-1]] = value
+
+
+class PrivatePreferences(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory())).resolve()
+        self.runtime = self.root / 'run/user/1000/snap.chromium'
+        self.runtime.mkdir(parents=True, mode=0o700)
+        self.runtime.chmod(0o700)
+        proc = self.root / 'proc'
+        proc.mkdir()
+        (proc / 'mountinfo').write_text(
+            '1 0 0:1 / %s rw - tmpfs tmpfs rw\n' % self.runtime)
+        (proc / 'swaps').write_text('Filename\tType\tSize\tUsed\tPriority\n')
+        paths = {
+            '/run': self.root / 'run',
+            '/run/user': self.root / 'run/user',
+            '/run/user/1000': self.root / 'run/user/1000',
+            '/proc/self/mountinfo': proc / 'mountinfo',
+            '/proc/swaps': proc / 'swaps',
+        }
+        real_uid = os.getuid()
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def target_uid(stat):
+            # Preserve every actual file identity/time/type; only translate the
+            # host test account to the target's fixed ordinary user.
+            fields = {name: getattr(stat, name) for name in dir(stat) if name.startswith('st_')}
+            if fields['st_uid'] == real_uid:
+                fields['st_uid'] = 1000
+            return SimpleNamespace(**fields)
+
+        def mapped_path(value):
+            self.assertIn(value, paths, 'unexpected fixed target path')
+            return paths[value]
+
+        real_lexists = os.path.lexists
+        policies = {'/etc/chromium-browser/policies', '/etc/chromium/policies',
+                    '/var/snap/chromium/current/policies'}
+        self.stack.enter_context(patch.object(private, 'RUNTIME', self.runtime))
+        self.stack.enter_context(patch.object(stage, 'RUNTIME', self.runtime))
+        self.stack.enter_context(patch.object(private, 'Path', side_effect=mapped_path))
+        self.stack.enter_context(patch.object(os, 'getuid', return_value=1000))
+        self.stack.enter_context(patch.object(os, 'stat', side_effect=lambda *a, **k: target_uid(real_stat(*a, **k))))
+        self.stack.enter_context(patch.object(os, 'lstat', side_effect=lambda *a, **k: target_uid(real_lstat(*a, **k))))
+        self.stack.enter_context(patch.object(os.path, 'lexists', side_effect=lambda p: False if p in policies else real_lexists(p)))
+        self.profiles = []
+        self.addCleanup(self.cleanup_profiles)
+
+    def cleanup_profiles(self):
+        for profile in self.profiles:
+            if not profile.removed:
+                self.assertTrue(profile.cleanup(True))
+
+    def profile(self):
+        profile = private.PrivateProfile()
+        self.profiles.append(profile)
+        return profile
+
+    def preferences(self, profile):
+        return json.loads((profile.path / 'profile/Default/Preferences').read_text())
+
+    def assert_privacy(self, preferences):
+        for path in PRIVACY_KEYS:
+            value = preferences
+            for key in path:
+                self.assertIn(key, value, path)
+                value = value[key]
+            self.assertIs(value, False, path)
+
+    def test_actual_creation_writes_private_preferences_and_original_secure_dns(self):
+        profile = self.profile()
+        preferences = self.preferences(profile)
+        self.assert_privacy(preferences)
+        self.assertEqual(preferences, private.fresh_preferences(profile.path))
+        self.assertEqual(preferences['download']['default_directory'], str(profile.path / 'downloads'))
+        self.assertEqual(preferences['savefile']['default_directory'], str(profile.path / 'downloads'))
+        self.assertEqual(json.loads((profile.path / 'profile/Local State').read_text()), private.DNS_LOCAL_STATE)
+        self.assertFalse(profile.evidence()['dns_configuration']['browser_wire_behavior_proved'])
+
+    def test_actual_bundle_stage_preserves_all_privacy_values_and_incognito_launch(self):
+        profile = self.profile()
+        original = self.preferences(profile)
+        prepared = stage.prepare(profile)
+        staged = self.preferences(profile)
+        self.assert_privacy(staged)
+        for key, value in original.items():
+            self.assertEqual(staged[key], value, key)
+        self.assertEqual(staged['profile']['default_content_setting_values']['popups'], 2)
+        self.assertEqual(staged['extensions']['settings'][prepared.bundle['extensionId']], {'incognito': True})
+        # prepare() verifies the actual rendered bundle pins and file hashes;
+        # launch() rechecks the copied preferences and extension bytes.
+        argv = prepared.launch(['--kiosk', 'https://www.youtube.com'])
+        self.assertIn('--load-extension=' + str(profile.path / 'protection'), argv)
+        bootstrap = argv[argv.index('-c') + 1]
+        self.assertIn('--incognito', bootstrap)
+        self.assertIn('--remote-debugging-pipe', bootstrap)
+        self.assertIn('--disable-blink-features=AutomationControlled', bootstrap)
+        self.assertFalse(prepared.evidence()['nativeActivationProved'])
+
+    def test_staging_rejects_missing_or_enabled_privacy_preferences_before_copy(self):
+        for key in PRIVACY_KEYS:
+            for remove in (False, True):
+                with self.subTest(key=key, remove=remove):
+                    profile = self.profile()
+                    preferences = self.preferences(profile)
+                    set_preference(preferences, key, True, remove=remove)
+                    (profile.path / 'profile/Default/Preferences').write_text(json.dumps(preferences))
+                    with self.assertRaisesRegex(stage.StageError, 'STAGE_NOT_FRESH'):
+                        stage.prepare(profile)
+                    self.assertFalse((profile.path / 'protection').exists())
+
+    def test_launch_refuses_privacy_edit_after_successful_real_bundle_stage(self):
+        profile = self.profile()
+        prepared = stage.prepare(profile)
+        preferences = self.preferences(profile)
+        preferences['signin']['allowed'] = True
+        (profile.path / 'profile/Default/Preferences').write_text(json.dumps(preferences))
+        with self.assertRaisesRegex(stage.StageError, 'STAGE_PREFS_CHANGED'):
+            prepared.launch(['--kiosk'])
+
+    def test_fresh_preferences_are_independent_nested_values(self):
+        first = private.fresh_preferences(Path('/synthetic/session-one'))
+        second = private.fresh_preferences(Path('/synthetic/session-two'))
+        expected = copy.deepcopy(second)
+        first['search']['suggest_enabled'] = True
+        first['signin']['allowed'] = True
+        first['download']['default_directory'] = '/synthetic/unrelated'
+        self.assertEqual(second, expected)
+        self.assert_privacy(second)
+        self.assertEqual(second['download']['default_directory'], '/synthetic/session-two/downloads')
+
+    def test_closed_session_files_are_deleted_and_not_imported_into_next_session(self):
+        if not private.shutil.rmtree.avoids_symlink_attacks:
+            self.skipTest('fd-based deletion unavailable on host')
+        personal = self.root / 'unrelated-personal-profile'
+        personal.mkdir()
+        (personal / 'Cookies').write_bytes(b'SYNTHETIC_PERSONAL_COOKIE')
+        first = self.profile()
+        stage.prepare(first)
+        for name in ('Cookies', 'History', 'Login Data'):
+            (first.path / 'profile/Default' / name).write_bytes(b'SYNTHETIC_SESSION_DATA')
+        (first.path / 'downloads/test.txt').write_bytes(b'SYNTHETIC_DOWNLOAD')
+        self.assertTrue(first.cleanup(True))
+        self.assertFalse(first.path.exists())
+        second = self.profile()
+        self.assertNotEqual(second.path, first.path)
+        self.assertEqual(set(p.name for p in (second.path / 'profile/Default').iterdir()), {'Preferences'})
+        self.assertEqual(self.preferences(second), private.fresh_preferences(second.path))
+        self.assertFalse(any((second.path / 'downloads').iterdir()))
+        self.assertEqual((personal / 'Cookies').read_bytes(), b'SYNTHETIC_PERSONAL_COOKIE')
+
+    def test_creates_runtime_directory_when_missing_after_boot(self):
+        self.runtime.rmdir()
+        self.assertFalse(self.runtime.exists())
+        profile = self.profile()
+        self.assertTrue(self.runtime.is_dir())
+        self.assertEqual(self.runtime.stat().st_mode & 0o777, 0o700)
+        self.assertTrue((profile.path / 'profile/Default/Preferences').is_file())
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1,0 +1,147 @@
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+import protocol
+import trial
+from layout_runtime import queue_network_input, queue_layout, queue_seen, service_layout, native_preflight
+from layout import Layout, FixedLayout
+
+
+def ready():
+    t = trial.Trial(Path('/synthetic-only'), 'a' * 48, Mock())
+    t.page_ready = True
+    t.capture_allowed = Mock(return_value=True)
+    t.input = Mock()
+    t.input.poll.return_value = None
+    t.input_preflight = {'qualified': True}
+    return t
+
+
+class WheelAndLayout(unittest.TestCase):
+    def test_wheel_delta_and_coordinates_are_bounded(self):
+        body = dict(kind='wheel', x=.5, y=.4, deltaY=360)
+        self.assertTrue(protocol.valid_input(body))
+        for key, value in [('deltaY', True), ('deltaY', 0), ('deltaY', 1201),
+                           ('deltaY', 1.0), ('x', float('nan')), ('y', 1.01)]:
+            self.assertFalse(protocol.valid_input(dict(body, **{key: value})))
+        self.assertFalse(protocol.valid_input(dict(body, extra=0)))
+
+    def test_wheel_requires_current_revision_and_active_pixels(self):
+        t = ready()
+        t.layout = Layout()
+        t.layout.height = 1800
+        body = dict(kind='wheel', x=.5, y=.5, deltaY=360, layoutRevision=0)
+        self.assertTrue(queue_network_input(t, body))
+        self.assertEqual(t.input_actions[0], {k:v for k,v in body.items() if k!='layoutRevision'})
+        self.assertFalse(queue_network_input(t, dict(body, layoutRevision=1)))
+        self.assertFalse(queue_network_input(t, dict(body, layoutRevision=True)))
+        self.assertFalse(queue_network_input(t, dict(body, y=1)))
+        self.assertEqual(len(t.input_actions), 1)
+
+    def test_resize_invalidates_queued_wheel_and_old_epoch(self):
+        t = ready()
+        t.layout = Layout()
+        self.assertTrue(queue_network_input(t, dict(kind='wheel', x=.5, y=.5, deltaY=-120, layoutRevision=0)))
+        old = t.input_epoch
+        self.assertTrue(queue_layout(t, dict(height=1880, baseRevision=0)))
+        self.assertFalse(t.input_actions)
+        self.assertIsNone(t.apply_input(dict(kind='key', key='Enter'), expected_epoch=old))
+        self.assertFalse(queue_network_input(t, dict(kind='wheel', x=.5, y=.5, deltaY=120, layoutRevision=0)))
+
+    def test_wheel_never_becomes_click_and_has_bounded_x_events(self):
+        t = trial.OwnedDisplay.__new__(trial.OwnedDisplay)
+        t.handle = 99
+        t.lock = trial.threading.Lock()
+        t.x11 = Mock()
+        t.xtst = Mock()
+        for delta, button in [(360,5),(-360,4)]:
+            t.xtst.reset_mock()
+            t.send(dict(kind='wheel', x=.5, y=.5, deltaY=delta))
+            self.assertEqual(t.xtst.XTestFakeMotionEvent.call_count,1)
+            self.assertEqual(t.xtst.XTestFakeButtonEvent.call_count,6)
+            self.assertEqual([c.args[1] for c in t.xtst.XTestFakeButtonEvent.call_args_list],[button]*6)
+            t.xtst.XTestFakeKeyEvent.assert_not_called()
+
+
+class FixedProduction(unittest.TestCase):
+    def test_resize_endpoint_cannot_change_geometry_or_block_inputs(self):
+        t=ready()
+        self.assertIsInstance(t.layout,FixedLayout)
+        before=t.layout.view()
+        body=dict(kind='wheel',x=.5,y=1,deltaY=-120,layoutRevision=0)
+        self.assertTrue(queue_network_input(t,body))
+        for height in (1500,1826,2160,2162):
+            self.assertFalse(queue_layout(t,dict(height=height,baseRevision=0)))
+        self.assertFalse(queue_seen(t,dict(revision=0,marker='a'*16)))
+        self.assertEqual(t.layout.view(),before)
+        self.assertEqual(len(t.input_actions),1)
+        self.assertTrue(queue_network_input(t,dict(kind='key',key='Enter',layoutRevision=0)))
+        self.assertFalse(queue_network_input(t,dict(body,layoutRevision=1)))
+        self.assertFalse(queue_network_input(t,dict(body,layoutRevision=True)))
+
+    def test_no_marker_timeout_or_native_resize_at_twenty_seconds(self):
+        t=ready();t.layout_started_at=1
+        page=Mock();prove=Mock()
+        with patch('layout_runtime.time.monotonic',return_value=100):
+            service_layout(t,page,prove)
+        prove.assert_not_called()
+        self.assertFalse(t.layout.view()['pending'])
+
+    def test_geometry_drift_is_not_silently_accepted(self):
+        for key,value in [('height',1826),('revision',1)]:
+            t=ready();setattr(t.layout,key,value)
+            with self.assertRaisesRegex(RuntimeError,'FIXED_LAYOUT_CHANGED'):
+                service_layout(t,Mock(),Mock())
+
+    def test_native_fixed_preflight_requires_window_and_css_dimensions(self):
+        t=ready();page=Mock()
+        report={'pinned':True,'pin_valid':True,'matched':1,'focused':True,
+          'after':{'x':0,'y':0,'width':3840,'height':2160,'border':0}}
+        t.worker_command=Mock(return_value=report)
+        page._evaluate.return_value={'width':1920,'height':1080,'dpr':2}
+        result=native_preflight(t,page)
+        self.assertEqual(result,dict(qualified=True,fixed4K=True,fixedViewport=True,
+          resizeRejected=True,revisionZero=True,decodedTVFrame=False))
+        t.worker_command.assert_called_once_with({'kind':'focus-fixture'},2048)
+        page._evaluate.return_value={'width':1920,'height':913,'dpr':2}
+        with self.assertRaisesRegex(RuntimeError,'FIXED_LAYOUT_NOT_PROVED'):
+            native_preflight(t,page)
+
+    def test_new_viewer_uses_fixed_revision_contract(self):
+        html=ready().viewer.decode()
+        self.assertIn('"fixedViewport":true',html)
+        self.assertIn('"layout":true',html)
+
+
+class AudioWiring(unittest.TestCase):
+    def test_encoder_requires_proved_private_audio(self):
+        t = ready()
+        t.spawn = Mock()
+        with self.assertRaisesRegex(RuntimeError, 'AUDIO_STARTUP_UNPROVED'):
+            t.encode()
+        t.spawn.assert_not_called()
+
+    def test_encoder_and_route_are_bound_to_owned_child(self):
+        t = ready()
+        t.audio = Mock()
+        t.audio_graph = Mock(spec=['assert_alive'])
+        t.audio_preflight = {'passed':True}
+        t.display=':99'
+        t.env={'DISPLAY':':99'}
+        t.spawn=Mock(return_value=Mock(pid=123))
+        with patch.object(trial,'ffmpeg_args',return_value=['synthetic-encoder']) as args,\
+                patch.object(trial,'VIDEO_MBPS',25),patch.object(trial,'ENCODER_PROGRESS',False):
+            self.assertIs(t.encode(),t.encoder)
+            args.assert_called_once_with(':99',t.audio,lower_delay=True,bitrate_mbps=25,progress_path=None)
+        t.browser=Mock()
+        t.owner.live.return_value=True
+        with patch.object(trial,'owns_browser_audio',return_value=True):
+            t.check_audio()
+        playback, capture=t.audio.verify.call_args.args
+        self.assertTrue(capture(123))
+        self.assertFalse(capture(124))
+        t.owner.live.return_value=False
+        self.assertFalse(capture(123))
+
+
+if __name__=='__main__':unittest.main()

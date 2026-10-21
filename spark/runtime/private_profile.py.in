@@ -1,0 +1,145 @@
+"""One disposable profile/cache/config tree on the already-mounted Snap runtime tmpfs."""
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+from dns_proof import SHELL_PREFIX
+
+RUNTIME = Path('/run/user/1000/snap.chromium')
+DNS_LOCAL_STATE = {'dns_over_https': {'mode': 'secure', 'templates': 'https://dns.quad9.net/dns-query'}}
+
+def fresh_preferences(path):
+    """Preferences for one owned session; never import a personal browser profile.
+
+    Incognito still allows in-session website cookies and explicit website login.
+    These preferences request no browser sign-in or remote address suggestions;
+    they do not hide the network address or stop a site assigning identifiers.
+    """
+    return {
+        'download': {'default_directory': str(path / 'downloads'), 'prompt_for_download': False},
+        'savefile': {'default_directory': str(path / 'downloads')},
+        'search': {'suggest_enabled': False},
+        'signin': {'allowed': False, 'allowed_on_next_startup': False},
+        'credentials_enable_service': False,
+        'credentials_enable_autosignin': False,
+    }
+
+def mount_facts(path, text):
+    if len(text) > 1048576:
+        raise RuntimeError('MOUNTINFO_LIMIT')
+    matches = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 10 or '-' not in parts:
+            continue
+        split = parts.index('-')
+        if split + 3 >= len(parts):
+            continue
+        mount = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), parts[4])
+        if str(path) == mount or str(path).startswith(mount.rstrip('/') + '/'):
+            options = set(parts[5].split(',')) | set(parts[split + 3].split(','))
+            matches.append((len(mount), parts[split + 1], 'noswap' in options))
+    if not matches:
+        raise RuntimeError('RUNTIME_MOUNT_UNKNOWN')
+    _, kind, noswap = max(matches)
+    return {'fstype': kind, 'noswap': noswap}
+
+# --remote-debugging-pipe makes Chromium expose navigator.webdriver=true to every page; YouTube's
+# attestation then fails, googlevideo stops serving media (STREAM_PROTECTION_STATUS=3) and the player
+# errors out about a minute in. --disable-blink-features=AutomationControlled is applied after that
+# switch mapping, so the CDP pipe is kept while pages see navigator.webdriver=false.
+# --shell retains the chromium snap's strict confinement and executes its packaged
+# command-chain before this noninteractive bash. Skip chromium.launcher: it may
+# import user profiles, source user init files, or inject daemon security flags.
+BOOTSTRAP = r'''set -eu
+set +o history
+unset HISTFILE BASH_ENV ENV CHROMIUM_FLAGS CHROME_USER_DATA_DIR CHROME_HEADLESS
+baaz_private=$1
+shift
+[[ "$baaz_private" =~ ^/run/user/1000/snap\.chromium/baaz-private-[a-f0-9]{16}$ ]] || exit 73
+test ! -L "$baaz_private"
+test "$SNAP_NAME" = chromium
+test -d "$baaz_private/profile"
+export CHROME_CONFIG_HOME="$baaz_private/config"
+export XDG_CONFIG_HOME="$baaz_private/config"
+export XDG_CACHE_HOME="$baaz_private/cache"
+export XDG_DATA_HOME="$baaz_private/data"
+export TMPDIR="$baaz_private/tmp"
+export CHROME_LOG_FILE=/dev/null
+export HISTFILE=/dev/null
+ulimit -c 0
+''' + SHELL_PREFIX + r'''exec "$SNAP/usr/lib/chromium-browser/chrome" --incognito --no-first-run --no-default-browser-check --gtk-version=3 --user-data-dir="$baaz_private/profile" --disk-cache-dir="$baaz_private/cache" --remote-debugging-pipe --disable-blink-features=AutomationControlled "$@"
+'''
+
+class PrivateProfile:
+    def __init__(self):
+        if os.getuid() != 1000:
+            raise RuntimeError('PRIVATE_PROFILE_USER')
+        for path in ('/etc/chromium-browser/policies', '/etc/chromium/policies',
+                     '/var/snap/chromium/current/policies'):
+            if os.path.lexists(path):
+                raise RuntimeError('BROWSER_POLICY_REQUIRES_REVIEW')
+        for path in (Path('/run'), Path('/run/user'), Path('/run/user/1000')):
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError('RUNTIME_PATH_TYPE')
+        if not os.path.lexists(RUNTIME):
+            RUNTIME.mkdir(mode=0o700)
+            RUNTIME.chmod(0o700)
+        info = RUNTIME.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise RuntimeError('RUNTIME_PATH_TYPE')
+        info = RUNTIME.stat()
+        if info.st_uid != 1000 or stat.S_IMODE(info.st_mode) != 0o700:
+            raise RuntimeError('RUNTIME_PATH_OWNER_MODE')
+        self.mount = mount_facts(RUNTIME, Path('/proc/self/mountinfo').read_text())
+        if self.mount['fstype'] != 'tmpfs':
+            raise RuntimeError('RUNTIME_NOT_TMPFS')
+        self.swap_entries = len(Path('/proc/swaps').read_text().splitlines()[1:])
+        self.basefd = os.open(RUNTIME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.name = 'baaz-private-' + secrets.token_hex(8)
+        self.path = RUNTIME / self.name
+        os.mkdir(self.name, mode=0o700, dir_fd=self.basefd)
+        self.identity = os.stat(self.name, dir_fd=self.basefd, follow_symlinks=False)
+        for child in ('profile', 'config', 'cache', 'data', 'tmp', 'downloads'):
+            (self.path / child).mkdir(mode=0o700)
+        (self.path / 'profile/Default').mkdir(mode=0o700)
+        # Incognito retains explicit downloads by default; keep those in this same disposable tree.
+        preferences = fresh_preferences(self.path)
+        (self.path / 'profile/Default/Preferences').write_text(json.dumps(preferences))
+        (self.path / 'profile/Local State').write_text(json.dumps(DNS_LOCAL_STATE))
+        self.removed = False
+
+    def launch(self, args):
+        return ['/usr/bin/snap', 'run', '--shell', 'chromium', '--noprofile', '--norc',
+                '-c', BOOTSTRAP, 'baaz-private', str(self.path)] + list(args)
+
+    def evidence(self):
+        return {'incognito_requested': True, 'runtime_fstype': self.mount['fstype'],
+            'runtime_noswap': self.mount['noswap'], 'active_swap_entries': self.swap_entries,
+            'disk_swap_exclusion_proved': self.mount['noswap'] or self.swap_entries == 0,
+            'downloads_redirected_to_owned_tmpfs': True,
+            'dns_configuration': {'mode_requested': 'secure', 'resolver': 'Quad9',
+                'browser_wire_behavior_proved': False, 'system_dns_bootstrap_possible': True},
+            'owned_profile_cache_config_removed': self.removed}
+
+    def cleanup(self, children_gone):
+        try:
+            if not children_gone:
+                return False
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise RuntimeError('SAFE_TREE_DELETE_REQUIRED')
+            info = os.stat(self.name, dir_fd=self.basefd, follow_symlinks=False)
+            if (info.st_dev, info.st_ino, info.st_uid) != (self.identity.st_dev, self.identity.st_ino, 1000) or not stat.S_ISDIR(info.st_mode):
+                raise RuntimeError('PRIVATE_PROFILE_IDENTITY_CHANGED')
+            shutil.rmtree(self.name, dir_fd=self.basefd)
+            try:
+                os.stat(self.name, dir_fd=self.basefd, follow_symlinks=False)
+            except FileNotFoundError:
+                self.removed = True
+            return self.removed
+        finally:
+            os.close(self.basefd)

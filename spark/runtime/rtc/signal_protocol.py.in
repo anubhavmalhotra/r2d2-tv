@@ -1,0 +1,118 @@
+"""Finite signed nontrickle WebRTC messages. No imports start sockets/media."""
+import hashlib
+import hmac
+import ipaddress
+import json
+import re
+
+MAX_SDP = 65536
+MAX_ENVELOPE = 70000
+
+def need(value, code):
+    if not value: raise ValueError(code)
+
+def ipv4(text):
+    address = ipaddress.IPv4Address(text)
+    need(str(address) == text and address.is_private and not address.is_loopback and
+         not address.is_link_local and not address.is_multicast and not address.is_unspecified,
+         'LAN_IPV4')
+    return text
+
+def canonical(message):
+    return json.dumps(message,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode('utf-8')
+
+def sign(key,attempt,kind,sdp):
+    need(type(key) is bytes and len(key)==32 and re.fullmatch('[a-f0-9]{64}',attempt) and kind in ('offer','answer'),'SIGN_SCOPE')
+    need(type(sdp) is str and 0<len(sdp.encode('ascii'))<=MAX_SDP,'SDP_BOUND')
+    message={'schema':1,'attempt':attempt,'kind':kind,'sequence':1,'payload':{'sdp':sdp}}
+    return dict(message,mac=hmac.new(key,canonical(message),hashlib.sha256).hexdigest())
+
+def verify(key,attempt,kind,raw):
+    need(type(raw) is bytes and 0<len(raw)<=MAX_ENVELOPE,'ENVELOPE_BOUND')
+    def pairs(items):
+        need(len(items)==len({key for key,_ in items}),'DUPLICATE_JSON_KEY')
+        return dict(items)
+    obj=json.loads(raw.decode('utf-8'),object_pairs_hook=pairs)
+    need(type(obj) is dict and set(obj)=={'schema','attempt','kind','sequence','payload','mac'},'ENVELOPE_KEYS')
+    need(type(obj['schema']) is int and obj['schema']==1 and type(obj['sequence']) is int and obj['sequence']==1 and
+         obj['attempt']==attempt and obj['kind']==kind and type(obj['payload']) is dict and set(obj['payload'])=={'sdp'},'ENVELOPE_SCOPE')
+    mac=obj.pop('mac')
+    need(type(mac) is str and re.fullmatch('[a-f0-9]{64}',mac) and
+         hmac.compare_digest(mac,hmac.new(key,canonical(obj),hashlib.sha256).hexdigest()),'ENVELOPE_MAC')
+    return obj['payload']['sdp']
+
+def inspect_sdp(sdp,address,kind,video_codec='H264'):
+    need(video_codec in ('H264','AV1','VP9'),'VIDEO_CODEC')
+    ipv4(address)
+    need(type(sdp) is str and 0<len(sdp.encode('ascii'))<=MAX_SDP and '\x00' not in sdp,'SDP_BOUND')
+    lines=sdp.replace('\r\n','\n').splitlines()
+    need(len(lines)<=1024 and all(len(x)<=2048 and re.fullmatch('[\x20-\x7e]*',x) for x in lines),'SDP_LINES')
+    need(lines and lines[0]=='v=0','SDP_VERSION')
+    sections=[[]]
+    for line in lines:
+        if line.startswith('m='): sections.append([])
+        sections[-1].append(line)
+    need(len(sections)==3,'MEDIA_COUNT')
+    session=sections[0]
+    need(not any(x.startswith('a=bundle-only') for x in session),'MEDIA_TRANSPORT')
+    bundle=[x.split()[1:]for x in session if x.startswith('a=group:BUNDLE ')]
+    need(len(bundle)==1 and len(bundle[0])==2 and len(set(bundle[0]))==2,'BUNDLE')
+    fingerprints=[]; candidates=[]; media=[];mids=[];h264_profile=None
+    av1_format=None;vp9_format=None
+    direction='sendonly' if kind=='offer' else 'recvonly'
+    for section in sections[1:]:
+        header=section[0].split()
+        need(len(header)>=4 and header[0] in ('m=audio','m=video') and re.fullmatch(r'(?:0|[1-9][0-9]{0,4})',header[1]) and int(header[1])<=65535 and header[2]=='UDP/TLS/RTP/SAVPF','MEDIA_TRANSPORT')
+        media.append(header[0][2:])
+        mid=[x[6:]for x in section if x.startswith('a=mid:')]
+        need(len(mid)==1 and mid[0] in bundle[0],'MEDIA_MID');mids+=mid
+        # RFC 8843: port zero is live only for an exact bundle-only secondary
+        # section sharing the active first BUNDLE mid. A bare zero remains rejected.
+        only=[x for x in section if x.startswith('a=bundle-only')]
+        need(not only or only==['a=bundle-only'],'MEDIA_TRANSPORT')
+        if header[1]=='0':need(only==['a=bundle-only'] and mid[0]!=bundle[0][0],'MEDIA_TRANSPORT')
+        else:need(not only,'MEDIA_TRANSPORT')
+        need('a='+direction in section and 'a=rtcp-mux' in section,'MEDIA_DIRECTION')
+        codec=video_codec+'/90000' if header[0]=='m=video' else 'opus/48000/2'
+        payloads=[m[1] for x in section if (m:=re.fullmatch(r'a=rtpmap:(\d+) '+re.escape(codec),x,re.IGNORECASE))]
+        need(payloads and any(p in header[3:] for p in payloads),'MEDIA_CODEC')
+        if header[0]=='m=video':
+            formats=[x.split(' ',1)[1]for x in section if any(x.startswith('a=fmtp:'+p+' ')for p in payloads)]
+            need(len(formats)<=1,'VP9_FORMAT' if video_codec=='VP9' else 'AV1_FORMAT' if video_codec=='AV1' else 'H264_FORMAT')
+            entries=[x.strip().split('=',1)for x in formats[0].split(';')] if formats else []
+            need(all(len(x)==2 for x in entries) and len({x[0]for x in entries})==len(entries),'VP9_FORMAT' if video_codec=='VP9' else 'AV1_FORMAT' if video_codec=='AV1' else 'H264_FORMAT')
+            params=dict(entries)
+            if video_codec=='VP9':
+                need(set(params)<= {'profile-id'},'VP9_FORMAT')
+                value=params.get('profile-id','0');need(value=='0','VP9_FORMAT')
+                vp9_format={'profileId':0,'profileExplicit':'profile-id'in params}
+            elif video_codec=='AV1':
+                need(set(params)<= {'profile','level-idx','tier'},'AV1_FORMAT')
+                defaults={'profile':('0',2),'level-idx':('5',23),'tier':('0',1)};av1_format={}
+                for name,(default,limit)in defaults.items():
+                    value=params.get(name,default);need(re.fullmatch(r'(?:0|[1-9][0-9]?)',value) and int(value)<=limit,'AV1_FORMAT')
+                    av1_format[{'level-idx':'levelIdx'}.get(name,name)]=int(value)
+                need(av1_format['profile']==0,'AV1_FORMAT')
+            else:
+                need(formats,'H264_FORMAT');h264_profile=params.get('profile-level-id')
+                need(params.get('packetization-mode')=='1' and h264_profile and re.fullmatch('[a-fA-F0-9]{6}',h264_profile),'H264_FORMAT')
+        fp=[x for x in section if x.startswith('a=fingerprint:')] or [x for x in session if x.startswith('a=fingerprint:')]
+        need(len(fp)==1 and re.fullmatch(r'a=fingerprint:sha-256 (?:[0-9A-Fa-f]{2}:){31}[0-9A-Fa-f]{2}',fp[0]),'DTLS_FINGERPRINT')
+        fingerprints.append(fp[0].split(' ',1)[1].upper())
+        for line in section:
+            if line.startswith('c='): need(line in ('c=IN IP4 0.0.0.0','c=IN IP4 '+address),'SDP_CONNECTION')
+    need(sorted(media)==['audio','video'] and len(set(fingerprints))==1 and sorted(mids)==sorted(bundle[0]),'MEDIA_IDENTITY')
+    for line in lines:
+        if line.startswith('a=candidate:'):
+            fields=line[12:].split()
+            need(8<=len(fields)<=20 and re.fullmatch('[A-Za-z0-9+/]{1,32}',fields[0]) and fields[1]=='1' and
+                 fields[2].lower()=='udp' and fields[3].isdigit() and fields[4]==address and fields[5].isdigit() and
+                 1<=int(fields[5])<=65535 and fields[6:8]==['typ','host'],'HOST_ICE')
+            extras=fields[8:]
+            need(len(extras)%2==0 and all(extras[i] in ('generation','network-id','network-cost','ufrag') for i in range(0,len(extras),2)),'ICE_EXTENSION')
+            candidates.append(line)
+            need(len(candidates)<=16,'ICE_COUNT')
+        need(not line.startswith(('a=ice-options:renomination','m=application','a=remote-candidates:')),'SDP_SCOPE')
+    need(candidates,'ICE_MISSING')
+    return {'fingerprint':fingerprints[0],'sdpSha256':hashlib.sha256(sdp.encode('ascii')).hexdigest(),
+            'candidateCount':len(candidates),'media':media,'h264ProfileLevelId':h264_profile.lower() if h264_profile else None,'av1Format':av1_format,'vp9Format':vp9_format}

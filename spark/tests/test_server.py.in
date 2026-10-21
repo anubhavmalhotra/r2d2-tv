@@ -1,0 +1,164 @@
+import sys,io,json,threading,unittest,time
+from pathlib import Path
+from email.message import Message
+from unittest.mock import patch
+from protocol import route_request,SPARK,TV,PORT
+import trial
+from media_stream import MediaStream
+from test_media_stream import Feed,init_bytes,pair
+
+class Connection:
+    """Records stream socket tuning; no socket is opened."""
+    def __init__(self):self.timeout=None;self.options=[]
+    def settimeout(self,value):self.timeout=value
+    def setsockopt(self,*option):self.options.append(option)
+
+class Server(unittest.TestCase):
+    def setUp(self):
+        self.t=trial.Trial(Path('/unused'),'a'*48,object(),'mse');self.t.page_ready=True;self.t.capture_allowed=lambda:True
+        self.t.sandbox={'passed':True};self.t.input=True;self.t.input_preflight={'qualified':True};self.t.effective_dns={'qualified':True}
+        self.feed=Feed();self.starts=[];self.ends=[]
+        self.feed.add(b''.join(init_bytes())+b''.join(pair(vs=32,ac=25)))
+        self.t.media_stream=MediaStream(lambda:self.starts.append(1) or self.feed,lambda e,n:e.read(n),lambda e:self.ends.append(1),lambda:True,epoch='b'*32)
+        self.addCleanup(self.cleanup)
+    def cleanup(self):self.t.media_stream.cancel.set();self.feed.close();self.assertTrue(self.t.media_stream.close(2))
+    def headers(self,body=None,gen=None):
+        h=Message();h['Host']=f'{SPARK}:{PORT}'
+        if body is not None:h['Content-Type']='application/json';h['Content-Length']=str(len(json.dumps(body).encode()))
+        if gen is not None:h['X-R2D2-Media-Epoch']='b'*32;h['X-R2D2-Media-Generation']=str(gen)
+        return h
+    def request(self,route,body=None,gen=None,peer=TV,writer=None):
+        c=trial.handler_for(self.t);h=c.__new__(c);h.client_address=(peer,1);h.command='GET' if body is None else 'POST';h.path='/'+self.t.token+'/'+route;h.headers=self.headers(body,gen);h.rfile=io.BytesIO(json.dumps(body).encode());h.wfile=writer or io.BytesIO();h.code=None;h.value=None;h.connection=self.connection=Connection()
+        def reply(code,data=b'',kind=None):h.code=code;h.value=json.loads(data) if data else None
+        h.reply=reply;h.send_response=lambda x:setattr(h,'code',x);h.send_header=lambda *a:None;h.end_headers=lambda:None
+        (h.do_GET if body is None else h.do_POST)();return h
+    def open(self):return self.request('stream-open',{'epoch':'b'*32,'generation':0})
+    def test_no_foreign_peer_or_method_broadening(self):
+        for route,method in [('stream-state','GET'),('stream-open','POST'),('stream-ready','POST')]:
+            h=self.headers(None if method=='GET' else {})
+            self.assertEqual(route_request(TV,method,'/'+'a'*48+'/'+route,h,'a'*48),route)
+            self.assertIsNone(route_request(SPARK,method,'/'+'a'*48+'/'+route,h,'a'*48))
+            self.assertIsNone(route_request(TV,'POST' if method=='GET' else 'GET','/'+'a'*48+'/'+route,h,'a'*48))
+    def test_initial_read_does_not_spawn_and_open_requires_all_gates(self):
+        self.assertEqual(self.request('stream-state').code,200);self.assertEqual(self.starts,[])
+        self.t.effective_dns={'qualified':False};self.assertEqual(self.open().code,409);self.assertEqual(self.starts,[])
+    def test_generation_bound_and_ready_gate(self):
+        v=self.open();self.assertEqual(v.code,200);self.assertEqual(self.starts,[1]);calls=[]
+        with patch.object(trial,'queue_network_input',side_effect=lambda *a:calls.append(a) or True):
+            self.assertEqual(self.request('input',{},gen=1).code,409)
+            self.t.media_stream.attach({'epoch':'b'*32,'generation':1})
+            self.assertEqual(self.request('stream-ready',{'epoch':'b'*32,'generation':1}).code,200)
+            self.assertEqual(self.request('input',{},gen=1).code,200)
+            self.t.media_stream.detach(1);self.assertEqual(self.request('stream-open',{'epoch':'b'*32,'generation':1}).code,200)
+            self.t.media_stream.attach({'epoch':'b'*32,'generation':2});self.request('stream-ready',{'epoch':'b'*32,'generation':2})
+            self.assertEqual(self.request('input',{},gen=1).code,409);self.assertEqual(len(calls),1)
+    def test_consumer_write_loss_detaches_but_not_source(self):
+        self.open()
+        class Broken:
+            def write(self,b):raise BrokenPipeError()
+            def flush(self):pass
+        h=self.request('stream.mp4',gen=1,writer=Broken());self.assertEqual(h.code,200);self.assertFalse(self.t.media_stream.active);self.assertFalse(self.t.media_stream.finished);self.assertEqual(self.ends,[]);self.assertIsNone(self.t.error)
+        self.feed.add(b''.join(pair(2,32000,25600,vs=32,ac=25)));deadline=time.monotonic()+1
+        while self.t.media_stream.fragments<2 and time.monotonic()<deadline:time.sleep(.002)
+        self.assertEqual(self.t.media_stream.fragments,2);self.assertEqual(self.request('stream-open',{'epoch':'b'*32,'generation':1}).code,200);self.assertEqual(len(self.starts),1)
+    def test_end_remains_available_with_unready_media(self):
+        self.assertEqual(self.request('end',{}).code,200);self.assertTrue(self.t.stop.is_set());self.assertEqual(self.t.close_reason,'viewer-ended')
+    def test_generation_change_clears_input_epoch_and_queue(self):
+        self.t.input_actions.append((1,{}));self.t.input_motion={};before=self.t.input_epoch
+        self.open();self.assertGreater(self.t.input_epoch,before);self.assertFalse(self.t.input_actions);self.assertIsNone(self.t.input_motion)
+    def test_duplicate_or_unbound_stream_headers_fail_before_attach(self):
+        self.open();self.assertEqual(self.request('stream.mp4').code,409);self.assertFalse(self.t.media_stream.active)
+        h=self.headers(gen=1);h['X-R2D2-Media-Generation']='1';self.assertIsNone(route_request(TV,'GET','/'+'a'*48+'/stream.mp4',h,'a'*48))
+    def test_mutation_admission_shares_generation_lock(self):
+        self.open();self.t.media_stream.attach({'epoch':'b'*32,'generation':1});self.request('stream-ready',{'epoch':'b'*32,'generation':1})
+        def guarded(*a):self.assertTrue(self.t.lock._is_owned());self.assertFalse(self.t.input_io_lock._is_owned());return True
+        with patch.object(trial,'queue_network_input',side_effect=guarded):self.assertEqual(self.request('input',{},gen=1).code,200)
+        orig_permits = self.t.media_stream.permits_input
+        def bump_epoch(identity):
+            res = orig_permits(identity)
+            self.t.input_epoch += 1
+            return res
+        with patch.object(self.t.media_stream,'permits_input',side_effect=bump_epoch),patch.object(trial,'queue_network_input',return_value=True):
+            self.assertEqual(self.request('input',{},gen=1).code,409)
+        def nav_guarded(*a):self.assertTrue(self.t.input_io_lock._is_owned());return True
+        with patch.object(self.t,'queue_navigation',side_effect=nav_guarded):self.assertEqual(self.request('navigate',{'url':'https://example.com/'},gen=1).code,200)
+    def test_media_open_does_not_hold_trial_lock_while_producer_checks_capture_allowed(self):
+        t=trial.Trial(Path('/unused'),'a'*48,object(),'mse');t.page_ready=True;t.owner_verified_at=time.monotonic();t.ready_at=time.monotonic()
+        t.sandbox={'passed':True};t.input=True;t.input_preflight={'qualified':True};t.effective_dns={'qualified':True}
+        feed=Feed();feed.add(b''.join(init_bytes())+b''.join(pair(vs=32,ac=25)))
+        t.media_stream=MediaStream(lambda:feed,lambda e,n:e.read(n),lambda e:None,t.capture_allowed,epoch='b'*32)
+        self.addCleanup(lambda:(t.media_stream.cancel.set(),feed.close(),t.media_stream.close(2)))
+        opened=t.media_open({'epoch':'b'*32,'generation':0})
+        self.assertEqual(opened['generation'],1)
+        self.assertTrue(t.stream_started)
+    def test_queue_end_requests_viewer_close_then_falls_back_to_agent_ended(self):
+        self.assertTrue(self.t.queue_end())
+        self.assertFalse(self.t.stop.is_set())
+        self.assertTrue(self.t.agent_close_requested)
+        self.t.agent_close_deadline=time.monotonic()-0.01
+        self.assertTrue(self.t.check_agent_close())
+        self.assertTrue(self.t.stop.is_set())
+        self.assertEqual(self.t.close_reason,'agent-ended')
+    def test_heartbeat_reply_is_written_outside_trial_and_input_locks(self):
+        from test_trial import metrics
+        from test_voice_card import card
+        self.t.voice_card_exchange({'card':card()});self.assertTrue(self.t.queue_end());body=metrics();body['token']=self.t.token;seen=[]
+        c=trial.handler_for(self.t);h=c.__new__(c);h.client_address=(TV,1);h.command='POST';h.path='/'+self.t.token+'/metrics'
+        h.headers=self.headers(body);h.rfile=io.BytesIO(json.dumps(body).encode());h.wfile=io.BytesIO()
+        h.reply=lambda code,data=b'',kind=None:seen.append((code,json.loads(data),self.t.lock._is_owned(),self.t.input_io_lock._is_owned()))
+        h.do_POST()
+        self.assertEqual(len(seen),1);code,value,trial_lock,io_lock=seen[0]
+        self.assertEqual((code,trial_lock,io_lock),(200,False,False))
+        self.assertEqual((value['ok'],value['close'],value['voice']['seq']),(True,True,7))
+        self.assertIsNone(self.t.voice_card.delivered)
+    def test_absolute_delivery_deadline_detaches_slow_writer(self):
+        # Each chunk is one write (header+payload+CRLF). The init meets its 2 s
+        # deadline; the fragment's moof and mdat writes then exceed the 4 s
+        # absolute fragment deadline, which detaches without a consumer wait.
+        self.open();now=[10.0];writes=[];costs=[1.1,3.0,3.0]
+        class Slow:
+            def write(self,b):writes.append(len(b));now[0]+=costs[min(len(writes),len(costs))-1]
+            def flush(self):pass
+        started=time.perf_counter()
+        with patch.object(trial.time,'monotonic',side_effect=lambda:now[0]):
+            response=self.request('stream.mp4',gen=1,writer=Slow())
+        self.assertLess(time.perf_counter()-started,2)
+        self.assertEqual(response.code,200);self.assertEqual(len(writes),3);self.assertFalse(self.t.media_stream.active);self.assertFalse(self.t.media_stream.finished)
+    def test_lagging_consumer_jumps_to_newest_group(self):
+        # Reserve at the first IDR, then publish 4.3 s more media: the first
+        # fragment is more than STREAM_MAX_BEHIND behind, so the server sends
+        # the newest IDR group next (one counted skip) instead of the backlog.
+        self.open();vd,ad=32000,25600
+        for seq in range(2,10):
+            self.feed.add(b''.join(pair(seq,vd,ad,sync=seq%2==1,vs=32,ac=25)));vd+=32000;ad+=25600
+        deadline=time.monotonic()+2
+        while self.t.media_stream.fragments<9 and time.monotonic()<deadline:time.sleep(.002)
+        self.assertEqual(self.t.media_stream.fragments,9)
+        writes=[];t=self.t
+        class Recorder:
+            def write(self,b):
+                writes.append(bytes(b))
+                if len(writes)==3:t.capture_allowed=lambda:False
+            def flush(self):pass
+        self.assertEqual(self.request('stream.mp4',gen=1,writer=Recorder()).code,200)
+        body=[w[w.index(b'\r\n')+2:-2] for w in writes]
+        self.assertEqual(body[1][4:8],b'moof');self.assertEqual(int.from_bytes(body[1][20:24],'big'),9)
+        self.assertEqual(body[2][4:8],b'mdat');self.assertEqual(self.t.media_stream.snapshot()['skips'],1)
+    def test_stream_socket_is_tuned_before_media(self):
+        self.open()
+        class Broken:
+            def write(self,b):raise BrokenPipeError()
+            def flush(self):pass
+        self.assertEqual(self.request('stream.mp4',gen=1,writer=Broken()).code,200)
+        self.assertEqual(self.connection.timeout,trial.STREAM_SOCKET_TIMEOUT)
+        self.assertEqual(self.connection.options,[(trial.socket.IPPROTO_TCP,trial.socket.TCP_NODELAY,1),
+            (trial.socket.IPPROTO_TCP,trial.socket.TCP_NOTSENT_LOWAT,131072),(trial.socket.IPPROTO_IP,trial.socket.IP_TOS,0x88)])
+    def test_control_routes_do_not_tune_sockets(self):
+        self.assertEqual(self.request('stream-state').code,200);self.assertEqual((self.connection.timeout,self.connection.options),(None,[]))
+    def test_production_config_and_inherited_bounds(self):
+        self.assertIn(b'"ring":true',self.t.viewer);self.assertIn(b'"fixedViewport":true',self.t.viewer);self.assertEqual(self.t.deadline,float('inf'))
+        default_trial=trial.Trial(Path('/unused'),'a'*48,object())
+        self.assertEqual(default_trial.display_transport,'webrtc');self.assertIn(b'"transport":"webrtc"',default_trial.viewer)
+        import media_stream;self.assertEqual(media_stream.MAX_BYTES,6442450944)
+
+if __name__=='__main__':unittest.main()

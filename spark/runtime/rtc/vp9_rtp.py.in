@@ -1,0 +1,37 @@
+"""Bounded RTP/VP9 descriptor observation; keeps counters, no packet payloads."""
+import struct,threading
+from .signal_protocol import need
+KEYS={'pictureIdMode','packets','frames','keyframes','maxPacketBytes','descriptorVerified','failure'}
+class DescriptorProof:
+ def __init__(self):
+  self.lock=threading.Lock();self.mode=None;self.packets=0;self.frames=0;self.keyframes=0;self.maximum=0;self.failed=False
+  self.seq=None;self.picture=None;self.stamp=None;self.active=False
+ def confirm_mode(self,value):
+  need(type(value)is int and value==2,'VP9_RTP_MODE');self.mode=value
+ def packet(self,prefix,total):
+  with self.lock:
+   try:
+    need(self.mode==2 and not self.failed and type(prefix)is bytes and 15<=len(prefix)<=256 and type(total)is int and len(prefix)<=total<=65535,'VP9_RTP_DESCRIPTOR')
+    a,b,seq,stamp=struct.unpack('>BBHI',prefix[:8]);need(a>>6==2 and b&127==96,'VP9_RTP_DESCRIPTOR')
+    start=12+(a&15)*4
+    if a&16:
+     need(start+4<=len(prefix),'VP9_RTP_DESCRIPTOR');words=struct.unpack('>H',prefix[start+2:start+4])[0];start+=4+words*4
+    need(start+3<=len(prefix),'VP9_RTP_DESCRIPTOR');d,pid1,pid2=prefix[start:start+3]
+    need(d&128 and pid1&128,'VP9_RTP_DESCRIPTOR');picture=((pid1&127)<<8)|pid2;begin=bool(d&8);end=bool(d&4);key=not bool(d&64)
+    need(bool(b&128)==end,'VP9_RTP_DESCRIPTOR')
+    if self.seq is not None:need(seq==((self.seq+1)&65535),'VP9_RTP_SEQUENCE')
+    if not self.active:
+     need(begin,'VP9_RTP_DESCRIPTOR')
+     if self.picture is not None:need(picture==((self.picture+1)&32767) and 0<((stamp-self.stamp)&0xffffffff)<0x80000000,'VP9_RTP_PICTURE_ORDER')
+     self.picture=picture;self.stamp=stamp;self.active=True;self.keyframes+=int(key)
+    else:need(not begin and picture==self.picture and stamp==self.stamp,'VP9_RTP_PICTURE_ORDER')
+    self.seq=seq;self.packets+=1;self.maximum=max(self.maximum,total);need(self.packets<=10**15,'VP9_RTP_BOUND')
+    if end:self.frames+=1;self.active=False;need(self.frames<=10**12,'VP9_RTP_BOUND')
+   except BaseException:self.failed=True;raise
+ def snapshot(self):
+  with self.lock:return {'pictureIdMode':self.mode,'packets':self.packets,'frames':self.frames,'keyframes':self.keyframes,'maxPacketBytes':self.maximum,'descriptorVerified':self.packets>0 and not self.failed,'failure':'VP9_RTP_DESCRIPTOR'if self.failed else None}
+def validate(v):
+ need(type(v)is dict and set(v)==KEYS and v['pictureIdMode']in(None,2)and type(v['pictureIdMode'])in(type(None),int),'VP9_RTP_PROJECTION')
+ for k,maximum in [('packets',10**15+1),('frames',10**12+1),('keyframes',10**12+1),('maxPacketBytes',65535)]:need(type(v[k])is int and 0<=v[k]<=maximum,'VP9_RTP_PROJECTION')
+ need(type(v['descriptorVerified'])is bool and v['failure']in(None,'VP9_RTP_DESCRIPTOR')and(not v['descriptorVerified']or v['pictureIdMode']==2 and v['packets']>0 and v['failure']is None),'VP9_RTP_PROJECTION')
+ return dict(v)

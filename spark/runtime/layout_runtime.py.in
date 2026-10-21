@@ -1,0 +1,186 @@
+"""Fixed 4K production geometry with revision-checked receiver input."""
+import time
+from layout import FixedLayout, window_matches, viewport_matches, point_in_capture
+from protocol import Budget, valid_input
+
+
+def init_layout(trial):
+    trial.layout = FixedLayout()
+    trial.layout_get_budget = Budget(6, 12000)
+    trial.layout_post_budget = Budget(2, 256)
+    trial.layout_seen_budget = Budget(4, 512)
+    trial.layout_started_at = None
+    trial.layout_active = False
+    trial.layout_preflight = None
+
+
+def busy(trial):
+    return trial.layout_active or trial.layout.view()['pending']
+
+
+def queue_layout(trial, body):
+    if getattr(trial.layout, 'fixed', False):
+        return False
+    with trial.input_wake:
+        if (not trial.page_ready or trial.stop.is_set() or not trial.capture_allowed() or
+            trial.navigation_pending is not None or trial.navigation_active or trial.editor_pending or trial.editor_active or
+            trial.direct_pending or trial.direct_active or trial.presentation_pending or
+            not trial.layout_post_budget.take() or not trial.layout.queue(body)):
+            return False
+        trial.input_epoch += 1
+        trial.input_stats['rejected'] += len(trial.input_actions) + (trial.input_motion is not None)
+        trial.input_actions.clear();trial.input_motion = None
+        trial.invalidate_text()
+        trial.layout_started_at = time.monotonic()
+        trial.input_wake.notify_all()
+        return True
+
+
+def queue_seen(trial, body):
+    if getattr(trial.layout, 'fixed', False):
+        return False
+    with trial.lock:
+        return (trial.page_ready and not trial.stop.is_set() and trial.capture_allowed() and
+                trial.layout_seen_budget.take() and trial.layout.seen(body))
+
+
+def queue_network_input(trial, body):
+    if type(body) is not dict or type(body.get('layoutRevision')) is not int:
+        return False
+    with trial.lock:
+        if busy(trial) or body['layoutRevision'] != trial.layout.revision:
+            return False
+        value = {k:v for k,v in body.items() if k != 'layoutRevision'}
+        if not valid_input(value) or not point_in_capture(value, trial.layout.height):
+            return False
+        return trial.queue_input(value)
+
+
+def viewport(page):
+    page.deadline = time.monotonic() + 3
+    value = page._evaluate('({width:innerWidth,height:innerHeight,dpr:devicePixelRatio})')
+    return value
+
+
+def resize(trial, page, height, marker):
+    report = trial.worker_command(dict(kind='layout-fixture', height=height, marker=marker), 2048)
+    if not window_matches(report, height, True):
+        raise RuntimeError('LAYOUT_WINDOW_NOT_PROVED')
+    for attempt in range(10):
+        value = viewport(page)
+        if viewport_matches(value, height):
+            return report, value
+        if trial.stop.is_set():
+            break
+        time.sleep(.05)
+    raise RuntimeError('LAYOUT_VIEWPORT_NOT_PROVED')
+
+
+def service_layout(trial, page, prove):
+    if getattr(trial.layout, 'fixed', False):
+        with trial.lock:
+            if trial.layout.height != 2160 or trial.layout.revision != 0 or busy(trial):
+                raise RuntimeError('FIXED_LAYOUT_CHANGED')
+        return
+    with trial.lock:
+        request = trial.layout.request()
+        clear = trial.layout.clear_request()
+        if not request and not clear:
+            if busy(trial) and trial.layout_started_at and time.monotonic() - trial.layout_started_at > 15:
+                raise RuntimeError('LAYOUT_FRAME_NOT_OBSERVED')
+            return
+        if trial.navigation_active or trial.direct_active or trial.editor_active:
+            return
+        trial.layout_active = True
+    with trial.input_io_lock:
+        try:
+            prove()
+            page.invalidate_editor()
+            if request:
+                report, value = resize(trial, page, request['height'], request['marker'])
+                with trial.lock:
+                    trial.layout.commit(report, value)
+                    trial.page_window = report
+            else:
+                report = trial.worker_command(dict(kind='layout-seen', marker=clear), 2048)
+                with trial.lock:
+                    trial.layout.cleared(report)
+                    trial.layout_started_at = None
+                    trial.invalidate_text()
+        finally:
+            with trial.lock:
+                trial.layout_active = False
+
+
+def native_preflight(trial, page):
+    if getattr(trial.layout, 'fixed', False):
+        report = trial.worker_command({'kind': 'focus-fixture'}, 2048)
+        value = viewport(page)
+        flags = dict(qualified=False,
+            fixed4K=window_matches(report,2160,True),
+            fixedViewport=viewport_matches(value,2160),
+            resizeRejected=not trial.layout.queue({'height':1826,'baseRevision':0}),
+            revisionZero=trial.layout.revision == 0 and not trial.layout.view()['pending'],
+            decodedTVFrame=False)
+        if not all(flags[k] for k in ('fixed4K','fixedViewport','resizeRejected','revisionZero')):
+            raise RuntimeError('FIXED_LAYOUT_NOT_PROVED')
+        trial.page_window = report
+        flags['qualified'] = True
+        return flags
+    # This tests owned X geometry only. The real TV marker decode is separate.
+    import secrets
+    flags = dict(qualified=False, reducedViewport=False, restored4K=False, markerCleared=False, decodedTVFrame=False)
+    for height, name in ((1920,'reducedViewport'), (2160,'restored4K')):
+        marker = secrets.token_hex(8)
+        report, value = resize(trial, page, height, marker)
+        flags[name] = window_matches(report,height,True) and viewport_matches(value,height)
+        cleared = trial.worker_command(dict(kind='layout-seen',marker=marker),2048)
+        if cleared != {'cleared':True,'height':height}:
+            raise RuntimeError('LAYOUT_PREFLIGHT_CLEAR')
+        flags['markerCleared'] = True
+    flags['qualified'] = all(flags[k] for k in ('reducedViewport','restored4K','markerCleared'))
+    return flags
+
+
+def scroll_preflight(trial, page):
+    import json
+    local = 'location.href===' + json.dumps(page.start_url)
+    page.deadline = time.monotonic() + 3
+    script = '(()=>{if(!(' + local + r"""))return false;const e=document.createElement('div');e.id='r2d2-scroll-proof';
+e.style.cssText='position:fixed;z-index:99999;left:100px;top:200px;width:800px;height:500px;overflow:auto;background:black';
+const child=document.createElement('div');child.style.height='2400px';e.append(child);document.body.append(e);return true})()"""
+    flags = dict(qualified=False, down=False, up=False, cleared=False)
+    trial.scroll_preflight = flags
+    if page._evaluate(script) is not True:
+        raise RuntimeError('SCROLL_PREFLIGHT_ORIGIN')
+    def position():
+        page.deadline = time.monotonic() + 2
+        return page._evaluate("document.getElementById('r2d2-scroll-proof').scrollTop")
+    try:
+        # XInput hit testing uses the compositor's last submitted frame, which can
+        # precede a just-created DOM element even after a synchronous layout flush.
+        page.deadline=time.monotonic()+3
+        reply=page._call('Runtime.evaluate',dict(expression='new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))',awaitPromise=True,returnByValue=True,timeout=1500),True)
+        if reply.get('result',{}).get('value') is not True:raise RuntimeError('SCROLL_PREFLIGHT_FRAME')
+        flags['hitTarget']=page._evaluate("(()=>{const e=document.getElementById('r2d2-scroll-proof');return e===document.elementFromPoint(300,350)||e.contains(document.elementFromPoint(300,350))})()") is True
+        if not flags['hitTarget']:raise RuntimeError('SCROLL_PREFLIGHT_HIT_TARGET')
+        point = dict(kind='wheel',x=600/3839,y=700/2159,deltaY=360)
+        if trial.apply_input(point) != 'wheel':raise RuntimeError('SCROLL_PREFLIGHT_ACK')
+        for _ in range(10):
+            top = position()
+            if type(top) in (int,float) and top > 0:break
+            time.sleep(.05)
+        else:raise RuntimeError('SCROLL_DOWN_NOT_OBSERVED')
+        flags['down'] = True
+        if trial.apply_input(dict(point,deltaY=-360)) != 'wheel':raise RuntimeError('SCROLL_PREFLIGHT_ACK')
+        for _ in range(10):
+            after = position()
+            if type(after) in (int,float) and after < top:break
+            time.sleep(.05)
+        else:raise RuntimeError('SCROLL_UP_NOT_OBSERVED')
+        flags['up'] = True
+    finally:
+        page.deadline = time.monotonic()+2
+        flags['cleared'] = page._evaluate('(()=>{if(!('+local+'))return false;document.getElementById("r2d2-scroll-proof")?.remove();return !document.getElementById("r2d2-scroll-proof")})()') is True
+    flags['qualified'] = all(flags[k] for k in ('down','up','cleared'))
+    return flags

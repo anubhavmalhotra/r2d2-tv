@@ -1,0 +1,271 @@
+"""One bounded encoder producer, independent of one current HTTP consumer.
+
+No I/O at import. The caller supplies the owned encoder/read/cleanup functions.
+No media bytes are logged, written to disk, or queued per consumer. Consumer
+failure never restarts the encoder. A reconnect is an explicit new generation.
+"""
+import re
+import secrets
+import threading
+import time
+from media_ring import MediaRing, Producer, MediaError, Lagged
+
+MAX_BYTES = 6442450944
+# Automatic receiver reconnects (03-receiver) need more than the original 8 manual ones.
+MAX_GENERATIONS = 32
+# Bounded server-side jumps to the newest IDR group per generation.
+MAX_SKIPS_PER_GENERATION = 60
+
+
+def identity(body, epoch, generation):
+    return (type(body) is dict and set(body) == {'epoch', 'generation'} and
+            type(body['epoch']) is str and body['epoch'] == epoch and
+            type(body['generation']) is int and body['generation'] == generation)
+
+
+def header_identity(headers):
+    epoch = headers.get('X-R2D2-Media-Epoch')
+    generation = headers.get('X-R2D2-Media-Generation')
+    if (type(epoch) is not str or re.fullmatch('[a-f0-9]{32}', epoch) is None or
+            type(generation) is not str or re.fullmatch('[1-9]|[12][0-9]|3[0-2]', generation) is None or
+            any(len(headers.get_all(k, [])) != 1 for k in
+                ('X-R2D2-Media-Epoch', 'X-R2D2-Media-Generation'))):
+        return None
+    return {'epoch': epoch, 'generation': int(generation)}
+
+
+class StreamError(ValueError):
+    pass
+
+
+def ring_bytes():
+    import os
+    return 32 * 1024 * 1024 if os.environ.get('R2D2_VIDEO_MBPS') in ('30', '38') else 16 * 1024 * 1024
+
+
+class MediaStream:
+    """Retained16MiB + pending8MiB + one consumer8MiB + init1MiB + index64KiB.
+
+    Those are encoded-storage maxima, not an RSS promise: bounded parser copies
+    and the kernel/HTTP/video buffers are additional. No consumer allocation
+    queue grows with time. All blocking consumer writes happen outside locks.
+    """
+    def __init__(self, start, read, finish, allowed, *, clock=time.monotonic,
+                 epoch=None, ring=None):
+        self.clock = clock
+        self.epoch = epoch or secrets.token_hex(16)
+        # The ring byte cap bounds lag tolerance in seconds: 16 MiB is ~5.4 s at
+        # 25 Mbit/s but only ~3.5 s at 38 Mbit/s, so scale it with the preset.
+        self.ring = ring or MediaRing(self.epoch, max_bytes=ring_bytes())
+        if self.ring.epoch != self.epoch:
+            raise ValueError('RING_EPOCH')
+        self.start_encoder, self.read_encoder, self.finish_encoder = start, read, finish
+        self.allowed = allowed
+        self.cv = threading.Condition()
+        self.thread = None
+        self.started = self.finished = self.opening = False
+        self.generation = 0
+        self.reservation = None
+        self.active = self.ready = False
+        self.error = None
+        self.total = self.fragments = self.disconnects = self.lagged = 0
+        self.skips = self.generation_skips = 0
+        self.cancel = threading.Event()
+
+    def _run(self):
+        encoder = None
+        try:
+            if not self.allowed() or self.cancel.is_set():
+                raise StreamError('SOURCE_STOPPED')
+            encoder = self.start_encoder()
+            def read(n):
+                if self.cancel.is_set() or not self.allowed():
+                    raise StreamError('SOURCE_STOPPED')
+                data = self.read_encoder(encoder, n)
+                if type(data) is not bytes or len(data) > n or self.total + len(data) > MAX_BYTES:
+                    raise StreamError('SOURCE_BYTE_LIMIT')
+                self.total += len(data)
+                return data
+            producer = Producer(self.ring, read)
+            while True:
+                kind = producer.step()
+                # Producer diagnostic references are not an extra history.
+                producer.last_init = producer.last_pair = producer.last_box = None
+                with self.cv:
+                    if kind == 'fragment':
+                        self.fragments += 1
+                    self.cv.notify_all()
+                if kind == 'end':
+                    break
+        except (Exception,):
+            # Fixed public enum, no raw exception or media/website content.
+            with self.cv:
+                if not self.cancel.is_set():
+                    self.error = 'SOURCE_INVALID_OR_STOPPED'
+        finally:
+            try:
+                if encoder is not None:
+                    self.finish_encoder(encoder)
+            except Exception:
+                with self.cv:
+                    self.error = 'SOURCE_CLEANUP_UNVERIFIED'
+            with self.cv:
+                self.finished = True
+                self.ready = False
+                self.cv.notify_all()
+
+    def state(self):
+        with self.cv:
+            return dict(schema=1, epoch=self.epoch, generation=self.generation,
+                        active=self.active, started=self.started, ended=self.finished,
+                        error=self.error)
+
+    def open(self, body, timeout=5):
+        """Compare-and-reserve exactly once. A lost reply is not replay authority."""
+        with self.cv:
+            if (not identity(body, self.epoch, self.generation) or self.opening or
+                    self.active or self.cancel.is_set() or self.error or
+                    self.finished or self.generation >= MAX_GENERATIONS):
+                raise StreamError('OPEN_REFUSED')
+            self.opening = True
+            if not self.started:
+                self.started = True  # Consumed before thread start; never retry spawn.
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                try:
+                    self.thread.start()
+                except Exception:
+                    self.thread = None
+                    self.finished = True
+                    self.error = 'SOURCE_START_FAILED'
+                    self.opening = False
+                    raise StreamError('OPEN_REFUSED') from None
+            deadline = self.clock() + min(5, max(0, timeout))
+            try:
+                while True:
+                    if self.error or self.cancel.is_set():
+                        raise StreamError('OPEN_REFUSED')
+                    try:
+                        resume = self.ring.resume(latest=True)
+                        break
+                    except MediaError:
+                        if self.finished or self.clock() >= deadline:
+                            raise StreamError('OPEN_NOT_READY') from None
+                        self.cv.wait(min(.1, max(0, deadline-self.clock())))
+                self.generation += 1
+                self.generation_skips = 0
+                self.reservation = resume
+                self.ready = False
+                return dict(schema=1, epoch=self.epoch, generation=self.generation,
+                            index=resume.cursor.index, startNumerator=resume.start.numerator,
+                            startDenominator=resume.start.denominator, initBytes=len(resume.init))
+            finally:
+                self.opening = False
+
+    def attach(self, body):
+        with self.cv:
+            if (not identity(body, self.epoch, self.generation) or not self.reservation or
+                    self.active or self.cancel.is_set() or self.error):
+                raise StreamError('ATTACH_REFUSED')
+            # Reject a reservation evicted before GET; never silently move cursor.
+            self.ring.read(self.reservation.cursor)
+            self.active = True
+            self.ready = False
+            return self.reservation
+
+    def mark_ready(self, body):
+        with self.cv:
+            if (not identity(body, self.epoch, self.generation) or not self.active or
+                    self.error or self.cancel.is_set()):
+                return False
+            self.ready = True
+            return True
+
+    def permits_input(self, body):
+        with self.cv:
+            return bool(identity(body, self.epoch, self.generation) and self.ready and
+                        self.active and not self.error and not self.cancel.is_set())
+
+    def permits_voice(self, body):
+        # The bounded inherited voice poll must not wait on media production.
+        # Trial independently validates its owner/deadline/heartbeat first.
+        if not self.cv.acquire(blocking=False):
+            return False
+        try:
+            return bool(identity(body, self.epoch, self.generation) and self.ready and
+                        self.active and not self.error and not self.cancel.is_set())
+        finally:
+            self.cv.release()
+
+    def next(self, generation, cursor, timeout=5):
+        deadline = self.clock() + min(5, max(0, timeout))
+        with self.cv:
+            while True:
+                if generation != self.generation or not self.active or self.cancel.is_set() or self.error:
+                    raise StreamError('CONSUMER_CLOSED')
+                try:
+                    value = self.ring.read(cursor)
+                except Lagged:
+                    self.lagged += 1
+                    raise
+                if value is not None:
+                    return value
+                if self.finished:
+                    return None
+                if self.clock() >= deadline:
+                    raise StreamError('CONSUMER_WAIT_TIMEOUT')
+                self.cv.wait(min(.1, max(0, deadline-self.clock())))
+
+    def skip_to_latest(self, generation, cursor):
+        """Cursor of the newest complete IDR group if it is ahead of `cursor`.
+
+        None when there is nothing newer or this generation's skip budget is
+        spent. The skipped media never reaches this consumer; the receiver sees
+        one gap in its buffered ranges and seeks across it.
+        """
+        with self.cv:
+            if generation != self.generation or not self.active or self.cancel.is_set() or self.error:
+                raise StreamError('CONSUMER_CLOSED')
+            if self.generation_skips >= MAX_SKIPS_PER_GENERATION:
+                return None
+            try:
+                resume = self.ring.resume(latest=True)
+            except MediaError:
+                return None
+            if resume.cursor.index <= cursor.index:
+                return None
+            self.generation_skips += 1
+            self.skips += 1
+            return resume.cursor
+
+    def behind(self, fragment):
+        """Media seconds between `fragment` and the newest published fragment."""
+        newest = self.ring.newest_end()
+        return 0.0 if newest is None else max(0.0, float(newest - fragment.end))
+
+    def detach(self, generation):
+        with self.cv:
+            if generation != self.generation:
+                return False
+            if self.active:
+                self.disconnects += 1
+            self.active = self.ready = False
+            self.reservation = None
+            self.cv.notify_all()
+            return True
+
+    def close(self, timeout=1):
+        self.cancel.set()
+        with self.cv:
+            self.ready = False
+            self.cv.notify_all()
+        if self.thread:
+            self.thread.join(timeout=timeout)
+        return self.thread is None or not self.thread.is_alive()
+
+    def snapshot(self):
+        with self.cv:
+            return dict(producedBytes=self.total, fragments=self.fragments,
+                        generations=self.generation, disconnects=self.disconnects,
+                        lagged=self.lagged, skips=self.skips, finished=self.finished, error=self.error,
+                        threadExited=self.thread is None or not self.thread.is_alive(),
+                        ring=self.ring.snapshot())

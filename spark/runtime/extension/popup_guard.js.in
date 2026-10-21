@@ -1,0 +1,21 @@
+/* Authored GPL-3.0-or-later. No URL/value inspection, network, storage or messages.
+ * Website MAIN world only. The trusted toolbar uses a separate isolated world.
+ * This is a convenience policy, not a hostile-page security boundary: the host
+ * must reconcile unexpected page targets in its exclusive private context. */
+(() => {
+  "use strict";
+  try { Object.defineProperty(window, "open", {value: () => null, writable: false, configurable: false}); }
+  catch (_) { /* Native popup default + host census remains authoritative. */ }
+  const localTarget = target => !target || ["_self", "_top", "_parent"].includes(target.toLowerCase());
+  document.addEventListener("click", event => {
+    const path = event.composedPath();
+    const link = path.find(node => node instanceof Element && (node.tagName === "A" || node.tagName === "AREA"));
+    if (link && !localTarget(link.getAttribute("target"))) link.setAttribute("target", "_self");
+  }, true);
+  document.addEventListener("submit", event => {
+    const form = event.target;
+    if (form instanceof HTMLFormElement && !localTarget(form.getAttribute("target"))) form.setAttribute("target", "_self");
+    const button = event.submitter;
+    if (button instanceof Element && !localTarget(button.getAttribute("formtarget"))) button.setAttribute("formtarget", "_self");
+  }, true);
+})();

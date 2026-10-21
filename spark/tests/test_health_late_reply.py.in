@@ -1,0 +1,59 @@
+"""Exact delayed-CDP response models, never a native pipe or browser."""
+import copy,unittest
+from unittest.mock import Mock,patch
+import session_page as sp
+class Tests(unittest.TestCase):
+ def page(self):
+  page=sp.SessionPage.__new__(sp.SessionPage);page.sequence=0;page.session='owned-session';page.target='owned-target';page.closed=False;page.phase='navigated';page.deadline=10**12
+  page.frames=page.total=0
+  page._send=Mock();page._message=Mock()
+  return page
+ def info(self,id=1):return {'id':id,'result':{'targetInfo':{'targetId':'owned-target','type':'page','attached':True}}}
+ def timed_out(self,scope='page'):
+  page=self.page()
+  if scope=='page':page._message.side_effect=[self.info(),sp.ProofError('CDP_TIMEOUT')]
+  else:page._message.side_effect=sp.ProofError('CDP_TIMEOUT')
+  self.assertEqual(page.video_health(),sp.unavailable_video_health());return page
+ def test_exact_late_response_is_discarded_once_before_next_regular_reply(self):
+  for scope in ('page','browser'):
+   page=self.timed_out(scope);old=page.sequence;session='owned-session' if scope=='page' else None
+   self.assertEqual(page._video_health_abandoned,(old,session));sent=page._send.call_count
+   for _ in range(100):self.assertEqual(page.video_health(),sp.unavailable_video_health())
+   self.assertEqual(page._send.call_count,sent)
+   late={'id':old,'result':{'private':'not exported'}}
+   if session:late['sessionId']=session
+   page._message.side_effect=[late,self.info(old+1)]
+   self.assertEqual(page._call('Target.getTargetInfo',{'targetId':page.target}),self.info()['result'])
+   self.assertFalse(hasattr(page,'_video_health_abandoned'))
+ def test_unknown_wrong_session_malformed_and_duplicate_late_replies_still_refuse(self):
+  for kind in ('unknown','session','shape','both','duplicate','boolean'):
+   page=self.timed_out();late={'id':2,'sessionId':'owned-session','result':{}}
+   if kind=='unknown':late['id']=1
+   if kind=='session':late['sessionId']='foreign'
+   if kind=='shape':late['result']=None
+   if kind=='both':late['error']={}
+   if kind=='boolean':late['id']=True
+   page._message.side_effect=[late,copy.deepcopy(late),self.info(3)] if kind=='duplicate' else [late,self.info(3)]
+   with self.assertRaises(sp.ProofError):page._call('Target.getTargetInfo',{'targetId':page.target})
+ def test_complete_native_and_context_error_replies_are_unavailable_without_abandonment(self):
+  for msg in ('Execution context was destroyed.','synthetic native error SECRET'):
+   page=self.page();page._message.side_effect=[self.info(),{'id':2,'sessionId':'owned-session','error':{'code':-32000,'message':msg}}]
+   self.assertEqual(page.video_health(),sp.unavailable_video_health());self.assertFalse(hasattr(page,'_video_health_abandoned'))
+   page._message.side_effect=[self.info(3)];page.assert_alive()
+ def test_expired_budget_before_send_is_unavailable_without_outstanding_request(self):
+  page=self.page();clock=[0]
+  def reply():clock[0]=3;return self.info()
+  page._message.side_effect=reply
+  with patch.object(sp.time,'monotonic',side_effect=lambda:clock[0]):
+   self.assertEqual(page.video_health(),sp.unavailable_video_health())
+  self.assertEqual(page._send.call_count,1);self.assertFalse(hasattr(page,'_video_health_abandoned'))
+ def test_partial_send_and_actual_transport_loss_remain_fatal(self):
+  for failure in (sp.ProofError('CDP_TIMEOUT'),OSError('synthetic')):
+   page=self.page();page._send.side_effect=failure
+   with self.assertRaises(type(failure)):page.video_health()
+   self.assertFalse(hasattr(page,'_video_health_abandoned'))
+  for failure in (sp.ProofError('CDP_PIPE_CLOSED'),sp.ProofError('CDP_JSON'),OSError('synthetic')):
+   page=self.page();page._message.side_effect=failure
+   with self.assertRaises(type(failure)):page.video_health()
+   self.assertFalse(hasattr(page,'_video_health_abandoned'))
+if __name__=='__main__':unittest.main(verbosity=2)

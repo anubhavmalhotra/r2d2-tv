@@ -1,0 +1,81 @@
+import json,unittest
+from unittest.mock import Mock,patch
+import session_page as sp
+from test_direct_editor import tr
+
+class SourceHealth(unittest.TestCase):
+    def video(self,**changes):
+        v=dict(width=3840,height=2160,readyState=4,networkState=2,paused=False,seeking=False,ended=False,errorCode=None,totalFrames=600,droppedFrames=1);v.update(changes);return v
+    def health(self,n=2):return dict(available=True,videoCount=n,truncated=n>4,videos=[self.video() for _ in range(min(n,4))])
+    def page(self):
+        page=sp.SessionPage.__new__(sp.SessionPage);page.deadline=10**12;page.assert_alive=Mock(return_value=True);page._evaluate=Mock(return_value=self.health());return page
+    def test_multi_video_error_is_visible_without_changing_old_snapshot(self):
+        for n in range(6):self.assertEqual(sp.scalar_video_health(self.health(n)),self.health(n))
+        page=self.page();health=self.health();health['videos'][1]['errorCode']=3;page._evaluate.return_value=health
+        self.assertEqual(page.video_health()['videos'][1]['errorCode'],3);self.assertEqual(page.assert_alive.call_count,2)
+        from test_session import scalars
+        old=scalars(videoCount=2,video=None);self.assertEqual(sp.scalar_snapshot(old),old)
+    def test_unknown_native_context_and_quality_do_not_become_healthy_zero(self):
+        for fail in (sp.ProofError('PAGE_CONTEXT_TRANSITION'),sp.ProofError('PAGE_OWNER_LOST'),OSError('private')):
+            page=self.page();page._evaluate.side_effect=fail;self.assertEqual(page.video_health(),sp.unavailable_video_health())
+        page=self.page();page.assert_alive.side_effect=[True,sp.ProofError('PAGE_OWNER_LOST')]
+        self.assertEqual(page.video_health(),sp.unavailable_video_health())
+        page=self.page();page._evaluate.return_value=None;self.assertEqual(page.video_health(),sp.unavailable_video_health())
+    def test_source_errors_and_unavailable_diagnostics_never_stop_outer_trial(self):
+        value=tr();page=self.page()
+        for code in (1,2,3,4):
+            sample=self.health();sample['videos'][0]['errorCode']=code;page._evaluate.return_value=sample
+            value.record_video_health(page)
+            self.assertEqual(value.source_video_health[-1]['videos'][0]['errorCode'],code)
+            self.assertFalse(value.stop.is_set());self.assertIsNone(value.error)
+        for bad in (None,{'private':'SECRET'},dict(self.health(),videos=[])):
+            page._evaluate.return_value=bad;value.record_video_health(page)
+            self.assertEqual({k:v for k,v in value.source_video_health[-1].items() if k!='elapsedMs'},sp.unavailable_video_health())
+            self.assertFalse(value.stop.is_set());self.assertIsNone(value.error)
+        for exc in (sp.ProofError('PAGE_CONTEXT_TRANSITION'),OSError('SECRET')):
+            page._evaluate.side_effect=exc;value.record_video_health(page)
+            self.assertEqual({k:v for k,v in value.source_video_health[-1].items() if k!='elapsedMs'},sp.unavailable_video_health())
+            self.assertFalse(value.stop.is_set());self.assertIsNone(value.error)
+
+    def test_diagnostic_two_second_budget_cannot_reset_and_restores_normal_deadline(self):
+        page=self.page();clock=[100.0];prior=page.deadline;calls=[]
+        def alive():
+            page.deadline=clock[0]+2;calls.append(page._remaining());clock[0]+=1.25
+        page.assert_alive.side_effect=alive
+        with patch.object(sp.time,'monotonic',side_effect=lambda:clock[0]):
+            self.assertEqual(page.video_health(),sp.unavailable_video_health())
+            self.assertEqual(calls,[2,.75]);self.assertEqual(page.deadline,prior)
+            self.assertFalse(hasattr(page,'_video_health_deadline'))
+            page.deadline=clock[0]+7;self.assertEqual(page._remaining(),7)
+        page=self.page();page._evaluate.side_effect=sp.ProofError('PAGE_CONTEXT_TRANSITION')
+        self.assertEqual(page.video_health(),sp.unavailable_video_health());self.assertEqual(page.deadline,10**12)
+        self.assertFalse(hasattr(page,'_video_health_deadline'))
+
+    def test_elapsed_monotonic_time_is_bounded_and_does_not_export_wallclock(self):
+        value=tr();page=self.page();value.source_video_clock=10
+        with patch.object(sp.time,'monotonic',return_value=10.25):value.record_video_health(page)
+        self.assertEqual(value.source_video_health[-1]['elapsedMs'],250)
+        with patch.object(sp.time,'monotonic',return_value=9):value.record_video_health(page)
+        self.assertEqual(value.source_video_health[-1]['elapsedMs'],0)
+        with patch.object(sp.time,'monotonic',return_value=10**9):value.record_video_health(page)
+        self.assertLessEqual(value.source_video_health[-1]['elapsedMs'],86520000)
+        self.assertEqual(set(value.source_video_health[-1]),{'elapsedMs','available','videoCount','truncated','videos'})
+
+    def test_scalar_schema_rejects_payloads_and_numeric_aliases(self):
+        for key,bad in [('width',True),('height',8193),('readyState',5),('networkState',4),('paused',0),('seeking',1),('ended',None),('errorCode',0),('errorCode',True),('totalFrames',-1),('droppedFrames',601)]:
+            v=self.health();v['videos'][0][key]=bad
+            with self.assertRaises(sp.ProofError):sp.scalar_video_health(v)
+        for field in ('url','currentSrc','message','title','cookies','text'):
+            v=self.health();v['videos'][0][field]='private'
+            with self.assertRaises(sp.ProofError):sp.scalar_video_health(v)
+        for v in (dict(self.health(),videoCount=True),dict(self.health(),extra='private'),dict(self.health(),available=1),dict(self.health(),truncated=True),dict(self.health(),videos=self.health()['videos']*3)):
+            with self.assertRaises(sp.ProofError):sp.scalar_video_health(v)
+    def test_sample_ring_bounded_across_day_and_contains_no_page_payload(self):
+        value=tr();page=self.page()
+        for _ in range(8640):value.record_video_health(page)
+        self.assertEqual(len(value.source_video_health),16)
+        self.assertLess(len(json.dumps(value.source_video_health).encode()),16000)
+        expression=sp.VIDEO_HEALTH_EXPRESSION
+        for forbidden in ('currentSrc','location','fetch(','innerText','textContent','cookie','title'):self.assertNotIn(forbidden,expression)
+
+if __name__=='__main__':unittest.main(verbosity=2)

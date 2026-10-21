@@ -1,0 +1,62 @@
+/* Same-origin display-only RTC adapter. No device capture or navigation API. */
+(function(root){'use strict';
+var C=typeof module==='object'&&module.exports?require('./rtc_crypto.js'):root.R2D2Crypto;
+var P=typeof module==='object'&&module.exports?require('./rtc_policy.js'):root.R2D2Policy;
+var M=typeof module==='object'&&module.exports?require('./rtc_measurement'):root.R2D2VideoMeasurement;
+var Q=typeof module==='object'&&module.exports?require('./rtc_measurement_pack'):root.R2D2MeasurementPack;
+function need(v,c){if(!v)throw Error(c);}
+var errorCodes='UNCLASSIFIED UNSUPPORTED_API MEDIA_CONTRACT RTC_REPLAY RTC_CONFIG RTC_API RTC_CLOSED RTC_PHASE RTC_OFFER RTC_TRANSCEIVERS RTC_ANSWER RTC_CONNECTION RTC_STATE RTC_ENCODING RTC_RESPONSE RTC_BOUND RTC_TRACK RTC_DATA_CHANNEL SIGNAL_SCOPE SIGNAL_AUTH CONFIG_SCOPE SDP_SCOPE SDP_FINGERPRINT SDP_CODEC SDP_MEDIA SDP_LAN SDP_CANDIDATE SDP_DUPLICATE SDP_ICE SDP_ROLE SDP_DIRECTION ICE_NO_EXACT_UDP_HOST'.split(' ');
+var errorNames='Error TypeError SyntaxError InvalidStateError OperationError NotSupportedError SecurityError AbortError NetworkError TimeoutError NotAllowedError Other'.split(' ');
+function diagnosticError(error){var code=error&&error.message,name=error&&error.name;return {errorCode:typeof code==='string'&&errorCodes.indexOf(code)>=0?code:'UNCLASSIFIED',errorName:typeof name==='string'&&errorNames.indexOf(name)>=0?name:'Other'};}
+
+function create(env,video,io){
+ var stage='new',failure=null,apiMask=null;
+ function note(next,error){if(failure)return;stage=next;if(error)failure=diagnosticError(error);if(io.diagnostic)io.diagnostic({stage:stage,errorCode:failure?failure.errorCode:null,errorName:failure?failure.errorName:null,apiMask:apiMask});}
+ var pc=null,stream=null,tracks=[],key=null,closed=false,used=false,timers=[],pending=[],frame=null,watch=null,measurement=null,measurementValue=null,measurementBusy=false,measurementDone=false;
+ function close(){if(closed)return;closed=true;if(measurement)measurement.close();pending.slice().forEach(function(fn){fn();});pending=[];timers.forEach(env.clearTimeout);timers=[];if(watch!==null)env.clearInterval(watch);if(frame!==null)video.cancelVideoFrameCallback(frame);frame=null;if(io.abort)io.abort();if(pc){pc.ontrack=pc.ondatachannel=null;pc.close();}tracks.forEach(function(t){t.stop();});tracks=[];if(video.srcObject===stream)video.srcObject=null;stream=null;if(key)key.fill(0);key=null;}
+ function bound(fn,ms){return new Promise(function(ok,bad){var done=false,t;function finish(error,value){if(done)return;done=true;env.clearTimeout(t);pending=pending.filter(function(x){return x!==cancel;});error?bad(error):ok(value);}function cancel(){finish(Error(closed?'RTC_CLOSED':'RTC_PHASE'));}pending.push(cancel);t=env.setTimeout(cancel,ms);timers.push(t);Promise.resolve().then(function(){need(!closed,'RTC_CLOSED');return fn();}).then(function(v){finish(closed?Error('RTC_CLOSED'):null,v);},function(error){finish(error);});});}
+ async function until(check,end){while(!check()){need(!closed&&env.now()<end,'RTC_PHASE');await bound(function(){return new Promise(function(ok){var t=env.setTimeout(ok,25);timers.push(t);});},100);}}
+ function collectMeasurement(){
+  if(closed||measurementBusy||measurementDone||!measurement)return;
+  measurementBusy=true;
+  bound(function(){return pc.getStats();},1000).then(function(report){
+   if(closed)return;var elapsed=measurement.sample(report);report=null;
+   if(elapsed>=30000){measurement.complete();measurementDone=true;}
+   measurementValue=Q.pack(measurement.snapshot(),null);
+  },function(){if(!closed){measurementValue=Q.pack(null,'RTC_STATS_UNCONFIRMED');measurementDone=true;}}).catch(function(){if(!closed){measurementValue=Q.pack(null,'RTC_STATS_UNCONFIRMED');measurementDone=true;}}).then(function(){measurementBusy=false;});
+ }
+ async function start(c){
+  need(!used&&!closed,'RTC_REPLAY');used=true;
+  try{
+   note('config');need(P.keys(c,'attempt,createdUnixMs,expectedOfferSha256,expectedSenderDtlsFingerprint,expiresUnixMs,keyHex,lifetimeSeconds,port,receiverIPv4,senderIPv4'),'RTC_CONFIG');
+   need(/^[a-f0-9]{64}$/.test(c.attempt)&&/^[a-f0-9]{64}$/.test(c.keyHex)&&/^[a-f0-9]{64}$/.test(c.expectedOfferSha256)&&/^(?:[A-F0-9]{2}:){31}[A-F0-9]{2}$/.test(c.expectedSenderDtlsFingerprint),'RTC_CONFIG');
+   P.ip(c.senderIPv4);P.ip(c.receiverIPv4);need(c.senderIPv4!==c.receiverIPv4&&c.port===4177&&c.lifetimeSeconds===12&&Number.isSafeInteger(c.createdUnixMs)&&c.expiresUnixMs-c.createdUnixMs===12000,'RTC_CONFIG');
+   apiMask=(typeof env.RTCPeerConnection==='function'?1:0)|(typeof env.MediaStream==='function'?2:0)|(typeof video.requestVideoFrameCallback==='function'?4:0)|(typeof video.cancelVideoFrameCallback==='function'?8:0);note('config');
+   need(typeof env.RTCPeerConnection==='function'&&typeof env.MediaStream==='function'&&typeof video.requestVideoFrameCallback==='function'&&typeof video.cancelVideoFrameCallback==='function','RTC_API');
+   key=C.unhex(c.keyHex);note('offer-fetch');var raw=await bound(io.offer,2000);note('offer-verify');var offer=P.verify(raw,key,c.attempt,'offer');
+   need(C.equal(C.hex(C.sha(C.ascii(offer))),c.expectedOfferSha256),'RTC_OFFER');P.parse(offer,'offer',c.senderIPv4,c.expectedSenderDtlsFingerprint.replace(/:/g,'').toLowerCase(),'VP9');
+   note('peer-create');pc=new env.RTCPeerConnection({iceServers:[],iceCandidatePoolSize:0,iceTransportPolicy:'all',bundlePolicy:'max-bundle',rtcpMuxPolicy:'require'});stream=new env.MediaStream();video.srcObject=stream;
+   pc.ondatachannel=function(e){note('datachannel',Error('RTC_DATA_CHANNEL'));if(e&&e.channel)e.channel.close();close();io.failed();};
+   pc.ontrack=function(e){var t=e&&e.track;if(closed)return;if(!t||['audio','video'].indexOf(t.kind)<0||tracks.some(function(v){return v.kind===t.kind;})||tracks.length>=2){note('track',Error('RTC_TRACK'));close();io.failed();return;}tracks.push(t);stream.addTrack(t);};
+   note('set-remote');await bound(function(){return pc.setRemoteDescription({type:'offer',sdp:offer});},2000);offer=raw=null;
+   note('transceivers');var trans=pc.getTransceivers();need(Array.isArray(trans)&&trans.length===2,'RTC_TRANSCEIVERS');trans.forEach(function(t){need(t.receiver&&t.receiver.track&&!t.sender.track&&['audio','video'].indexOf(t.receiver.track.kind)>=0,'RTC_TRANSCEIVERS');t.direction='recvonly';});
+   note('create-answer');var answer=await bound(function(){return pc.createAnswer();},2000);need(answer&&answer.type==='answer'&&typeof answer.sdp==='string','RTC_ANSWER');note('set-local');await bound(function(){return pc.setLocalDescription(answer);},2000);answer=null;
+   note('ice-gather');await until(function(){return pc.iceGatheringState==='complete';},env.now()+5000);
+   note('answer-filter');var filtered=P.filterLocalAnswer(pc.localDescription.sdp,c.receiverIPv4,P.candidateShape());note('answer-verify');P.parse(filtered,'answer',c.receiverIPv4,null,'VP9');
+   need(pc.getTransceivers().every(function(t){return t.direction==='recvonly'&&t.currentDirection==='recvonly'&&t.sender.track===null;}),'RTC_TRANSCEIVERS');
+   note('send-answer');var signed=P.sign(key,c.attempt,'answer',filtered);filtered=null;need(await bound(function(){return io.answer(signed);},4000)===true,'RTC_ANSWER');signed=null;key.fill(0);key=null;
+   note('connect');await until(function(){need(['closed','failed','disconnected'].indexOf(pc.connectionState)<0,'RTC_CONNECTION');return pc.connectionState==='connected'&&tracks.length===2;},env.now()+5000);
+   // The existing viewer owns autoplay/mute handling; no fabricated audio or
+   // physical-presentation success is inferred from a resolved play promise.
+   note('play');io.play();
+   note('first-frame');await bound(function(){return new Promise(function(ok){function observe(now,m){frame=null;if(closed)return;if(m&&m.width===3840&&m.height===2160&&video.videoWidth===3840&&video.videoHeight===2160){ok();return;}frame=video.requestVideoFrameCallback(observe);}frame=video.requestVideoFrameCallback(observe);});},5000);
+   need(!closed&&pc.connectionState==='connected','RTC_CONNECTION');
+   measurement=M.create(video,env.now);collectMeasurement();
+   watch=env.setInterval(function(){if(!closed&&pc.connectionState!=='connected'){note('receiving',Error('RTC_CONNECTION'));close();io.failed();}else collectMeasurement();},500);
+   note('receiving');return true;
+  }catch(e){note(stage,e);close();throw Error('RTC_DISPLAY_UNCONFIRMED');}
+ }
+ return {start:start,close:close,measurement:function(){return measurementValue;}};
+}
+var api={create:create,diagnosticError:diagnosticError};if(typeof module==='object'&&module.exports)module.exports=api;else root.R2D2BrowserRTC=api;
+})(typeof window==='object'?window:globalThis);

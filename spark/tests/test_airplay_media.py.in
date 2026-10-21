@@ -1,0 +1,112 @@
+"""Offline synthetic FFmpeg filters/mux -> actual AirPlay ring; no sender or device.
+
+Set FFMPEG to a local FFmpeg with lavfi, libx265 and AAC, or install it on PATH.
+Only the unavailable CUDA/NVENC codec is substituted by software HEVC; this is
+not a GPU throughput, RTP arrival-clock, HDR tone-map or TV playback test.
+"""
+import io
+from fractions import Fraction
+import os
+import shutil
+import subprocess
+import unittest
+
+import airplay as ap
+import airplay_ingress as ai
+
+FFMPEG = os.environ.get('FFMPEG') or shutil.which('ffmpeg')
+
+
+@unittest.skipUnless(FFMPEG, 'local FFmpeg required for synthetic media controls')
+class AirPlayMediaTests(unittest.TestCase):
+    def run_ffmpeg(self, args, *, data=None):
+        p = subprocess.run([FFMPEG, '-hide_banner', '-v', 'error', *args], input=data,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr.decode(errors='replace')[-2000:])
+        return p.stdout
+
+    def video_filter(self):
+        cmd = ai.build_reencode_command()
+        return cmd[cmd.index('-vf') + 1]
+
+    def test_letterbox_preserves_portrait_and_non_square_display_aspect(self):
+        # Explicit expected content extents, measured from actual output pixels.
+        for source, expected in (
+            ('color=c=white:s=320x180:r=60:d=0.05', (3840, 2160)),
+            ('color=c=white:s=180x320:r=60:d=0.05', (1214, 2160)),
+            ('color=c=white:s=720x576:r=60:d=0.05,setsar=16/15', (2880, 2160)),
+        ):
+            with self.subTest(source=source):
+                raw = self.run_ffmpeg(['-f', 'lavfi', '-i', source, '-vf', self.video_filter(),
+                                      '-frames:v', '1', '-pix_fmt', 'gray', '-f', 'rawvideo', 'pipe:1'])
+                self.assertEqual(len(raw), 3840 * 2160)
+                row = raw[1080 * 3840:1081 * 3840]
+                col = raw[1920::3840]
+                self.assertEqual((sum(v > 200 for v in row), sum(v > 200 for v in col)), expected)
+                self.assertLessEqual(abs(row.find(b'\xff') - (3840 - expected[0]) // 2), 2)
+
+    def encode_for_ring(self, source, *, data=None, raw_hevc=False):
+        cmd = ai.build_reencode_command()
+        # Keep the actual filter, pixel-format constraint, AAC and mux arguments.
+        # libx265 mirrors the required closed-GOP Main/8-bit bitstream contract;
+        # it does not exercise CUDA decode, NVENC, or their performance.
+        video_input = (['-framerate', '60', '-f', 'hevc', '-i', 'pipe:0'] if raw_hevc
+                       else ['-f', 'lavfi', '-i', source])
+        output_format = []
+        if '-pix_fmt' in cmd:
+            output_format = ['-pix_fmt', cmd[cmd.index('-pix_fmt') + 1]]
+        cadence = []
+        for option in ('-fps_mode:v', '-r:v'):
+            if option in cmd:
+                cadence.extend([option, cmd[cmd.index(option) + 1]])
+        encoded = self.run_ffmpeg([
+            *video_input, '-f', 'lavfi', '-i', 'sine=sample_rate=44100:frequency=440:duration=0.5',
+            '-map', '0:v:0', '-map', '1:a:0', '-vf', cmd[cmd.index('-vf') + 1],
+            '-c:v', 'libx265', '-preset', 'ultrafast', *output_format, *cadence,
+            '-x265-params', 'log-level=error:pools=1:frame-threads=1:keyint=60:min-keyint=60:bframes=0:scenecut=0:open-gop=0:level-idc=5.1:high-tier=0',
+            '-tag:v', 'hvc1', *cmd[cmd.index('-c:a'):],
+        ], data=data)
+        self.assertLess(len(encoded), 2 * 1024 * 1024)
+        session = ap.AirPlayRelaySession('a' * 32)
+        try:
+            result = session.pump_stream(io.BytesIO(encoded).read)
+        except Exception as exc:
+            self.fail(f'actual AirPlay ring rejected synthetic mux: {type(exc).__name__}: {exc}')
+        self.assertEqual(result['activeProfile'], '4k60_hevc')
+        self.assertTrue(result['ring']['avBootstrapSeen'])
+        self.assertTrue(result['ring']['ended'])
+        self.assertIsNone(result['ring']['error'])
+        self.assertGreaterEqual(result['ring']['fragments'], 25)
+        tracks = {track.ident: track for track in session.ring.init.tracks}
+        video_spans = [(begin, end, tracks[ident].scale)
+                       for group in session.ring.groups for fragment in group
+                       for ident, begin, end in fragment.track_spans
+                       if tracks[ident].kind == 'video']
+        # AAC priming can extend the first muxed video duration; all following
+        # single-sample fragments must retain the actual 60 Hz cadence, even
+        # across filter reinitialization on a source-size change.
+        self.assertGreater(len(video_spans), 20)
+        self.assertEqual({Fraction(end-begin, scale) for begin,end,scale in video_spans[1:]}, {Fraction(1,60)})
+        return result
+
+    def test_8bit_landscape_reaches_actual_ring(self):
+        self.encode_for_ring('color=c=black:s=320x180:r=60:d=0.5')
+
+    def test_10bit_source_is_converted_to_receiver_main_profile(self):
+        # Without the explicit yuv420p constraint, this produces Main10 and the
+        # actual receiver rejects HVCC_PROFILE (NVENC also promotes 10-bit input).
+        self.encode_for_ring('color=c=black:s=180x320:r=60:d=0.5,format=yuv420p10le')
+
+    def test_midstream_resolution_change_preserves_one_4k_ring(self):
+        chunks = []
+        for size in ('320x180', '180x320'):
+            chunks.append(self.run_ffmpeg([
+                '-f', 'lavfi', '-i', f'color=c=black:s={size}:r=60:d=0.25',
+                '-c:v', 'libx265', '-preset', 'ultrafast', '-x265-params',
+                'log-level=error:pools=1:frame-threads=1:bframes=0:open-gop=0',
+                '-f', 'hevc', 'pipe:1']))
+        self.encode_for_ring(None, data=b''.join(chunks), raw_hevc=True)
+
+
+if __name__ == '__main__':
+    unittest.main()

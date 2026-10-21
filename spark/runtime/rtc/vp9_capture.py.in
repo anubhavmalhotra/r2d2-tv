@@ -1,0 +1,200 @@
+"""Finite authored-page private-display capture/conversion/VP9 proof.
+
+No process, browser, capture or network on import. Invoked only after the copied
+Trial's real private-display/profile/renderer/audio/input/DNS preflights.
+"""
+import json,math,os,re,select,stat,struct,subprocess,threading,time
+from pathlib import Path
+from .vp9_public import keyframe,decode_ivf_header,argv as clip_argv
+from .capture_clock import ClockMap,ClockError,MAX_AGE_NS
+
+FRAMES=2400
+MAX_FRAMES=10**12
+GOP=30
+DEADLINE=40
+MAX_TOTAL=128*1024*1024
+MAX_FRAME=2*1024*1024
+MAX_READ=65536
+class CaptureError(RuntimeError):pass
+def need(ok,code):
+    if not ok:raise CaptureError(code)
+
+# CDP evaluates these only in the exact new local start page. No website strings,
+# external assets, media devices, user content, clipboard or storage are read.
+START=r'''(()=>{if(location.href!==START_URL||document.hidden||!document.hasFocus()||globalThis.__r2d2Vp9Capture||innerWidth*devicePixelRatio!==3840||innerHeight*devicePixelRatio!==2160)return false;
+const c=document.createElement('canvas');c.width=3840;c.height=2160;c.style.cssText='position:fixed;inset:0;width:100vw;height:100vh;background:#000;z-index:2147483647';c.id='r2d2-vp9-capture';document.body.appendChild(c);const ctx=c.getContext('2d',{alpha:false});if(!ctx){c.remove();return false}
+const p={canvas:c,frames:0,first:null,last:null,raf:0,timer:0,ended:false};globalThis.__r2d2Vp9Capture=p;
+function tick(t){if(p.ended)return;if(p.first===null)p.first=t;p.last=t;p.frames++;ctx.fillStyle='#000';ctx.fillRect(0,0,3840,2160);ctx.fillStyle='#fff';ctx.font='96px sans-serif';ctx.fillText('R2D2 / Authored 4K60 capture',160,200);for(let i=0;i<18;i++){ctx.fillStyle='hsl('+((i*20+t/25)%360)+',70%,50%)';const x=(t*(.20+i*.01)+i*240)%4200-240;ctx.fillRect(x,340+i*82,240,64)}p.raf=requestAnimationFrame(tick)}p.raf=requestAnimationFrame(tick);
+p.timer=setTimeout(()=>{p.ended=true;cancelAnimationFrame(p.raf)},44000);return true})()'''
+SAMPLE=r'''(()=>{if(location.href!==START_URL)return null;const p=globalThis.__r2d2Vp9Capture;if(!p||p.canvas!==document.getElementById('r2d2-vp9-capture'))return null;return {frames:p.frames,firstMs:p.first,lastMs:p.last,width:p.canvas.width,height:p.canvas.height,visible:!document.hidden,focused:document.hasFocus(),ended:p.ended}})()'''
+CLEAR=r'''(()=>{if(location.href!==START_URL)return false;const p=globalThis.__r2d2Vp9Capture;if(!p)return true;p.ended=true;clearTimeout(p.timer);cancelAnimationFrame(p.raf);p.canvas.remove();delete globalThis.__r2d2Vp9Capture;return true})()'''
+
+def evaluate(page,text,end):
+    page.deadline=min(end,time.monotonic()+2)
+    return page._evaluate(text.replace('START_URL',json.dumps(page.start_url)))
+def animation(value):
+    need(type(value)is dict and set(value)=={'frames','firstMs','lastMs','width','height','visible','focused','ended'},'CAPTURE_ANIMATION')
+    need(type(value['frames'])is int and 0<=value['frames']<=10000 and value['width']==3840 and value['height']==2160,'CAPTURE_ANIMATION')
+    need(value['visible']is True and value['focused']is True and type(value['ended'])is bool,'CAPTURE_ANIMATION')
+    for key in('firstMs','lastMs'):need(value[key]is None or type(value[key])in(int,float)and math.isfinite(value[key])and 0<=value[key]<=10**9,'CAPTURE_ANIMATION')
+    need(not value['frames']or value['firstMs']is not None and value['lastMs']>=value['firstMs'],'CAPTURE_ANIMATION')
+    return dict(value)
+
+def command(display,frames=FRAMES):
+    need(type(display)is str and re.fullmatch(r':[0-9]{1,5}',display),'CAPTURE_DISPLAY')
+    need(frames is None or type(frames)is int and 1<=frames<=MAX_FRAMES,'CAPTURE_FRAME_BOUND')
+    # Real-page 4K60 capture: an eight-frame x11grab queue bounds encode
+    # spikes, 12 encoder threads leave 8 cores for Chromium's 4K60 video decode,
+    # and bounded quantizer/overshoot prevents multi-MB AU bursts on transitions.
+    args=clip_argv();start=args.index('-c:v');codec=args[start:]
+    codec[codec.index('-threads')+1]='12'
+    codec[codec.index('-b:v')+1]='16M'
+    codec[codec.index('-maxrate')+1]='18M'
+    codec[codec.index('-g')+1]=str(GOP);codec[codec.index('-keyint_min')+1]=str(GOP)
+    codec[codec.index('-bufsize'):codec.index('-bufsize')]=['-minrate','4M','-max-intra-rate','150','-qmin','12','-qmax','52','-overshoot-pct','0','-undershoot-pct','0']
+    limit=['-frames:v',str(frames)]if frames is not None else[]
+    return ['/usr/bin/ffmpeg','-hide_banner','-loglevel','error','-nostdin',
+        '-copyts','-thread_queue_size','8','-f','x11grab','-draw_mouse','0','-video_size','3840x2160','-framerate','60','-i',display+'.0']+limit+[
+        '-an','-map_metadata','-1',
+        '-fps_mode','passthrough','-enc_time_base','1:1000000','-avoid_negative_ts','disabled']+codec
+
+def authority(trial,uid=os.getuid):
+    need(type(trial.env)is dict and trial.env.get('DISPLAY')==trial.display and trial.xauth=={'authorized_private_display':True,'wrong_cookie_rejected':True},'CAPTURE_AUTHORITY')
+    path=Path(trial.env.get('XAUTHORITY',''));need(path==trial.run/'Xauthority'and path.is_absolute()and path.resolve()==path,'CAPTURE_AUTHORITY')
+    info=path.lstat();need(stat.S_ISREG(info.st_mode)and info.st_uid==uid()and info.st_nlink==1 and stat.S_IMODE(info.st_mode)==0o600,'CAPTURE_AUTHORITY')
+    # No ambient desktop, session bus, preload, Pulse defaults or user rc values.
+    env={'PATH':'/usr/bin:/bin','LANG':'C','LC_ALL':'C','DISPLAY':trial.display,'XAUTHORITY':str(path)}
+    return env,(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+def validate_header(h,frames=FRAMES):
+    need(frames is None or type(frames)is int and 1<=frames<=MAX_FRAMES,'CAPTURE_FRAME_BOUND')
+    need(h==dict(magicTag=0x46494b44,version=0,headerBytes=32,codecTag=0x30395056,width=3840,height=2160,rate=1000000,scale=1,declaredFrames=h['declaredFrames'],unused=0)and h['declaredFrames']in(0,FRAMES,frames,0xffffffff),'VP9_IVF_HEADER')
+
+class Stream:
+    """Incremental counters only: <=64-byte AU prefix, never a frame or clip."""
+    def __init__(self,mapping):
+        self.mapping=mapping;self.first_age=None;self.max_upper_age=None;self.source_gaps=[]
+        self.header=None;self.head=bytearray();self.remaining=None;self.prefix=bytearray();self.current_stamp=None
+        self.frames=0;self.total=0;self.last_stamp=None;self.first_stamp=None;self.keyframes=0;self.last_key=None
+        self.duplicate_stamps=0;self.max_frame=0;self.max_retained=0;self.arrivals=[]
+    def feed(self,raw,now_ns):
+        need(type(raw)is bytes and 0<len(raw)<=MAX_READ,'CAPTURE_READ_BOUND');self.total+=len(raw);need(self.total<=MAX_TOTAL,'CAPTURE_TOTAL_BOUND')
+        view=memoryview(raw)
+        while view:
+            if self.header is None:
+                n=min(32-len(self.head),len(view));self.head.extend(view[:n]);self.max_retained=max(self.max_retained,len(self.head));view=view[n:]
+                if len(self.head)==32:self.header=decode_ivf_header(self.head);validate_header(self.header);self.head.clear()
+            elif self.remaining is None:
+                n=min(12-len(self.head),len(view));self.head.extend(view[:n]);self.max_retained=max(self.max_retained,len(self.head));view=view[n:]
+                if len(self.head)==12:
+                    size,stamp=struct.unpack('<IQ',self.head);self.head.clear()
+                    need(self.frames<FRAMES and 1<=size<=MAX_FRAME and 0<stamp<2**63,'CAPTURE_FRAME_BOUND')
+                    need(self.last_stamp is None or stamp>=self.last_stamp,'CAPTURE_TIMESTAMP')
+                    self.remaining=size;self.current_stamp=stamp;self.max_frame=max(self.max_frame,size)
+            else:
+                n=min(self.remaining,len(view));take=min(n,64-len(self.prefix));self.prefix.extend(view[:take]);self.max_retained=max(self.max_retained,len(self.prefix));view=view[n:];self.remaining-=n
+                if self.remaining==0:
+                    key=keyframe(self.prefix)
+                    if key:self.last_key=self.frames;self.keyframes+=1
+                    need(self.last_key is not None and self.frames-self.last_key<GOP,'CAPTURE_KEY_INTERVAL')
+                    if self.last_stamp is not None:
+                        step=self.current_stamp-self.last_stamp;self.source_gaps.append(step);self.duplicate_stamps+=int(step==0)
+                    else:self.first_stamp=self.current_stamp
+                    self.last_stamp=self.current_stamp;self.frames+=1;self.arrivals.append(now_ns);self.remaining=None;self.prefix.clear()
+                    low,high=self.mapping.ages(self.current_stamp,now_ns)
+                    if self.first_age is None:self.first_age=(low,high)
+                    self.max_upper_age=high if self.max_upper_age is None else max(high,self.max_upper_age)
+                    need(high<=MAX_AGE_NS,'CAPTURE_FRAME_STALE')
+            self.max_retained=max(self.max_retained,len(self.head)+len(self.prefix))
+    def finish(self):need(self.header is not None and self.frames==FRAMES and self.remaining is None and not self.head,'CAPTURE_TRUNCATED')
+    def result(self,elapsed_ms):
+        steady=self.arrivals[60:] if len(self.arrivals)>61 else[];seconds=(steady[-1]-steady[0])/1e9 if steady else 0
+        gaps=sorted((b-a)/1e6 for a,b in zip(steady,steady[1:]));intervals=max(0,len(steady)-1)
+        return dict(encodedFrames=self.frames,keyframes=self.keyframes,encodedBytes=self.total,elapsedMs=elapsed_ms,
+            outputSteadyIntervals=intervals,outputSteadySeconds=seconds,outputSteadyFps=intervals/seconds if seconds>0 else None,
+            outputP95GapMs=gaps[(len(gaps)-1)*95//100]if gaps else None,outputMaxGapMs=max(gaps)if gaps else None,
+            sourceElapsedUs=None if self.first_stamp is None else self.last_stamp-self.first_stamp,
+            sourceFirstAcquisitionOffsetUs=None if self.first_stamp is None else(self.first_stamp*1000-self.mapping.start_real)//1000,
+            sourceMinGapUs=min(self.source_gaps)if self.source_gaps else None,sourceMaxGapUs=max(self.source_gaps)if self.source_gaps else None,
+            sourceP95GapUs=sorted(self.source_gaps)[(len(self.source_gaps)-1)*95//100]if self.source_gaps else None,sourceDuplicateTimestamps=self.duplicate_stamps,
+            firstAgeLowerNs=None if self.first_age is None else self.first_age[0],firstAgeUpperNs=None if self.first_age is None else self.first_age[1],maxAgeUpperNs=self.max_upper_age,
+            acquisitionClock=self.mapping.projection(),ivfTimebaseNum=None if self.header is None else self.header['scale'],ivfTimebaseDen=None if self.header is None else self.header['rate'],
+            maxEncodedFrameBytes=self.max_frame,maxParserRetainedBytes=self.max_retained)
+    def close(self):self.head[:]=b'\0'*len(self.head);self.head.clear();self.prefix[:]=b'\0'*len(self.prefix);self.prefix.clear()
+
+def failure(error):
+    code=error.args[0]if type(error)in(CaptureError,ClockError,ValueError,RuntimeError)and len(error.args)==1 and type(error.args[0])is str else None
+    allowed={'CAPTURE_FRAME_STALE','CAPTURE_CLOCK_SHAPE','CAPTURE_CLOCK_UNCERTAINTY','CAPTURE_CLOCK_ORDER','CAPTURE_CLOCK_STEP','CAPTURE_CLOCK_BOUND','CAPTURE_CLOCK_UNREADY','CAPTURE_PTS_OUTSIDE_RUN','CAPTURE_PTS_FUTURE','CAPTURE_READ_BOUND','CAPTURE_TOTAL_BOUND','CAPTURE_FRAME_BOUND','CAPTURE_TIMESTAMP','CAPTURE_KEY_INTERVAL','CAPTURE_TRUNCATED','CAPTURE_ANIMATION','CAPTURE_ANIMATION_START','CAPTURE_DISPLAY_OWNER','CAPTURE_DEADLINE','CAPTURE_AUTHORITY','CAPTURE_AUTHORITY_CHANGED','CAPTURE_ANIMATION_ENDED','CAPTURE_ENCODER_EXIT','CAPTURE_READER_JOIN','VP9_IVF_HEADER','VP9_FRAME_HEADER','VP9_FRAME_PROFILE','VP9_SHOW_EXISTING_REFUSED','VP9_HIDDEN_FRAME_REFUSED','VP9_KEY_SYNC','VP9_4K_REQUIRED'}
+    return code if code in allowed else'CAPTURE_UNCONFIRMED'
+
+def run(trial,page,owner,xvfb,refresh,*,clock=time.monotonic,ns=time.monotonic_ns):
+    need(callable(refresh)and trial.capture_allowed()and trial.page_ready and trial.encoder is None,'CAPTURE_ADMISSION')
+    out={'schema':1,'kind':'authored-private-vp9-acquisition-clock','complete':False,'failure':None,'ownerChecks':0,'maxObserverCheckMs':0,'readerJoined':False,'animationStarted':False,'animationCleared':False,'animation':None,'encoderExit':None,'encoderReaped':False,'metrics':None,'personalDisplayCaptured':False,'TVContacted':False,'browserLive60Qualified':False,'endToEndLatencyQualified':False}
+    mapping=ClockMap(mono=ns);parser=Stream(mapping);child=None;reader=None;started=clock();end=min(started+DEADLINE,trial.deadline);identity=None
+    done=threading.Event();cancel=threading.Event();read_result={'failure':None,'exit':None,'elapsedMs':None,'calls':0}
+    # The reader owns parser state exclusively until joined. The main thread runs
+    # real owner/CDP/audio checks independently, so they cannot fill this pipe.
+    # No frame queue: one <=64 KiB read plus a <=64-byte header prefix only.
+    def drain():
+        try:
+            fd=child.stdout.fileno();os.set_blocking(fd,False)
+            while True:
+                need(clock()<end and not cancel.is_set()and not trial.stop.is_set()and trial.capture_allowed(),'CAPTURE_DEADLINE')
+                if not select.select([fd],[],[],min(.05,max(0,end-clock())))[0]:continue
+                try:block=os.read(fd,MAX_READ)
+                except BlockingIOError:continue
+                if not block:break
+                read_result['calls']+=1;mapping.sample();parser.feed(block,ns())
+            parser.finish();need(clock()<end and trial.capture_allowed()and not cancel.is_set(),'CAPTURE_DEADLINE')
+            read_result['exit']=child.wait(timeout=min(1,max(.001,end-clock())))
+            need(read_result['exit']==0,'CAPTURE_ENCODER_EXIT')
+        except BaseException as error:read_result['failure']=failure(error)
+        finally:
+            read_result['elapsedMs']=round((clock()-started)*1000);done.set()
+    def observe(sample):
+        before=clock();refresh();need(clock()<end and trial.capture_allowed(),'CAPTURE_DEADLINE')
+        need(authority(trial)[1]==identity and owner.live(xvfb.pid),'CAPTURE_AUTHORITY_CHANGED')
+        out['ownerChecks']+=1
+        if sample:
+            out['animation']=animation(evaluate(page,SAMPLE,end));need(not out['animation']['ended'],'CAPTURE_ANIMATION_ENDED')
+        out['maxObserverCheckMs']=max(out['maxObserverCheckMs'],round((clock()-before)*1000))
+    try:
+        need(evaluate(page,START,end)is True,'CAPTURE_ANIMATION_START');out['animationStarted']=True
+        env,identity=authority(trial);need(xvfb in owner.processes and owner.live(xvfb.pid),'CAPTURE_DISPLAY_OWNER')
+        observe(False)
+        # Recheck the same authority identity immediately before spawn, not a new
+        # baseline after potentially slow ownership checks.
+        need(authority(trial)[1]==identity,'CAPTURE_AUTHORITY_CHANGED')
+        mapping.sample() # actual clock anchor immediately before this owned spawn
+        child=trial.spawn(command(trial.display),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,env=env);trial.encoder=child
+        reader=threading.Thread(target=drain,name='r2d2-vp9-counter',daemon=True);reader.start();next_check=clock()+1
+        while not done.wait(.025):
+            need(clock()<end and not trial.stop.is_set()and trial.capture_allowed(),'CAPTURE_DEADLINE')
+            if clock()>=next_check:observe(True);next_check=clock()+1
+        reader.join(timeout=.1);need(not reader.is_alive(),'CAPTURE_READER_JOIN');out['readerJoined']=True
+        out['encoderExit']=read_result['exit'];need(read_result['failure']is None,read_result['failure']or'CAPTURE_UNCONFIRMED')
+        observe(True);mapping.sample();need(out['animation']['frames']>=120,'CAPTURE_ANIMATION_ENDED');out['complete']=True
+    except BaseException as error:out['failure']=failure(error)
+    finally:
+        cancel.set()
+        if child is not None:
+            try:
+                owner.terminate(child)
+                try:child.wait(timeout=2)
+                except subprocess.TimeoutExpired:pass
+                out['encoderReaped']=child.poll()is not None
+            except Exception:pass
+        if reader is not None:
+            reader.join(timeout=2);out['readerJoined']=not reader.is_alive()
+        # Never close the reader's FD or inspect/mutate its parser concurrently.
+        # The enclosing Trial still owns process-tree cleanup if join fails.
+        if reader is None or out['readerJoined']:
+            if child is not None and child.stdout:child.stdout.close()
+            out['metrics']=parser.result(read_result['elapsedMs']if read_result['elapsedMs']is not None else round((clock()-started)*1000))
+            out['metrics']['readCalls']=read_result['calls'];parser.close()
+        if out['animationStarted']:
+            try:out['animationCleared']=evaluate(page,CLEAR,min(trial.deadline,clock()+2))is True
+            except Exception:pass
+        if not out['encoderReaped']or not out['readerJoined']or not out['animationCleared']:
+            out['complete']=False;out['failure']=out['failure']or'CAPTURE_CLEANUP_UNCONFIRMED'
+    return out

@@ -1,0 +1,16 @@
+import json,subprocess,unittest
+import session_page as sp
+SCRIPT=r'''const fs=require('fs'),vm=require('vm'),v=JSON.parse(fs.readFileSync(0,'utf8'));let called=0;
+const videos=Array.from({length:v.n},(_,i)=>({videoWidth:3840,videoHeight:2160,readyState:4,networkState:2,paused:false,seeking:false,ended:false,error:i===1?{code:3,message:'SECRET'}:null,currentSrc:'SECRET',getVideoPlaybackQuality:v.noQuality?undefined:function(){called++;if(v.throws)throw Error('SECRET');return {totalVideoFrames:600+i,droppedVideoFrames:i}}}));
+let result;try{result=vm.runInNewContext(v.expression,{document:{querySelectorAll:q=>{if(q!=='video')throw Error('scope');return videos;}}});}catch(e){result=null;}process.stdout.write(JSON.stringify({result,called}));'''
+class Tests(unittest.TestCase):
+ def evaluate(self,**kw):
+  proc=subprocess.run(['node','-e',SCRIPT],input=json.dumps(dict(expression=sp.VIDEO_HEALTH_EXPRESSION,**kw)).encode(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5)
+  self.assertEqual(proc.returncode,0);return json.loads(proc.stdout)
+ def test_zero_one_two_and_many_elements_are_bounded_and_payload_free(self):
+  for n in (0,1,2,4,100):
+   value=self.evaluate(n=n);result=sp.scalar_video_health(value['result']);self.assertEqual(len(result['videos']),min(n,4));self.assertEqual(value['called'],min(n,4));self.assertNotIn('SECRET',json.dumps(result))
+   if n>=2:self.assertEqual(result['videos'][1]['errorCode'],3)
+ def test_missing_quality_or_native_exception_is_unavailable(self):
+  for kw in ({'noQuality':True},{'throws':True}):self.assertIsNone(self.evaluate(n=2,**kw)['result'])
+if __name__=='__main__':unittest.main(verbosity=2)

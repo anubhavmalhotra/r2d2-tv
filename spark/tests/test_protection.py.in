@@ -1,0 +1,126 @@
+"""Own activation and integrated popup controls, no browser/network/sockets."""
+import ast,copy,json,threading,time,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock,patch
+import protection as p
+import popup_census as c
+import trial as t
+from test_tabs import Model
+
+EXTENSION='gcobobiiepkciglmjkdcdglpmahflbho'
+class ProofPage:
+    def __init__(self):
+        self.context='private';self.target='own';self.session='owned';self.start_url='http://127.0.0.1/local';self.url=self.start_url;self.calls=[];self.deadline=0;self.proof=copy.deepcopy(p.PROOF);self.local={'local':True,'loaded':True};self.restore_count=0;self.history=True;self.nav_error=False
+    def assert_alive(self):self.calls.append(('assert',{}));self.deadline=time.monotonic()+2
+    def _remaining(self):
+        if time.monotonic()>self.deadline:raise p.ProofError('CDP_TIMEOUT')
+    def _call(self,m,v,session=False):
+        self.calls.append((m,copy.deepcopy(v)))
+        if m=='Page.navigate':
+            self.url=v['url']
+            if self.nav_error:return {'errorText':'PRIVATE_NOT_EXPORTED'}
+            return {'frameId':'frame'}
+        if m=='Page.resetNavigationHistory':self.restore_count+=1;return {}
+        if m=='Page.getNavigationHistory':return {'currentIndex':0,'entries':[{'url':self.start_url}] if self.history else [{'url':'chrome-extension://private'}]}
+        raise AssertionError(m)
+    def _evaluate(self,exp):return self.proof if 'r2d2ProtectionProof' in exp else self.local
+
+class ActivationTests(unittest.TestCase):
+    def test_same_target_restore_history_and_all_flags(self):
+        page=ProofPage();self.assertEqual(p.prove(page,EXTENSION),dict.fromkeys(p.FIELDS,True));self.assertEqual(page.restore_count,1)
+        self.assertEqual([v['url']for m,v in page.calls if m=='Page.navigate'],['chrome-extension://'+EXTENSION+'/proof.html',page.start_url]);self.assertEqual((page.context,page.target,page.session),('private','own','owned'))
+        with self.assertRaisesRegex(p.ProofError,'PROTECTION_SCOPE'):p.prove(page,EXTENSION)
+    def test_missing_incognito_ruleset_and_bool_forgery_refuse(self):
+        for key in p.PROOF:
+            page=ProofPage();page.proof[key]=False if type(page.proof[key])is not bool else 1
+            with patch.object(p.time,'sleep'),self.assertRaisesRegex(p.ProofError,'PROTECTION_NOT_PROVED'):p.prove(page,EXTENSION)
+            self.assertFalse(hasattr(page,'protection_preflight'))
+    def test_local_commit_before_history_reset(self):
+        page=ProofPage();page.local={'local':False,'loaded':True}
+        with patch.object(p.time,'sleep'),self.assertRaisesRegex(p.ProofError,'PROTECTION_NOT_PROVED'):p.prove(page,EXTENSION)
+        self.assertEqual(page.restore_count,0)
+    def test_nav_failure_no_retry_or_error_export(self):
+        page=ProofPage();page.nav_error=True
+        with self.assertRaisesRegex(p.ProofError,'PROTECTION_NAVIGATION'):p.prove(page,EXTENSION)
+        self.assertEqual(sum(m=='Page.navigate'for m,_ in page.calls),1)
+        with self.assertRaisesRegex(p.ProofError,'PROTECTION_SCOPE'):p.prove(page,EXTENSION)
+    def test_foreign_history_refused(self):
+        page=ProofPage();page.history=False
+        with self.assertRaisesRegex(p.ProofError,'PROTECTION_HISTORY'):p.prove(page,EXTENSION)
+    def test_context_switch_refused(self):
+        page=ProofPage();original=page.assert_alive;n=[0]
+        def alive():
+            original();n[0]+=1
+            if n[0]==2:page.context='foreign'
+        page.assert_alive=alive
+        with self.assertRaisesRegex(p.ProofError,'PROTECTION_OWNER_CHANGED'):p.prove(page,EXTENSION)
+    def test_runtime_startup_order_and_unchanged_audio_path(self):
+        source=(Path(t.__file__)).read_text();tree=ast.parse(source);main=next(x for x in tree.body if isinstance(x,ast.FunctionDef)and x.name=='main');calls=[x for x in ast.walk(main) if isinstance(x,ast.Call)]
+        named=lambda n:sorted(x.lineno for x in calls if isinstance(x.func,ast.Name)and x.func.id==n)
+        self.assertLess(named('PrivateProfile')[0],named('prepare_protection')[0]);self.assertLess(named('prepare_protection')[0],named('browser_launch')[0]);self.assertLess(named('prove_protection')[0],named('audio_preflight')[0])
+        launch=next(x for x in calls if isinstance(x.func,ast.Name)and x.func.id=='browser_launch');self.assertEqual(launch.args[0].id,'protection')
+        self.assertIn("'protection_preflight':trial.protection_preflight",source)
+    def test_pin_or_sandbox_failure_cannot_resume_input(self):
+        trial=Mock();trial.layout.height=2160;owner=Mock();owner.sandbox.return_value={'passed':True}
+        good={'pinned':True,'pin_valid':True,'focused':True,'matched':1,'after':{'width':3840,'height':2160}}
+        trial.worker_command.return_value=good;self.assertTrue(t.prove_popup_window(trial,owner))
+        for key in ('pinned','pin_valid','focused','matched'):
+            bad=copy.deepcopy(good);bad[key]=False;trial.worker_command.return_value=bad
+            with self.assertRaisesRegex(RuntimeError,'POPUP_WINDOW'):t.prove_popup_window(trial,owner)
+        trial.worker_command.return_value=good;owner.sandbox.return_value={'passed':False}
+        with self.assertRaisesRegex(RuntimeError,'POPUP_SANDBOX'):t.prove_popup_window(trial,owner)
+
+class PopupIntegration(unittest.TestCase):
+    def page(self):
+        m=Model();page=m.page();page.popup_lock=threading.RLock();page.popup_restored=Mock(return_value=True);page.start();return m,page
+    def add(self,m,key='popup',context=None,attached=False):m.pages[key]={'url':'https://PRIVATE.invalid/SECRET','context':context or m.context,'attached':attached}
+    def test_more_than32_successes_release_ids_and_preserve_selected(self):
+        m,page=self.page()
+        for i in range(100):
+            self.add(m,'popup'+str(i));self.assertTrue(page.assert_alive());self.assertFalse(page.popup_guard.attempted)
+        self.assertEqual(page.popup_guard.closed,100);self.assertEqual(page.popup_guard.attempt_count,100);self.assertEqual(len(m.pages),1);self.assertEqual(page.popup_restored.call_count,100)
+        self.assertNotIn('PRIVATE',json.dumps(page.evidence()));self.assertEqual(len([x for x in m.calls if x[0]=='Target.closeTarget']),100)
+    def test_manual_newtab_adopted_and_not_closed(self):
+        m,page=self.page();page.tab_command({'action':'new'},lambda:True)
+        self.assertEqual(len(page.tabs),2);self.assertEqual(page.popup_guard.closed,0);self.assertFalse(any(x[0]=='Target.closeTarget'for x in m.calls))
+    def test_close_lost_reply_never_replayed(self):
+        m,page=self.page();self.add(m);original=page._call
+        def lost(method,params,session=False):
+            value=original(method,params,session)
+            if method=='Target.closeTarget':raise TimeoutError('fixed')
+            return value
+        page._call=lost
+        with self.assertRaises(TimeoutError):page.assert_alive()
+        self.assertEqual(page.popup_guard.attempted,{'popup'})
+        with self.assertRaisesRegex(c.PopupError,'NO_REPLAY'):page.assert_alive()
+        self.assertEqual(sum(x[0]=='Target.closeTarget'for x in m.calls),1)
+    def test_foreign_or_attached_target_never_deleted(self):
+        for foreign,attached in ((True,False),(False,True)):
+            m,page=self.page();self.add(m,context='foreign'if foreign else None,attached=attached)
+            with self.assertRaises(c.PopupError):page.assert_alive()
+            self.assertFalse(any(x[0]=='Target.closeTarget'for x in m.calls))
+    def test_health_diagnostic_never_closes_popup(self):
+        m,page=self.page();self.add(m);page._video_health_deadline=time.monotonic()+2
+        with self.assertRaises(p.ProofError):page.assert_alive()
+        self.assertFalse(any(x[0]=='Target.closeTarget'for x in m.calls));del page._video_health_deadline
+        self.assertTrue(page.assert_alive())
+    def test_input_lock_held_through_window_proof(self):
+        m,page=self.page();self.add(m);seen=[]
+        class Lock:
+            held=False
+            def __enter__(self):self.held=True
+            def __exit__(self,*args):self.held=False
+        lock=Lock();page.popup_lock=lock;original=page._call
+        def call(method,*args):seen.append(lock.held);return original(method,*args)
+        page._call=call
+        def restore():seen.append(lock.held);return True
+        page.popup_restored=restore;page.assert_alive();self.assertTrue(all(seen));self.assertFalse(lock.held)
+    def test_storm_refuses_without_deleting(self):
+        m,page=self.page()
+        for i in range(5):self.add(m,'popup'+str(i))
+        with self.assertRaises(c.PopupError):page.assert_alive()
+        self.assertFalse(any(x[0]=='Target.closeTarget'for x in m.calls))
+    def test_counter_saturates_without_blocking_valid_close(self):
+        m,page=self.page();page.popup_guard.closed=page.popup_guard.attempt_count=2147483647;self.add(m);page.assert_alive();self.assertEqual(page.popup_guard.closed,2147483647);self.assertFalse(page.popup_guard.attempted);page.popup_restored.assert_called_once()
+if __name__=='__main__':unittest.main()

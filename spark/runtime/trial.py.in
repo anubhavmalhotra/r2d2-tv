@@ -1,0 +1,1402 @@
+"""Finite ordinary-user Chromium/Xvfb/NVENC trial. No installation or existing desktop capture."""
+import argparse
+from collections import deque
+import ctypes
+import http.server
+import json
+import os
+from pathlib import Path
+import platform
+import pwd
+import resource
+import secrets
+import select
+import shutil
+import signal
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+from build_viewer import build
+from media_stream import MediaStream, StreamError, header_identity
+from media_ring import MediaError, Lagged
+from protocol import (SPARK, TV, PORT, WIDTH, HEIGHT, DEVICE_SCALE, ORIGIN, CODEC, KEYS,
+    Budget, MP4Reader, valid_input, valid_metrics, valid_fixture, fixture_ready,
+    parse_json, route_request, valid_navigation, valid_history, valid_tabs, valid_text)
+from layout import valid_height, valid_marker, window_matches, viewport_matches
+from window_fit import fit_fixture as fit_owned_fixture
+from layout_runtime import (init_layout, busy as layout_busy, queue_layout, queue_seen,
+    queue_network_input, service_layout, native_preflight as layout_preflight, scroll_preflight)
+from process_owner import ProcessOwner
+from private_profile import PrivateProfile
+from profile_stage import prepare as prepare_protection
+from protection import prove as prove_protection
+from private_audio import PrivateAudio
+from audio import ffmpeg_args, browser_launch
+from audio_preflight import audio_preflight, owns_browser_audio
+from dns_proof import DnsProof, ProofError
+from session_page import presented
+from direct_editor import (DirectSession as SessionPage, init_direct, invalidate_direct,
+    direct_snapshot, queue_direct, queue_presentation, service_direct, empty)
+from viewer_voice import ViewerVoice, NativeMailbox, valid_command as valid_voice_command
+from voice_card import VoiceCard
+
+class OwnedDisplay:
+    def __init__(self, display):
+        self.x11 = ctypes.CDLL("libX11.so.6")
+        self.xtst = ctypes.CDLL("libXtst.so.6")
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+        self.x11.XStringToKeysym.restype = ctypes.c_ulong
+        self.x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        self.x11.XKeysymToKeycode.restype = ctypes.c_uint
+        self.x11.XFlush.argtypes = [ctypes.c_void_p]
+        self.x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self.x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+        self.xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+        self.handle = self.x11.XOpenDisplay(display.encode())
+        if not self.handle:
+            raise RuntimeError("private X display unavailable")
+        self.lock = threading.Lock()
+        self.fixture_window = None
+        self.fixture_nonce = None
+
+    def send(self, body):
+        if not valid_input(body):
+            raise ValueError("input refused")
+        with self.lock:
+            if not self.handle:
+                raise RuntimeError("private display closed")
+            if body["kind"] == "key":
+                symbol = self.x11.XStringToKeysym(KEYS[body["key"]].encode())
+                code = self.x11.XKeysymToKeycode(self.handle, symbol)
+                if not code:
+                    raise RuntimeError("key unavailable")
+                pressed = self.xtst.XTestFakeKeyEvent(self.handle, code, 1, 0)
+                released = self.xtst.XTestFakeKeyEvent(self.handle, code, 0, 0)
+                if not pressed or not released:
+                    raise RuntimeError('PRIVATE_KEY_FAILED')
+            else:
+                x, y = round(body["x"] * (WIDTH - 1)), round(body["y"] * (HEIGHT - 1))
+                if not self.xtst.XTestFakeMotionEvent(self.handle, -1, x, y, 0):
+                    raise RuntimeError('PRIVATE_MOTION_FAILED')
+                if body['kind']=='wheel':
+                    button=5 if body['deltaY']>0 else 4
+                    for _ in range(max(1,min(10,round(abs(body['deltaY'])/120)))):
+                        if not self.xtst.XTestFakeButtonEvent(self.handle,button,1,0) or not self.xtst.XTestFakeButtonEvent(self.handle,button,0,0):
+                            raise RuntimeError('PRIVATE_WHEEL_FAILED')
+                elif body["click"]:
+                    pressed = self.xtst.XTestFakeButtonEvent(self.handle, 1, 1, 0)
+                    released = self.xtst.XTestFakeButtonEvent(self.handle, 1, 0, 0)
+                    if not pressed or not released:
+                        raise RuntimeError('PRIVATE_CLICK_FAILED')
+            self.x11.XSync(self.handle, 0)
+
+    def close(self):
+        with self.lock:
+            if self.handle:
+                self.x11.XCloseDisplay(self.handle)
+                self.handle = None
+
+    fit_fixture = fit_owned_fixture
+
+
+FIXTURE = """<!doctype html><html><head><meta charset=utf-8>
+<meta http-equiv=Content-Security-Policy content="default-src 'none';style-src 'unsafe-inline';script-src 'unsafe-inline';connect-src 'self'">
+<title>R2D2 Chromium 4K trial</title><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color:#ddd;font:48px sans-serif}main{padding:96px}h1{font-size:104px;margin:24px 0}p{margin:26px 0}#controls{position:absolute;left:96px;top:620px;display:flex;gap:36px}button{width:300px;height:168px;font:48px sans-serif;background:#000;color:#ddd;border:3px solid #555;border-radius:18px}button:focus{outline:none;border:6px solid white;color:white}#result{position:absolute;left:96px;top:850px;font-size:48px}#ball{position:absolute;bottom:80px;width:20px;height:20px;border-radius:50%;background:#555}#resolution{font-size:44px;color:#999}</style></head><body><main><h1>R2D2</h1><p>Private browser · 4K</p><p id=resolution></p><p>Use arrows and OK, or point and click.</p></main><div id=controls><button id=a>One</button><button id=b>Two</button><button id=c>Three</button></div><p id=result>Ready for input</p><div id=ball></div><script>
+const endpoint=location.pathname.replace(/fixture$/,'fixture-metrics');let keys=0,clicks=0,moves=0,selection=0;const buttons=[...document.querySelectorAll('button')];buttons[0].focus();
+function report(){fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,inputCount:keys+clicks,keyCount:keys,clickCount:clicks,moveCount:moves,selection:selection})}).catch(()=>{});}
+function act(){document.getElementById('result').textContent='Received '+keys+' keys · '+clicks+' clicks';report();}
+buttons.forEach((b,i)=>b.onclick=()=>{selection=i;clicks++;act()});addEventListener('mousemove',()=>{moves++});addEventListener('keydown',e=>{if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Enter','Escape'].includes(e.key)){e.preventDefault();keys++;if(e.key.indexOf('Arrow')===0)selection=(selection+(e.key==='ArrowRight'||e.key==='ArrowDown'?1:2))%3;buttons[selection].focus();act()}});
+function size(){document.getElementById('resolution').textContent=innerWidth+' × '+innerHeight;report()}size();addEventListener('resize',size);setInterval(report,1000);function tick(t){document.getElementById('ball').style.left=(96+(t/8)%(innerWidth-200))+'px';requestAnimationFrame(tick)}requestAnimationFrame(tick);
+</script></body></html>"""
+
+START_PAGE = b'''<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>R2D2 private browser</title><style>html,body{margin:0;background:#000;color:#eee;width:100%;height:100%;font:48px sans-serif}main{padding:140px}h1{font-size:110px}p{max-width:2300px}</style></head><body><main><h1>R2D2</h1><p>Private Chromium on Spark</p><p>Enter a website or search in the address bar above.</p><p>Back shows browser controls. Close browser returns to R2D2.</p></main></body></html>'''
+
+
+def pipe_read(fd, count, deadline, stop):
+    while not stop.is_set() and time.monotonic() < deadline:
+        if select.select([fd], [], [], min(0.2, max(0, deadline - time.monotonic())))[0]:
+            return os.read(fd, count)
+    raise TimeoutError('PIPE_DEADLINE')
+
+def line_read(fd, deadline, stop, maximum=256):
+    result = bytearray()
+    while len(result) < maximum:
+        part = pipe_read(fd, 1, deadline, stop)
+        if not part:
+            raise ValueError('HANDSHAKE_EOF')
+        if part == b'\n':
+            return bytes(result)
+        result.extend(part)
+    raise ValueError('HANDSHAKE_LIMIT')
+
+def authority_record(number, cookie):
+    # Xserver LoadAuthorization consumes every protocol/data entry from -auth.
+    # The display number is the client-side selection label, not server startup selection.
+    fields = [socket.gethostname().encode(), str(number).encode(), b'MIT-MAGIC-COOKIE-1', cookie]
+    return struct.pack('>H', 256) + b''.join(struct.pack('>H', len(v)) + v for v in fields)
+
+def write_private(path, data):
+    with open(path, 'xb') as f:
+        os.chmod(path, 0o600)
+        f.write(data)
+
+def input_worker(display, probe=False):
+    if not __import__('re').fullmatch(r':[0-9]{1,5}', display):
+        return 2
+    d = OwnedDisplay(display)
+    d.x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    d.x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    geometry = [d.x11.XDisplayWidth(d.handle, 0), d.x11.XDisplayHeight(d.handle, 0)]
+    print(json.dumps({'geometry': geometry}), flush=True)
+    try:
+        if probe:
+            return 0
+        while True:
+            line = sys.stdin.buffer.readline(257)
+            if not line:
+                break
+            if len(line) > 256 or not line.endswith(b'\n'):
+                return 2
+            body = parse_json(line)
+            if body == {'kind': 'fit-fixture'}:
+                print(json.dumps(d.fit_fixture()), flush=True)
+                continue
+            if body == {'kind': 'focus-fixture'}:
+                print(json.dumps(d.fit_fixture(focus=True)), flush=True)
+                continue
+            if type(body) is dict and set(body)=={'kind','height','marker'} and body['kind']=='layout-fixture' and valid_height(body['height']) and valid_marker(body['marker']):
+                print(json.dumps(d.fit_fixture(focus=True,height=body['height'],marker=body['marker'])),flush=True)
+                continue
+            if type(body) is dict and set(body)=={'kind','marker'} and body['kind']=='layout-seen' and valid_marker(body['marker']):
+                pin=d.fit_fixture(focus=True)
+                if not window_matches(pin,getattr(d,'fixture_height',HEIGHT),True) or not getattr(d,'layout_overlays',None):raise RuntimeError('LAYOUT_CLEAR_OWNER')
+                print(json.dumps(d.layout_overlays.clear(body['marker'])),flush=True)
+                continue
+            if not valid_input(body):
+                return 2
+            d.send(body)
+            kind = 'key' if body['kind'] == 'key' else 'wheel' if body['kind']=='wheel' else 'click' if body['click'] else 'move'
+            print(json.dumps({'applied': kind}), flush=True)
+    finally:
+        d.close()
+    return 0
+
+# Stream socket tuning (stream.mp4 only; best effort, never fails a stream).
+# TCP_NODELAY: fragment tails are not held back waiting for an ACK.
+# TCP_NOTSENT_LOWAT: keep at most ~128 KiB (~40 ms at 25 Mbit/s) unsent in the
+#   kernel instead of up to tcp_wmem max (4 MiB, ~1.3 s), so a slow consumer is
+#   visible to the write deadline and to the lag policy below.
+# IP_TOS 0x88 (DSCP AF41): maps to the WMM video access category on any Wi-Fi hop.
+TCP_NOTSENT_LOWAT = getattr(socket, 'TCP_NOTSENT_LOWAT', 25)
+STREAM_NOTSENT_LOWAT = 131072
+STREAM_TOS = 0x88
+# Server-side latency bound: a consumer more than this many media seconds
+# behind the newest published fragment jumps to the newest IDR group instead of
+# falling further behind until Lagged/disconnect. The receiver seeks the gap.
+STREAM_MAX_BEHIND = 3.0
+# With a small unsent queue a blocked send waits on the network itself, so the
+# stream socket gets the same 4 s tolerance as the per-fragment write deadline
+# (the installed 2 s timeout plus a ~1.3 s kernel queue gave ~3.3 s before).
+STREAM_SOCKET_TIMEOUT = 4.0
+
+def tune_stream_socket(sock):
+    sock.settimeout(STREAM_SOCKET_TIMEOUT)
+    for level, name, value in ((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+                               (socket.IPPROTO_TCP, TCP_NOTSENT_LOWAT, STREAM_NOTSENT_LOWAT),
+                               (socket.IPPROTO_IP, socket.IP_TOS, STREAM_TOS)):
+        try:
+            sock.setsockopt(level, name, value)
+        except OSError:
+            pass
+
+# Encoder rate preset (audio.VIDEO_RATE_CONTROL) and optional scalar progress
+# counters, both owner-set through the service environment. Defaults = installed.
+VIDEO_MBPS = int(os.environ.get('R2D2_VIDEO_MBPS', '25')) if os.environ.get('R2D2_VIDEO_MBPS', '25') in ('25', '30', '38') else 25
+ENCODER_PROGRESS = os.environ.get('R2D2_ENCODER_PROGRESS') == '1'
+
+class BoundedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 4
+    # Restart after owned TCP TIME_WAIT; no SO_REUSEPORT, live listener stays exclusive.
+    allow_reuse_address = True
+    allow_reuse_port = False
+
+    def __init__(self, address, handler):
+        self.slots = threading.BoundedSemaphore(6)
+        self.active = set()
+        self.active_lock = threading.Lock()
+        super().__init__(address, handler)
+
+    def verify_request(self, request, address):
+        return address[0] in (SPARK, TV)
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(False):
+            self.shutdown_request(request)
+            return
+        with self.active_lock:
+            self.active.add(request)
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            with self.active_lock:
+                self.active.discard(request)
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            with self.active_lock:
+                self.active.discard(request)
+            self.slots.release()
+
+    def handle_error(self, request, address):
+        pass  # Never log URLs/tokens or untrusted request data.
+
+    def close_connections(self):
+        with self.active_lock:
+            for connection in list(self.active):
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+class Trial:
+    def __init__(self, run, token, owner, display_transport="webrtc"):
+        self.run, self.token, self.owner = run, token, owner
+        self.viewer = build(token, CODEC, history_enabled=True, tabs_enabled=True, text_enabled=True, audio_enabled=True, layout_enabled=True, fixed_viewport=True, ring_enabled=True, transport=display_transport)
+        self.deadline = float('inf')
+        self.stop = threading.Event()
+        self.lock = threading.RLock()
+        self.fixture, self.sandbox, self.input = None, None, None
+        self.display, self.env, self.error = None, None, None
+        self.audio = self.audio_graph = self.browser = self.encoder = None
+        self.audio_lock = threading.RLock()
+        self.audio_preflight = self.audio_cleanup = None
+        self.protection_preflight = None
+        self.metrics, self.inputs = [], 0
+        self.input_thread = None
+        self.input_actions, self.input_motion = deque(), None
+        self.input_wake = threading.Condition(self.lock)
+        self.input_io_lock = threading.RLock()
+        self.input_epoch = 0
+        self.input_stats = {'actionsQueued': 0, 'movesQueued': 0, 'movesCoalesced': 0, 'movesDiscardedForAction': 0,
+                            'keyApplied': 0, 'wheelApplied': 0, 'clickApplied': 0, 'moveApplied': 0, 'rejected': 0}
+        self.input_preflight = {'qualified': False}
+        self.window_focus = None
+        self.stream_started, self.stream_bytes, self.stream_fragments = False, 0, 0
+        self.stream_finished = False
+        self.stream_client_closed = False
+        self.action_budget = Budget(12, 10**9)
+        # Viewer pacing is at most 60 pointer / 30 coalesced wheel sends per
+        # second. Allow 50% ACK/network bunching without spending key/click
+        # capacity; pending motion and the shared action FIFO remain bounded.
+        self.motion_budget, self.wheel_budget = Budget(90, 10**9), Budget(45, 10**9)
+        self.metric_budget = Budget(4, 10**9)
+        self.fixture_budget, self.get_budget = Budget(25, 800), Budget(12, 10**9)
+        self.tab_get_budget = Budget(6, 10**9)
+        self.tab_state = None
+        self.tab_preflight = None
+        self.keyboard_preflight = None
+        self.direct_preflight = None
+        self.scroll_preflight = self.fullscreen_preflight = None
+        self.editor_state={'state':'pending','kind':None,'multiline':None,'focusId':None}
+        self.editor_identity=None;self.editor_revision=0;self.editor_probe_at=0
+        self.editor_probe_requested=False;self.editor_pending=None;self.editor_active=False
+        self.editor_result=None;self.editor_ids=set()
+        self.editor_get_budget=Budget(6,10**9);self.editor_budget=Budget(2,10**9)
+        self.xauth = {'authorized_private_display': False, 'wrong_cookie_rejected': False}
+        self.window_fit = []
+        self.privacy = None
+        self.effective_dns = None
+        self.fixture_accepting = True
+        self.fixture_preflight = None
+        self.page_ready = False
+        self.initial_page_proved = False
+        self.page_samples = []
+        self.source_video_health = []
+        self.source_video_clock = time.monotonic()
+        self.page_evidence = None
+        self.page_window = None
+        self.navigation_pending = None
+        self.navigation_active = False
+        self.navigation_budget = Budget(1, 10**9)
+        self.navigation_counts = {'accepted': 0, 'completed': 0, 'rejected': 0}
+        self.last_viewer_heartbeat = None
+        self.ready_at = None
+        self.owner_verified_at = None
+        self.close_reason = None
+        self.agent_close_requested = False
+        self.agent_close_deadline = None
+        self.metrics_total = 0
+        init_direct(self)
+        init_layout(self)
+        self.direct_get_budget = Budget(8, 10**9)
+        self.presentation_get_budget = Budget(4, 10**9)
+        self.presentation_budget = Budget(2, 10**9)
+        self.layout_get_budget = Budget(6, 10**9)
+        self.display_transport = display_transport
+        self.rtc_audio = None
+        from display_transport import create
+        self.media_stream = create(self, display_transport)
+        # The mailbox becomes ready only through the authenticated inherited
+        # Manager channel carrying a fresh, independently signed TV-owner ACK.
+        self.voice_adapter = NativeMailbox()
+        self.voice = ViewerVoice(self.voice_allowed, continuing=self.voice_continuing, adapter=self.voice_adapter)
+        self.voice_get_budget, self.voice_budget = Budget(4, 10000), Budget(6, 1024)
+        # Closed receipt pushed by the same channel, served only in heartbeat replies.
+        self.voice_card = VoiceCard()
+
+    def voice_binding(self, identity):
+        if not isinstance(identity, dict):
+            return None
+        return identity['epoch'], identity['generation'], self.input_epoch
+
+    def voice_allowed(self, binding):
+        # Context checks run outside ViewerVoice's lock. Voice media admission
+        # takes its lock nonblocking and never calls Trial or initiates shutdown.
+        now = time.monotonic()
+        anchor = self.last_viewer_heartbeat if self.last_viewer_heartbeat is not None else self.ready_at
+        return (type(binding) is tuple and len(binding) == 3 and binding[2] == self.input_epoch and
+                not self.stop.is_set() and now < self.deadline and self.page_ready and
+                (self.agent_close_deadline is None or now < self.agent_close_deadline) and
+                self.owner_verified_at is not None and now-self.owner_verified_at <= 5 and
+                (anchor is None or now-anchor <= 15) and self.navigation_pending is None and not self.navigation_active and
+                self.media_stream.permits_voice({'epoch':binding[0], 'generation':binding[1]}))
+
+    def voice_continuing(self, binding):
+        # After explicit release the existing ingress/AgentController owns fresh
+        # pre-action validation. Its own navigation changes the page epoch; keep
+        # only this original Trial/owner lifetime and heartbeat for result wait.
+        now = time.monotonic()
+        anchor = self.last_viewer_heartbeat if self.last_viewer_heartbeat is not None else self.ready_at
+        return (not self.stop.is_set() and now < self.deadline and self.owner_verified_at is not None and
+                (self.agent_close_deadline is None or now < self.agent_close_deadline) and
+                now-self.owner_verified_at <= 5 and (anchor is None or now-anchor <= 15))
+
+    def capture_exchange(self, body):
+        # Called only by the existing authenticated inherited control host.
+        # Revoke expired ownership before exposing a pending start/release,
+        # atomically with HTTP admission but without holding the Trial lock.
+        return self.voice.exchange(body)
+
+    def voice_card_exchange(self, body):
+        # Called only by the authenticated inherited control host. The mirror
+        # has its own leaf lock, so the channel thread never waits on Trial.lock.
+        if type(body) is not dict or set(body) != {'card'}:
+            return None
+        return self.voice_card.exchange(body['card'])
+
+    def spawn(self, args, **kwargs):
+        if self.stop.is_set() or time.monotonic() >= self.deadline:
+            raise RuntimeError('TRIAL_DEADLINE')
+        return self.owner.spawn(args, **kwargs)
+
+    def encode(self):
+        with self.audio_lock:
+            if not self.audio or not self.audio_preflight or not self.audio_preflight.get('passed'):
+                raise RuntimeError('AUDIO_STARTUP_UNPROVED')
+            self.audio_graph.assert_alive()
+            progress = str(self.run / 'encoder-progress') if ENCODER_PROGRESS else None
+            self.encoder = self.spawn(ffmpeg_args(self.display,self.audio,lower_delay=True,bitrate_mbps=VIDEO_MBPS,progress_path=progress), env=self.env, stdout=subprocess.PIPE)
+            return self.encoder
+
+    def read_media(self, encoder, count):
+        data = pipe_read(encoder.stdout.fileno(), count,
+                         min(self.deadline, time.monotonic()+5), self.stop)
+        return data
+
+    def finish_media(self, encoder):
+        self.owner.terminate(encoder)
+        encoder.stdout.close()
+        self.stream_finished = True
+
+    def media_open(self, body):
+        with self.lock:
+            if (not self.page_ready or not self.capture_allowed() or not self.sandbox or
+                not self.sandbox['passed'] or not self.input or not self.input_preflight['qualified'] or
+                not self.effective_dns or not self.effective_dns['qualified']):
+                raise StreamError('STARTUP_NOT_PROVED')
+        # Serialize generation changes with page-action admission and X dispatch.
+        # Do not hold self.lock across media_stream.open(body), because the first
+        # open waits for the producer thread to publish init + first IDR, and the
+        # producer's capture_allowed() check acquires self.lock via viewer_expired().
+        with self.input_io_lock:
+            value = self.media_stream.open(body)
+            with self.input_wake:
+                self.input_epoch += 1
+                self.input_actions.clear(); self.input_motion = None
+                self.invalidate_text()
+                self.stream_started = True
+            return value
+
+    def check_audio(self):
+        with self.audio_lock:
+            self.audio_graph.assert_alive()
+            self.owner.discover()
+            self.audio.verify(lambda pid: owns_browser_audio(self.owner,self.browser,pid),
+                lambda pid: (self.rtc_audio.owns_capture(pid) if self.display_transport=="webrtc" and self.rtc_audio is not None else
+                    self.encoder is not None and pid==self.encoder.pid and self.owner.live(pid)))
+
+    def request_stop(self, reason):
+        if hasattr(self, 'voice'):
+            self.voice.close()
+        if hasattr(self, 'voice_card'):
+            self.voice_card.close()
+        if hasattr(self, 'media_stream'):
+            if self.display_transport == 'webrtc': self.media_stream.request_stop()
+            else: self.media_stream.cancel.set()
+        if reason not in ('viewer-ended','agent-ended','viewer-heartbeat-lost','owner-lost','owner-proof-expired','signal','deadline','runtime-ended'):
+            reason='runtime-ended'
+        with self.input_wake:
+            if self.close_reason is None:self.close_reason=reason
+            self.page_ready=False
+            self.navigation_pending=None
+            self.tab_state=None
+            self.editor_pending=None;self.editor_result=None;self.editor_ids.clear();self.editor_identity=None
+            self.direct_pending=None;self.direct_state=empty('unavailable');self.direct_records.clear();self.direct_ids.clear();self.direct_result=None;self.direct_probe_requested=False;self.direct_probe_token=object()
+            self.editor_probe_requested=False
+            self.editor_state={'state':'unavailable','kind':None,'multiline':None,'focusId':None}
+            self.input_epoch += 1
+            self.input_actions.clear();self.input_motion=None
+            self.stop.set();self.input_wake.notify_all()
+
+    def check_agent_close(self):
+        with self.lock:
+            expired = self.agent_close_deadline is not None and time.monotonic() >= self.agent_close_deadline
+        if expired and not self.stop.is_set():
+            self.request_stop('agent-ended')
+            return True
+        return False
+
+    def viewer_expired(self):
+        with self.lock:
+            anchor=self.last_viewer_heartbeat if self.last_viewer_heartbeat is not None else self.ready_at
+            return anchor is not None and time.monotonic()-anchor>15
+
+    def capture_allowed(self):
+        if self.stop.is_set() or self.owner_verified_at is None:return False
+        if self.agent_close_deadline is not None and time.monotonic()>=self.agent_close_deadline:
+            self.request_stop('agent-ended');return False
+        if time.monotonic()-self.owner_verified_at>5:
+            self.request_stop('owner-proof-expired');return False
+        if self.viewer_expired():
+            self.request_stop('viewer-heartbeat-lost');return False
+        return True
+
+    def invalidate_text(self):
+        invalidate_direct(self)
+        self.editor_probe_requested=True
+        self.editor_state={'state':'pending','kind':None,'multiline':None,'focusId':None}
+
+    def record_video_health(self, page):
+        # Same 10-second sampling loop; retain only the last 16 scalar samples.
+        sample=page.video_health()
+        elapsed=min(1800000,max(0,int((time.monotonic()-self.source_video_clock)*1000)))
+        self.source_video_health.append(dict(sample,elapsedMs=elapsed))
+        self.source_video_health = self.source_video_health[-16:]
+
+    def text_snapshot(self):
+        with self.lock:
+            if not self.page_ready or self.stop.is_set() or not self.capture_allowed():
+                state={'state':'unavailable','kind':None,'multiline':None,'focusId':None}
+            else:
+                if time.monotonic()-self.editor_probe_at>=2 and not self.editor_pending and not self.editor_active:
+                    self.invalidate_text()
+                state=dict(self.editor_state)
+            state.update({'revision':self.editor_revision,'edit':dict(self.editor_result) if self.editor_result else None})
+            return state
+
+    def queue_text(self, body):
+        if not valid_text(body):return False
+        with self.input_wake:
+            if (not self.page_ready or self.stop.is_set() or not self.capture_allowed() or
+                self.navigation_pending is not None or self.navigation_active or self.editor_pending or self.editor_active or self.direct_pending or self.direct_active or
+                body['id'] in self.editor_ids or self.editor_state.get('state')!='editable' or self.editor_state.get('kind')!='text' or
+                self.editor_state.get('focusId')!=body['focusId'] or not self.editor_budget.take()):return False
+            if body['action'] in ('insert','insert-enter') and not self.editor_state['multiline'] and any(c in body['text'] for c in '\n\t'):return False
+            self.editor_ids.add(body['id'])
+            self.editor_pending=dict(body)
+            self.editor_result={'id':body['id'],'status':'pending'}
+            self.input_epoch+=1
+            self.input_stats['rejected']+=len(self.input_actions)+(self.input_motion is not None)
+            self.input_actions.clear();self.input_motion=None
+            self.editor_state={'state':'pending','kind':None,'multiline':None,'focusId':None}
+            return True
+
+    def queue_navigation(self, body):
+        if not valid_navigation(body):return False
+        return self.queue_page_action(body['url'])
+
+    def queue_history(self, body):
+        if not valid_history(body):return False
+        return self.queue_page_action(dict(body))
+
+    def queue_media_key(self):
+        return self.queue_page_action({'voice': 'media_key'})
+
+    def queue_end(self):
+        with self.lock:
+            if not self.page_ready or self.stop.is_set():
+                return False
+            self.agent_close_requested = True
+            if self.agent_close_deadline is None:
+                self.agent_close_deadline = time.monotonic() + 8
+            return True
+
+    def queue_tabs(self, body):
+        if not valid_tabs(body): return False
+        with self.lock:
+            state = self.tab_state
+            if not state: return False
+            if body['action'] == 'new' and len(state['tabs']) >= 8: return False
+            if body['action'] != 'new' and body['id'] not in {v['id'] for v in state['tabs']}: return False
+            return self.queue_page_action({'tabs': dict(body)})
+
+    def tabs_snapshot(self):
+        with self.lock:
+            if not self.page_ready or self.stop.is_set() or not self.capture_allowed() or self.tab_state is None:
+                return None
+            return {'tabs': [dict(v) for v in self.tab_state['tabs']],
+                    'active': self.tab_state['active'], 'revision': self.tab_state['revision']}
+
+    def queue_page_action(self, action):
+        with self.input_wake:
+            if (not self.page_ready or self.stop.is_set() or self.navigation_pending is not None or self.navigation_active or
+                self.editor_pending is not None or self.editor_active or self.direct_pending is not None or self.direct_active or layout_busy(self) or not self.capture_allowed() or not self.navigation_budget.take()):
+                self.navigation_counts['rejected']+=1
+                return False
+            self.input_epoch += 1
+            self.navigation_pending=action
+            self.invalidate_text()
+            self.navigation_counts['accepted']+=1
+            # Discard motion/actions queued against the old page before navigation.
+            self.input_stats['rejected']+=len(self.input_actions)+(self.input_motion is not None)
+            self.input_actions.clear();self.input_motion=None
+            return True
+
+    def take_navigation(self):
+        with self.lock:
+            value=self.navigation_pending;self.navigation_pending=None
+            if value is not None:self.navigation_active=True
+            return value
+
+    def queue_input(self, body):
+        if not valid_input(body):
+            return False
+        with self.lock:
+            move = body['kind'] == 'point' and not body['click']
+            wheel = body['kind'] == 'wheel'
+            tail = self.input_actions[-1] if wheel and self.input_actions else None
+            coalesce = tail is not None and tail['kind'] == 'wheel' and tail['x'] == body['x'] and tail['y'] == body['y']
+            budget = self.motion_budget if move else self.wheel_budget if wheel else self.action_budget
+            if (not self.input or self.input.poll() is not None or self.stop.is_set() or
+                not self.input_preflight['qualified'] or self.editor_pending is not None or self.editor_active or self.direct_pending is not None or self.direct_active or layout_busy(self) or self.navigation_pending is not None or self.navigation_active or not self.page_ready or not self.capture_allowed() or self.inputs >= 10**9 or
+                (not move and not coalesce and len(self.input_actions) >= (7 if wheel else 8)) or not budget.take()):
+                self.input_stats['rejected'] += 1
+                return False
+            if move:
+                if self.input_motion is not None:
+                    self.input_stats['movesCoalesced'] += 1
+                self.input_motion = dict(body)
+                self.input_stats['movesQueued'] += 1
+            else:
+                if self.input_motion is not None:
+                    self.input_motion = None
+                    self.input_stats['movesDiscardedForAction'] += 1
+                if coalesce:
+                    # Never combine across a key/click or a different scroll
+                    # target. The native event stays within valid_input bounds.
+                    delta = max(-1200, min(1200, tail['deltaY'] + body['deltaY']))
+                    if delta:
+                        tail['deltaY'] = delta
+                    else:
+                        self.input_actions.pop()
+                else:
+                    # Wheel backlogs leave one FIFO slot for the next explicit
+                    # key/click even when pointer targets prevent coalescing.
+                    self.input_actions.append(dict(body))
+                self.input_stats['actionsQueued'] += 1
+            if (body['kind']=='point' and body['click']) or (body['kind']=='key' and body['key']=='Enter'):self.invalidate_text()
+            self.inputs += 1
+            self.input_wake.notify()
+            return True
+
+    def worker_command(self, body, maximum=256):
+        raw = (json.dumps(body, separators=(',', ':')) + '\n').encode()
+        if len(raw) > 256:
+            raise RuntimeError('PRIVATE_INPUT_SIZE')
+        with self.input_io_lock:
+            if os.write(self.input.stdin.fileno(), raw) != len(raw):
+                raise RuntimeError('PRIVATE_INPUT_WRITE')
+            return parse_json(line_read(self.input.stdout.fileno(), time.monotonic() + 3, self.stop, maximum))
+
+    def apply_input(self, body, expected_epoch=None):
+        with self.input_io_lock:
+            with self.lock:
+                if expected_epoch is not None and (expected_epoch != self.input_epoch or
+                    self.navigation_pending is not None or self.navigation_active or self.editor_pending is not None or self.editor_active or self.direct_pending is not None or self.direct_active or layout_busy(self)):
+                    self.input_stats['rejected'] += 1
+                    return None
+            if self.ready_at is not None:
+                if not self.capture_allowed(): raise RuntimeError('PRIVATE_OWNER_OR_VIEWER_LOST')
+                pin = self.worker_command({'kind': 'focus-fixture'}, 2048)
+                if (pin.get('pinned') is not True or pin.get('pin_valid') is not True or
+                    pin.get('focused') is not True or pin.get('matched') != 1 or
+                    pin.get('after', {}).get('width') != WIDTH or pin.get('after', {}).get('height') != self.layout.height):
+                    raise RuntimeError('TAB_INPUT_WINDOW')
+            kind = 'key' if body['kind'] == 'key' else 'wheel' if body['kind']=='wheel' else 'click' if body['click'] else 'move'
+            if self.worker_command(body) != {'applied': kind}:
+                raise RuntimeError('PRIVATE_INPUT_ACK')
+            if (body['kind']=='point' and body['click']) or (body['kind']=='key' and body['key']=='Enter'):
+                with self.lock:self.invalidate_text()
+            return kind
+
+    def prove_input(self):
+        # Called only after own settings target closed; it may have stolen X focus.
+        self.window_focus = self.worker_command({'kind': 'focus-fixture'}, 2048)
+        if self.window_focus.get('matched') != 1 or self.window_focus.get('focused') is not True:
+            raise RuntimeError('PRIVATE_FOCUS_NOT_PROVED')
+        before = dict(self.fixture)
+        self.apply_input({'kind': 'key', 'key': 'ArrowRight'})
+        self.apply_input({'kind': 'point', 'x': 246 * DEVICE_SCALE / (WIDTH-1), 'y': 704 * DEVICE_SCALE / (HEIGHT-1), 'click': True})
+        deadline = min(self.deadline, time.monotonic() + 4)
+        while not self.stop.is_set() and time.monotonic() < deadline:
+            with self.lock:
+                now = dict(self.fixture)
+            if (fixture_ready(now) and now['keyCount'] >= before['keyCount'] + 1 and
+                now['clickCount'] >= before['clickCount'] + 1):
+                self.input_preflight = {'qualified': True,
+                    'keyDelta': now['keyCount'] - before['keyCount'],
+                    'clickDelta': now['clickCount'] - before['clickCount']}
+                return
+            time.sleep(0.05)
+        raise RuntimeError('PRIVATE_DOM_INPUT_NOT_PROVED')
+
+    def start_input_pump(self):
+        def run():
+            body = None
+            try:
+                while not self.stop.is_set() and time.monotonic() < self.deadline:
+                    with self.input_wake:
+                        if self.input_actions:
+                            body = self.input_actions.popleft()
+                            epoch = self.input_epoch
+                        elif self.input_motion is not None:
+                            body, self.input_motion = self.input_motion, None
+                            epoch = self.input_epoch
+                        else:
+                            self.input_wake.wait(timeout=0.1)
+                            continue
+                    kind = self.apply_input(body, expected_epoch=epoch)
+                    body = None
+                    if kind is None: continue
+                    with self.lock:
+                        self.input_stats[kind + 'Applied'] += 1
+            except (OSError, ValueError, RuntimeError, TimeoutError):
+                if not self.stop.is_set():
+                    self.error = 'PRIVATE_INPUT_DISPATCH_FAILED'
+                    self.stop.set()
+            finally:
+                body = None
+                with self.lock:
+                    self.input_actions.clear()
+                    self.input_motion = None
+        self.input_thread = threading.Thread(target=run, name='baaz-private-input', daemon=True)
+        try:
+            self.input_thread.start()
+        except RuntimeError:
+            self.input_thread = None
+            raise RuntimeError('PRIVATE_INPUT_THREAD_START') from None
+
+def prove_popup_window(trial, owner):
+    # Called under input_io_lock immediately after selected-target reactivation.
+    # No CDP recursion and no retarget/re-pin fallback.
+    pin = trial.worker_command({'kind': 'focus-fixture'}, 2048)
+    if (pin.get('pinned') is not True or pin.get('pin_valid') is not True or
+        pin.get('focused') is not True or pin.get('matched') != 1 or
+        pin.get('after', {}).get('width') != WIDTH or pin.get('after', {}).get('height') != trial.layout.height):
+        raise RuntimeError('POPUP_WINDOW_IDENTITY')
+    trial.page_window=pin;trial.sandbox=owner.sandbox()
+    if trial.sandbox.get('passed') is not True:raise RuntimeError('POPUP_SANDBOX')
+    trial.owner_verified_at=time.monotonic()
+    return True
+
+def prove_selected_tab(trial, page, owner, strict_local=False):
+    pin = trial.worker_command({'kind': 'focus-fixture'}, 2048)
+    if (pin.get('pinned') is not True or pin.get('pin_valid') is not True or
+        pin.get('focused') is not True or pin.get('matched') != 1 or
+        pin.get('after', {}).get('width') != WIDTH or pin.get('after', {}).get('height') != trial.layout.height):
+        raise RuntimeError('TAB_WINDOW_IDENTITY')
+    trial.page_window = pin
+    # Only our finite local page has a bounded load deadline. A normal HTTPS
+    # navigation/selected loading tab is qualified by owner/window/context, not
+    # by a transient document execution context or a claim that its page loaded.
+    if strict_local:
+        local_deadline = min(trial.deadline, time.monotonic() + 3)
+        for attempt in range(10):
+            if trial.stop.is_set() or time.monotonic() >= local_deadline: raise RuntimeError('TAB_PRESENTATION')
+            try: snapshot = page.snapshot()
+            except ProofError as exc:
+                if str(exc) != 'PAGE_CONTEXT_TRANSITION': raise
+                snapshot = None
+            if snapshot is not None:
+                trial.page_samples.append(snapshot)
+                trial.page_samples = trial.page_samples[-64:]
+                if presented(dict(snapshot,height=HEIGHT//DEVICE_SCALE)) and viewport_matches({k:snapshot[k] for k in ('width','height','dpr')},trial.layout.height) and snapshot['localStart']: break
+            if attempt == 9: raise RuntimeError('TAB_PRESENTATION')
+            time.sleep(0.1)
+    page.assert_alive()
+    trial.sandbox = owner.sandbox()
+    if trial.sandbox.get('passed') is not True: raise RuntimeError('TAB_SANDBOX')
+    trial.owner_verified_at = time.monotonic()
+    return True
+
+def service_editor(trial,page,owner):
+    body=None
+    with trial.lock:
+        if trial.navigation_pending is not None or trial.navigation_active:return
+        if trial.editor_pending:
+            body=trial.editor_pending;trial.editor_pending=None;trial.editor_active=True
+        probe=trial.editor_probe_requested
+        probe_rev=getattr(trial,'focus_revision',0)
+        if not body and (not probe or trial.input_actions or trial.input_motion is not None):return
+    with trial.input_io_lock:
+        try:
+            if body:
+                prove_selected_tab(trial,page,owner)
+                outcome=page.editor_apply(body)
+                # Native ownership must still exist even if field focus moved.
+                prove_selected_tab(trial,page,owner)
+                with trial.lock:trial.editor_result={'id':body['id'],'status':outcome}
+            try:value=page.editor_probe(force=body is not None)
+            except ProofError:value={'state':'unavailable','kind':None,'multiline':None,'focusId':None}
+            identity=(value['state'],value['kind'],value['multiline'],value['focusId'])
+            with trial.lock:
+                if body is not None or getattr(trial,'focus_revision',0)==probe_rev:
+                    if identity!=trial.editor_identity:
+                        if trial.editor_revision>=512:value={'state':'unavailable','kind':None,'multiline':None,'focusId':None}
+                        else:trial.editor_revision+=1;trial.editor_identity=identity
+                    trial.editor_state=value
+                    trial.editor_probe_at=time.monotonic();trial.editor_probe_requested=False
+        finally:
+            body=None
+            with trial.lock:trial.editor_active=False
+
+def handler_for(trial):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *args):
+            pass
+
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(2)
+
+        def handle_expect_100(self):
+            self.reply(417)
+            return False
+
+        def route(self):
+            if trial.stop.is_set() or time.monotonic() >= trial.deadline:
+                return None
+            return route_request(self.client_address[0], self.command, self.path, self.headers, trial.token)
+
+        def reply(self, code, data=b'', kind='application/json'):
+            self.close_connection = True
+            self.send_response(code)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            route = self.route()
+            if route is None:
+                return self.reply(404)
+            if not (trial.voice_get_budget if route=='voice' else trial.layout_get_budget if route=='layout' else trial.direct_get_budget if route == 'editor' else trial.presentation_get_budget if route == 'presentation' else trial.tab_get_budget if route == 'tabs' else trial.editor_get_budget if route == 'text-focus' else trial.get_budget).take():
+                return self.reply(429)
+            if route == 'voice':
+                identity = header_identity(self.headers)
+                if not trial.media_stream.permits_input(identity):
+                    return self.reply(409)
+                return self.reply(200, json.dumps(trial.voice.status(trial.voice_binding(identity)), separators=(',', ':')).encode())
+            if route == 'rtc-offer':
+                if trial.display_transport!='webrtc': return self.reply(404)
+                try: return self.reply(200,trial.media_stream.offer(header_identity(self.headers)))
+                except StreamError: return self.reply(409)
+            if route == 'stream-state':
+                return self.reply(200, json.dumps(trial.media_stream.state(), separators=(',', ':')).encode())
+            if route == 'layout':
+                with trial.lock: value=trial.layout.view()
+                return self.reply(200,json.dumps(value,separators=(',',':')).encode())
+            if route == 'editor':
+                return self.reply(200,json.dumps(direct_snapshot(trial),separators=(',',':')).encode())
+            if route == 'presentation':
+                with trial.lock: value=dict(trial.presentation_state)
+                return self.reply(200,json.dumps(value,separators=(',',':')).encode())
+            if route == 'text-focus':
+                return self.reply(200,json.dumps(trial.text_snapshot(),separators=(',',':')).encode())
+            if route == 'tabs':
+                value = trial.tabs_snapshot()
+                return self.reply(200, json.dumps(value, separators=(',', ':')).encode()) if value else self.reply(409)
+            if route == 'fixture':
+                return self.reply(200, FIXTURE.encode(), 'text/html; charset=utf-8')
+            if route == 'start':
+                return self.reply(200, START_PAGE, 'text/html; charset=utf-8')
+            if route == 'viewer':
+                return self.reply(200, trial.viewer, 'text/html; charset=utf-8')
+            identity = header_identity(self.headers)
+            try:
+                reservation = trial.media_stream.attach(identity)
+            except (StreamError, MediaError):
+                return self.reply(409)
+            generation = identity['generation']
+            cursor = reservation.cursor
+            tune_stream_socket(self.connection)
+            try:
+                self.send_response(200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                def send(data, write_deadline):
+                    # One immutable fragment held by this handler, no producer lock.
+                    for offset in range(0, len(data), 65536):
+                        if not trial.capture_allowed() or time.monotonic() >= write_deadline:
+                            raise StreamError('OWNER_OR_VIEWER_LOST_OR_SLOW_CONSUMER')
+                        part = memoryview(data)[offset:offset+65536]
+                        if time.monotonic() >= write_deadline:
+                            raise StreamError('SLOW_CONSUMER')
+                        # One send per chunk (header+payload+CRLF), not three.
+                        self.wfile.write(b''.join((('%x\r\n' % len(part)).encode(), part, b'\r\n')))
+                    if time.monotonic() >= write_deadline:
+                        raise StreamError('SLOW_CONSUMER')
+                    self.wfile.flush()
+                send(reservation.init, time.monotonic()+2)
+                reservation = None
+                while trial.capture_allowed():
+                    try:
+                        value = trial.media_stream.next(generation, cursor)
+                    except Lagged:
+                        # Evicted before it was sent: continue from the newest IDR
+                        # group (one counted skip) instead of closing the video.
+                        jumped = trial.media_stream.skip_to_latest(generation, cursor)
+                        if jumped is None:
+                            raise
+                        cursor = jumped
+                        continue
+                    if value is None:
+                        self.wfile.write(b'0\r\n\r\n')
+                        break
+                    fragment, next_cursor = value
+                    if trial.media_stream.behind(fragment) > STREAM_MAX_BEHIND:
+                        jumped = trial.media_stream.skip_to_latest(generation, next_cursor)
+                        if jumped is not None:
+                            cursor = jumped
+                            fragment = value = None
+                            continue
+                    cursor = next_cursor
+                    write_deadline = time.monotonic()+4
+                    send(fragment.moof, write_deadline); send(fragment.mdat, write_deadline)
+                    # Do not hold an old fragment while waiting for its successor.
+                    fragment = value = None
+            except (OSError, ValueError, RuntimeError, TimeoutError):
+                # Consumer loss is recoverable explicitly. It does not stop the
+                # producer, repeat any action, or report a whole-session failure.
+                pass
+            finally:
+                self.close_connection = True
+                trial.media_stream.detach(generation)
+
+
+        def do_POST(self):
+            route = self.route()
+            if route is None:
+                return self.reply(404)
+            if self.headers.get('Content-Type') != 'application/json':
+                return self.reply(415)
+            if route=='rtc-answer':
+                if trial.display_transport!='webrtc' or not trial.get_budget.take(): return self.reply(404)
+                length=self.headers.get('Content-Length','')
+                if not length.isascii() or not length.isdecimal() or len(length)>5 or not 0<int(length)<=70000: return self.reply(413)
+                try:
+                    raw=self.rfile.read(int(length))
+                    if len(raw)!=int(length): return self.reply(400)
+                    trial.media_stream.answer(header_identity(self.headers),raw)
+                    return self.reply(200,b'{"ok":true}')
+                except (ValueError,RuntimeError,OSError): return self.reply(409)
+            raw_length = self.headers.get('Content-Length', '')
+            if not raw_length.isascii() or not raw_length.isdecimal() or len(raw_length) > 5 or not 0 < int(raw_length) <= (16384 if route=='editor' else 8192 if route=='text' else 2048):
+                return self.reply(413)
+            try:
+                raw = self.rfile.read(int(raw_length))
+                if len(raw) != int(raw_length):
+                    return self.reply(400)
+                body = parse_json(raw,16384 if route=='editor' else 8192 if route=='text' else 2048)
+            except (ValueError, OSError, RecursionError):
+                return self.reply(400)
+            if route == 'voice':
+                if len(raw) > 256:
+                    return self.reply(413)
+                if not valid_voice_command(body):
+                    return self.reply(400)
+                if not trial.voice_budget.take():
+                    return self.reply(429)
+                identity = header_identity(self.headers)
+                if body.get('action') != 'cancel' and not trial.media_stream.permits_input(identity):
+                    return self.reply(409)
+                code, value = trial.voice.command(trial.voice_binding(identity), body)
+                return self.reply(code, json.dumps(value, separators=(',', ':')).encode() if value is not None else b'')
+            if route in ('stream-open', 'stream-ready'):
+                if not trial.get_budget.take():
+                    return self.reply(429)
+                if route == 'stream-ready':
+                    return self.reply(200, b'{"ok":true}') if trial.media_stream.mark_ready(body) else self.reply(409)
+                try:
+                    value = trial.media_open(body)
+                except (StreamError, MediaError):
+                    return self.reply(409)
+                return self.reply(200, json.dumps(value, separators=(',', ':')).encode())
+            if route == 'input':
+                # Input queues under trial.lock and is dispatched under input_io_lock
+                # by the input pump; do not stall pointer/key ACKs behind main-loop CDP.
+                with trial.lock:
+                    epoch = trial.input_epoch
+                if not trial.media_stream.permits_input(header_identity(self.headers)):
+                    return self.reply(409)
+                with trial.lock:
+                    queued = epoch == trial.input_epoch and queue_network_input(trial, body)
+                return self.reply(200, b'{"ok":true}') if queued else self.reply(409)
+            if route == 'metrics':
+                # Heartbeats need only trial.lock. The main loop holds input_io_lock
+                # across CDP navigation, exactly while a voice receipt changes, and
+                # the reply is written after trial.lock is released.
+                if not valid_metrics(body, trial.token, trial.display_transport):
+                    return self.reply(400)
+                if not trial.metric_budget.take():
+                    return self.reply(429)
+                with trial.lock:
+                    trial.metrics.append({k: v for k, v in body.items() if k != 'token'})
+                    trial.metrics = trial.metrics[-128:]
+                    trial.metrics_total += 1
+                    trial.last_viewer_heartbeat = time.monotonic()
+                    if body['final']:
+                        trial.request_stop('viewer-ended')
+                    close = not body['final'] and trial.agent_close_requested
+                data, seq = trial.voice_card.reply(close)
+                self.reply(200, data)
+                # A written non-final reply that the viewer will render is delivery.
+                if seq is not None and not body['final'] and not close:
+                    trial.voice_card.mark_delivered(seq)
+                return
+            with trial.input_io_lock:
+                # Page mutations are tied to the acknowledged current video epoch.
+                # Session close remains available during reconnect.
+                if route in ('navigate','history','tabs','text','editor','presentation') and not trial.media_stream.permits_input(header_identity(self.headers)):
+                    return self.reply(409)
+                if route == 'fixture-metrics':
+                    if not valid_fixture(body):
+                        return self.reply(400)
+                    if not trial.fixture_budget.take():
+                        return self.reply(429)
+                    with trial.lock:
+                        if not trial.fixture_accepting:
+                            return self.reply(409)
+                        trial.fixture = body
+                elif route == 'navigate':
+                    if not trial.queue_navigation(body):
+                        return self.reply(409)
+                elif route == 'history':
+                    if not trial.queue_history(body):
+                        return self.reply(409)
+                elif route == 'tabs':
+                    if not trial.queue_tabs(body):
+                        return self.reply(409)
+                elif route == 'layout':
+                    return self.reply(202,b'{"ok":true}') if queue_layout(trial,body) else self.reply(409)
+                elif route == 'layout-seen':
+                    return self.reply(202,b'{"ok":true}') if queue_seen(trial,body) else self.reply(409)
+                elif route == 'editor':
+                    return self.reply(202,b'{"ok":true}') if queue_direct(trial,body) else self.reply(409)
+                elif route == 'presentation':
+                    return self.reply(202,b'{"ok":true}') if queue_presentation(trial,body) else self.reply(409)
+                elif route == 'text':
+                    if not trial.queue_text(body):return self.reply(409)
+                elif route == 'end':
+                    if body != {}:
+                        return self.reply(400)
+                    trial.request_stop('viewer-ended')
+                else:
+                    return self.reply(409)
+                self.reply(200, b'{"ok":true}')
+
+    return Handler
+
+def prepare_run():
+    os.umask(0o077)
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    base = home / 'snap/chromium/common/baaz-trial'
+    current = home
+    for part in ('snap', 'chromium', 'common', 'baaz-trial'):
+        current = current / part
+        if current.is_symlink():
+            raise RuntimeError('PRIVATE_PATH_SYMLINK')
+        current.mkdir(mode=0o700, exist_ok=True)
+        if not current.is_dir() or current.stat().st_uid != os.getuid():
+            raise RuntimeError('PRIVATE_PATH_OWNER')
+    run = base / ('run-' + secrets.token_hex(8))
+    run.mkdir(mode=0o700, exist_ok=False)
+    return run
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--run', action='store_true')
+    parser.add_argument('--voice-control-fd', type=int)
+    parser.add_argument('--display-transport',choices=('mse','webrtc'),default='webrtc')
+    parser.add_argument('--input-worker')
+    parser.add_argument('--probe', action='store_true')
+    parser.add_argument('--preflight-only', action='store_true')
+    args = parser.parse_args()
+    if args.voice_control_fd is not None and (not args.run or args.input_worker or args.preflight_only or
+                                            not 3 <= args.voice_control_fd <= 1048576):
+        parser.error('voice control requires an ordinary owned --run session')
+    if args.input_worker:
+        if os.getuid() != 1000 or args.run:
+            raise SystemExit('ORDINARY_USER_REQUIRED')
+        raise SystemExit(input_worker(args.input_worker, args.probe))
+    if not args.run:
+        print('Prepared only. --run starts one on-demand private session, maximum 30 minutes.')
+        return
+    if os.getuid() != 1000 or os.geteuid() != 1000 or platform.machine() != 'aarch64' or socket.gethostname() != '{{SPARK_HOSTNAME}}':
+        raise SystemExit('FIXED_ORDINARY_SPARK_USER_REQUIRED')
+    for binary in ('/usr/bin/snap', '/usr/bin/Xvfb', '/usr/bin/ffmpeg'):
+        if not Path(binary).is_file() or not os.access(binary, os.X_OK):
+            raise SystemExit('MISSING_OFFICIAL_PREREQUISITE')
+    owner = ProcessOwner()
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    run, server, server_thread, trial, private, dns_proof, page = None, None, None, None, None, None, None
+    audio_graph = None
+    voice_host = voice_thread = None
+    startup_stage, startup_failure = 'prepare-run', None
+    try:
+        run = prepare_run()
+        trial = Trial(run, secrets.token_hex(24), owner, args.display_transport)
+        if args.voice_control_fd is not None:
+            # The package is part of this private build, never resolved from a
+            # webpage, model output, environment variable or network location.
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from voice_control.browser_spawn import attach_trial, close_trial
+            from voice_control.trial_control import service_trial_control
+            voice_host, voice_thread = attach_trial(trial, args.voice_control_fd)
+        startup_stage = 'private-profile'
+        private = PrivateProfile()
+        startup_stage = 'protection-stage'
+        protection = prepare_protection(private)
+        trial.privacy = private.evidence()
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(sig, lambda *_: trial.request_stop('signal'))
+        startup_stage = 'private-audio'
+        audio_graph = PrivateAudio(owner)
+        trial.audio_graph = audio_graph
+        trial.audio = audio_graph.prepare()
+        startup_stage = 'stream-bind'
+        server = BoundedServer((SPARK, PORT), handler_for(trial))
+        startup_stage = 'handoff'
+        write_private(run / 'handoff.json', json.dumps({'url': ORIGIN + '/' + trial.token + '/viewer', 'token': trial.token}).encode())
+        startup_stage = 'xauthority'
+        authority, cookie = run / 'Xauthority', secrets.token_bytes(16)
+        write_private(authority, authority_record(32767, cookie))
+        startup_stage = None
+        env = os.environ.copy()
+        for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'XAUTHORITY', 'LD_PRELOAD', 'LD_LIBRARY_PATH',
+                    'BASH_ENV', 'ENV', 'HISTFILE', 'CHROMIUM_FLAGS', 'CHROME_USER_DATA_DIR', 'CHROME_HEADLESS', 'CHROME_LOG_FILE'):
+            env.pop(key, None)
+        env['XAUTHORITY'] = str(authority)
+        xvfb = trial.spawn(['/usr/bin/Xvfb', '-displayfd', '1', '-screen', '0', '3840x2160x24', '-nolisten', 'tcp', '-auth', str(authority)], env=env, stdout=subprocess.PIPE)
+        trial.xvfb = xvfb
+        number = line_read(xvfb.stdout.fileno(), time.monotonic() + 8, trial.stop, 8).decode('ascii')
+        if not number.isdecimal() or not 0 <= int(number) <= 65535:
+            raise RuntimeError('INVALID_PRIVATE_DISPLAY')
+        trial.display = ':' + number
+        with open(authority, 'ab') as f:
+            f.write(authority_record(number, cookie))
+        env['DISPLAY'] = trial.display
+        trial.env = env
+        command = ['/usr/bin/python3', str(Path(__file__).resolve()), '--input-worker', trial.display]
+        # Wrong cookie must fail against only this run's newly allocated display.
+        wrong = run / 'wrong-Xauthority'
+        write_private(wrong, authority_record(number, secrets.token_bytes(16)))
+        probe = trial.spawn(command + ['--probe'], env=dict(env, XAUTHORITY=str(wrong)), stdout=subprocess.PIPE)
+        try:
+            probe.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            owner.terminate(probe)
+            raise RuntimeError('WRONG_COOKIE_PROBE_TIMEOUT')
+        if probe.returncode == 0 or probe.stdout.read(256):
+            raise RuntimeError('PRIVATE_DISPLAY_AUTH_FAILED')
+        trial.xauth['wrong_cookie_rejected'] = True
+        probe.stdout.close()
+        trial.input = trial.spawn(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        handshake = parse_json(line_read(trial.input.stdout.fileno(), time.monotonic() + 5, trial.stop))
+        if handshake != {'geometry': [WIDTH, HEIGHT]}:
+            raise RuntimeError('PRIVATE_DISPLAY_GEOMETRY')
+        trial.xauth['authorized_private_display'] = True
+        os.set_blocking(trial.input.stdin.fileno(), False)
+        server_thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+        server_thread.start()
+        browser_args, audio_env = browser_launch(protection, ['--kiosk', '--ozone-platform=x11', '--class=BaazPrivateTrial',
+            '--window-size=1920,1080', '--force-device-scale-factor=2',
+            ORIGIN + '/' + trial.token + '/fixture'],trial.audio)
+        env.update(audio_env)
+        browser = trial.spawn(browser_args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        trial.browser = browser
+        dns_proof = DnsProof(browser.stdin, browser.stdout)
+        ready_deadline = time.monotonic() + 25
+        next_fit = 0
+        while not trial.stop.is_set() and time.monotonic() < ready_deadline:
+            trial.sandbox = owner.sandbox()
+            if valid_fixture(trial.fixture) and (not trial.window_fit or not trial.window_fit[-1].get('pinned') or not fixture_ready(trial.fixture)) and len(trial.window_fit) < 3 and time.monotonic() >= next_fit:
+                trial.window_fit.append(trial.worker_command({'kind': 'fit-fixture'}, 2048))
+                next_fit = time.monotonic() + 1
+            if (valid_fixture(trial.fixture) and trial.sandbox['passed'] and trial.effective_dns is None and
+                trial.window_fit and trial.window_fit[-1].get('pinned') is True):
+                trial.effective_dns = dns_proof.prove()
+                if not trial.effective_dns['qualified']:
+                    raise RuntimeError('EFFECTIVE_DNS_NOT_PROVED')
+                trial.sandbox = owner.sandbox()
+            if fixture_ready(trial.fixture) and trial.sandbox['passed'] and trial.effective_dns and trial.effective_dns['qualified']:
+                break
+            time.sleep(0.2)
+        if not fixture_ready(trial.fixture) or not trial.sandbox or not trial.sandbox['passed']:
+            raise RuntimeError('EXACT_4K_RENDERER_SANDBOX_NOT_PROVED')
+        if not trial.effective_dns or not trial.effective_dns['qualified']:
+            raise RuntimeError('EFFECTIVE_DNS_NOT_PROVED')
+        trial.prove_input()
+        with trial.lock:
+            trial.fixture_accepting = False
+            trial.fixture_preflight = dict(trial.fixture)
+        page = SessionPage.from_verified_dns(dns_proof, trial.effective_dns, trial.token)
+        page.popup_lock = trial.input_io_lock
+        page.popup_restored = lambda: prove_popup_window(trial, owner)
+        try:
+            page.start()
+            with trial.input_io_lock:
+                trial.protection_preflight = prove_protection(page,protection.bundle['extensionId'])
+            # Reuse the original unpredictable X-window pin; no same-class fallback.
+            trial.page_window = trial.worker_command({'kind': 'focus-fixture'}, 2048)
+            pin = trial.page_window
+            if (pin.get('pinned') is not True or pin.get('pin_valid') is not True or
+                pin.get('focused') is not True or pin.get('matched') != 1 or
+                pin.get('after', {}).get('width') != WIDTH or pin.get('after', {}).get('height') != HEIGHT):
+                raise RuntimeError('PAGE_WINDOW_IDENTITY')
+            page_deadline = min(time.monotonic() + 16, trial.deadline - 20)
+            for _ in range(8):
+                if trial.stop.is_set() or time.monotonic() + 2 >= page_deadline:
+                    break
+                snapshot = page.snapshot()
+                trial.page_samples.append(snapshot)
+                if presented(snapshot):
+                    trial.page_ready = True
+                    trial.initial_page_proved = True
+                    break
+                time.sleep(0.25)
+            trial.sandbox = owner.sandbox()
+            if not trial.page_ready or not trial.sandbox['passed'] or trial.deadline - time.monotonic() < 20:
+                raise RuntimeError('PAGE_PRESENTATION_NOT_PROVED')
+            with trial.input_io_lock:
+                trial.tab_preflight = page.preflight(lambda: prove_selected_tab(trial, page, owner, strict_local=True))
+                trial.tab_state = page.state()
+                trial.keyboard_preflight = page.keyboard_preflight()
+                trial.direct_preflight = page.direct_preflight()
+                trial.layout_preflight = layout_preflight(trial,page)
+                trial.scroll_preflight = scroll_preflight(trial,page)
+                trial.fullscreen_preflight = page.fullscreen_preflight()
+                trial.audio_preflight = audio_preflight(page, owner, browser, trial.audio, audio_graph, capture=args.preflight_only)
+                prove_selected_tab(trial,page,owner,strict_local=True)
+        finally:
+            trial.page_evidence = page.evidence()
+        trial.owner_verified_at = time.monotonic()
+        trial.ready_at = time.monotonic()
+        if args.preflight_only:
+            return
+        trial.start_input_pump()
+        write_private(run / 'ready.json', json.dumps({'protection_preflight':trial.protection_preflight,'audio_preflight':trial.audio_preflight,'audio_cleanup':trial.audio_cleanup,'scroll_preflight':trial.scroll_preflight,'fullscreen_preflight':trial.fullscreen_preflight,'layout_preflight':trial.layout_preflight,'direct_preflight':trial.direct_preflight,'keyboard_preflight':trial.keyboard_preflight,'tab_preflight': trial.tab_preflight, 'fixture_preflight': trial.fixture_preflight, 'actual_page': {'ready': trial.page_ready, 'initial_presentation_proved': trial.initial_page_proved, 'samples': trial.page_samples, 'source_video_health': trial.source_video_health, 'navigation': trial.page_evidence, 'pinned_window': trial.page_window}, 'sandbox': trial.sandbox, 'xauth': trial.xauth, 'window_fit': trial.window_fit, 'window_focus': trial.window_focus, 'input_preflight': trial.input_preflight, 'privacy': trial.privacy, 'effective_dns': trial.effective_dns, 'ready': True}).encode())
+        print(json.dumps({'run_path': str(run), 'ready': True}), flush=True)
+        next_page_sample = time.monotonic() + 10
+        while not trial.stop.is_set() and time.monotonic() < trial.deadline:
+            # Launcher exit is not browser exit: the subreaper retains detached descendants.
+            owner.discover()
+            if trial.viewer_expired():
+                trial.request_stop('viewer-heartbeat-lost')
+                break
+            if time.monotonic() - trial.owner_verified_at >= 1:
+                page.assert_alive()
+                trial.check_audio()
+                with trial.lock:
+                    trial.tab_state = page.state()
+                trial.sandbox = owner.sandbox()
+                if not trial.sandbox['passed']:
+                    trial.request_stop('owner-lost')
+                    raise RuntimeError('PAGE_RENDERER_SANDBOX_LOST')
+                trial.owner_verified_at = time.monotonic()
+            pending = trial.take_navigation()
+            if pending is not None:
+                try:
+                    # Drain any old in-flight X command before changing the selected target.
+                    with trial.input_io_lock:
+                        if type(pending) is dict and 'tabs' in pending:
+                            state = page.tab_command(pending['tabs'], lambda: prove_selected_tab(trial, page, owner, strict_local=page.pending_local_start))
+                            with trial.lock: trial.tab_state = state
+                        elif type(pending) is dict and pending == {'voice': 'media_key'}:
+                            page.voice_media_key()
+                            prove_selected_tab(trial, page, owner)
+                            with trial.lock: trial.tab_state = page.state()
+                        else:
+                            if type(pending) is dict: page.history(pending['action'])
+                            else: page.navigate(pending)
+                            prove_selected_tab(trial, page, owner)
+                            with trial.lock: trial.tab_state = page.state()
+                        trial.navigation_counts['completed'] += 1
+                        trial.page_evidence = page.evidence()
+                        next_page_sample = time.monotonic() + 10
+                finally:
+                    pending = None
+                    trial.navigation_active = False
+            service_layout(trial,page,lambda:prove_selected_tab(trial,page,owner))
+            service_direct(trial,page,lambda:prove_selected_tab(trial,page,owner))
+            service_editor(trial,page,owner)
+            if voice_host is not None:
+                service_trial_control(voice_host, trial, page)
+            trial.check_agent_close()
+            if time.monotonic() >= next_page_sample:
+                try: snapshot = page.snapshot()
+                except ProofError as exc:
+                    if str(exc) != 'PAGE_CONTEXT_TRANSITION': raise
+                    snapshot = None
+                if snapshot is not None: trial.page_samples.append(snapshot)
+                trial.page_samples = trial.page_samples[-64:]
+                trial.record_video_health(page)
+                trial.page_evidence = page.evidence()
+                trial.sandbox = owner.sandbox()
+                if not trial.sandbox['passed']:
+                    raise RuntimeError('PAGE_RENDERER_SANDBOX_LOST')
+                trial.owner_verified_at = time.monotonic()
+                next_page_sample = time.monotonic() + 10
+            if xvfb.poll() is not None or trial.input.poll() is not None:
+                raise RuntimeError('PRIVATE_DISPLAY_CHILD_EXIT')
+            if trial.media_stream.error is not None:
+                raise RuntimeError('STREAM_INTERRUPTED_OR_INVALID')
+            if trial.stream_finished and trial.metrics and trial.metrics[-1]['final']:
+                break
+            time.sleep(0.2)
+    except Exception as exc:
+        if startup_stage is not None:
+            number = exc.errno if isinstance(exc, OSError) else None
+            startup_failure = {'stage': startup_stage, 'errno': number if type(number) is int and 1 <= number <= 4095 else None}
+        if trial:
+            trial.error = type(exc).__name__ + ':' + (str(exc) if str(exc).isupper() and len(str(exc)) < 100 else 'TRIAL_FAILED')
+    finally:
+        if trial:
+            trial.request_stop(trial.close_reason or ('deadline' if time.monotonic() >= trial.deadline else 'runtime-ended'))
+            with trial.input_wake:
+                trial.input_wake.notify_all()
+            if trial.input_thread:
+                trial.input_thread.join(timeout=3.5)
+        if voice_host is not None:
+            if not close_trial(voice_host, voice_thread) and trial:
+                trial.error = 'VOICE_CONTROL_CLEANUP_UNVERIFIED'
+        if server:
+            server.close_connections()
+            if server_thread:
+                server.shutdown()
+                server_thread.join(timeout=2)
+            server.server_close()
+            drain_deadline = time.monotonic() + 3
+            while server.active and time.monotonic() < drain_deadline:
+                time.sleep(0.02)
+        if trial:
+            trial.media_stream.close(timeout=5.5)
+        cleanup = owner.cleanup()
+        if trial and not trial.media_stream.close(timeout=1):
+            trial.error = 'MEDIA_PRODUCER_CLEANUP_UNVERIFIED'
+        if trial and trial.input_thread:
+            trial.input_thread.join(timeout=1)
+            if trial.input_thread.is_alive():
+                trial.error = 'PRIVATE_INPUT_THREAD_UNVERIFIED'
+        if audio_graph:
+            try:
+                trial.audio_cleanup = audio_graph.close_after_process_cleanup(cleanup['verified'])
+                if not all(trial.audio_cleanup.get(k) is True for k in ('ownedAbsent','defaultsUnchanged','privateDaemonsExited')):
+                    trial.error = 'PRIVATE_AUDIO_CLEANUP_UNVERIFIED'
+            except (OSError, RuntimeError):
+                if trial:trial.error = 'PRIVATE_AUDIO_CLEANUP_UNVERIFIED'
+        if page:
+            page.close()
+        if dns_proof:
+            dns_proof.close()
+        if private:
+            try:
+                if not private.cleanup(cleanup['verified']) and trial:
+                    trial.error = 'PRIVATE_PROFILE_CLEANUP_UNVERIFIED'
+            except (OSError, RuntimeError):
+                if trial:
+                    trial.error = 'PRIVATE_PROFILE_CLEANUP_UNVERIFIED'
+            if trial:
+                trial.privacy = private.evidence()
+        if trial and run:
+            if not cleanup['verified']:
+                trial.error = 'OWNED_CHILD_CLEANUP_UNVERIFIED'
+            media_snapshot = trial.media_stream.snapshot()
+            trial.stream_bytes = media_snapshot['producedBytes']
+            trial.stream_fragments = media_snapshot['fragments']
+            if media_snapshot['error'] and trial.error is None:
+                trial.error = 'STREAM_INTERRUPTED_OR_INVALID'
+            final = trial.metrics[-1] if trial.metrics else {}
+            normal_viewer_deadline = (trial.stream_client_closed and final.get('final') is True and
+                final.get('state') == 'finished' and final.get('error') is None and
+                type(final.get('elapsedMs')) is int and 0 <= final['elapsedMs'] <= 1800000 and
+                trial.stream_bytes > 0)
+            if trial.stream_client_closed and not normal_viewer_deadline and trial.error is None:
+                trial.error = 'STREAM_CLIENT_DISCONNECTED'
+            result = {'protection_preflight':trial.protection_preflight,'audio_preflight':trial.audio_preflight,'audio_cleanup':trial.audio_cleanup,'scroll_preflight':trial.scroll_preflight,'fullscreen_preflight':trial.fullscreen_preflight,'layout_preflight':trial.layout_preflight,'direct_preflight':trial.direct_preflight,'keyboard_preflight':trial.keyboard_preflight,'tab_preflight': trial.tab_preflight, 'fixture_preflight': trial.fixture_preflight, 'actual_page': {'ready': trial.page_ready, 'initial_presentation_proved': trial.initial_page_proved, 'samples': trial.page_samples, 'source_video_health': trial.source_video_health, 'navigation': trial.page_evidence, 'pinned_window': trial.page_window}, 'sandbox': trial.sandbox, 'xauth': trial.xauth, 'window_fit': trial.window_fit, 'window_focus': trial.window_focus, 'input_preflight': trial.input_preflight, 'privacy': trial.privacy, 'effective_dns': trial.effective_dns,
+                'viewer_metrics': trial.metrics, 'metrics_total': trial.metrics_total, 'input_events_queued': trial.inputs, 'input_counts': trial.input_stats, 'navigation': trial.navigation_counts, 'close_reason': trial.close_reason,
+                'media_ring': media_snapshot,
+                'stream': {'bytes': trial.stream_bytes, 'fragments': trial.stream_fragments,
+                    'client_connection_closed': trial.stream_client_closed, 'normal_viewer_deadline': normal_viewer_deadline},
+                'error': trial.error, 'startup_failure': startup_failure, 'cleanup': cleanup,
+                'proof_limits': 'The fixture and its DOM counts are pre-navigation safety proof only. Actual page fields are fixed generic viewport/video scalars; video absent or0 does not prove playback, and4Kcapture does not prove a sourcevideo2160p rendition. Input counts mean X dispatch, not website DOM receipt. Dimensions/frame counters do not prove physical pixel fidelity or input-to-photon latency. Only bounded user HTTPS submissions are initiated; subsequent website redirects/links are not a network allow policy. No automated login/consent/quality, audio delivery,120Hz,persistence or deployed Home integration proof. Browser profile/config/cache are disposable tmpfs with incognito requested and deletion verified separately. Existing disk swap prevents a never-written-to-disk or forensic-erasure guarantee.'}
+            # Exact projected schema, compact encoding; retain final cleanup even at max inputs.
+            data = json.dumps(result, separators=(',', ':')).encode()
+            if len(data) > 131072:
+                result['viewer_metrics'] = trial.metrics[-32:]
+                result['metrics_truncated'] = True
+                data = json.dumps(result, separators=(',', ':')).encode()
+            if len(data) > 131072:
+                result['sandbox'] = {'passed': bool(trial.sandbox and trial.sandbox['passed']), 'renderers_omitted': True}
+                data = json.dumps(result, separators=(',', ':')).encode()
+            write_private(run / 'result.json', data)
+            print(json.dumps({'run_path': str(run), 'complete': True, 'error': trial.error}), flush=True)
+        elif not cleanup['verified']:
+            raise SystemExit('CLEANUP_UNVERIFIED')
+
+if __name__ == '__main__':
+    main()

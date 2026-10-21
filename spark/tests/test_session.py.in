@@ -1,0 +1,384 @@
+"""Offline fixed-page pipe and integration checks; no sockets or browser."""
+import ast
+import copy
+import io
+import json
+import os
+from pathlib import Path
+import threading
+import unittest
+from unittest.mock import Mock, patch
+import dns_proof as d
+import session_page as p
+import trial as t
+
+TOKEN='a'*48
+RECEIPT={'qualified':True,'target_closed':True,'error':None,
+         'settings':{'mode':'secure','quad9_template_exact':True,'managementMode':0}}
+def scalars(**kw):
+    result=dict(width=1920,height=1080,dpr=2,visible=True,focused=True,documentReady='complete',
+        fixtureGone=True,httpsDocument=True,localStart=True,videoCount=1,
+        video=dict(width=3840,height=2160,paused=False,readyState=4))
+    result.update(kw);return result
+
+class Wire:
+    def __init__(self, mode='ok'):
+        self.mode=mode;self.commands=[];self.error=None
+        self.r,w=os.pipe();r,self.w=os.pipe()
+        self.stdin=os.fdopen(w,'wb',buffering=0);self.stdout=os.fdopen(r,'rb',buffering=0)
+        self.proof=d.DnsProof(self.stdin,self.stdout)
+        self.proof.used=self.proof.marker_seen=True;self.proof.sequence=6
+        self.page=p.SessionPage.from_verified_dns(self.proof,copy.deepcopy(RECEIPT),TOKEN)
+        self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start()
+    def run(self):
+        try:
+            pending=b''
+            while True:
+                value=os.read(self.r,4096)
+                if not value:return
+                pending+=value
+                while b'\0' in pending:
+                    raw,pending=pending.split(b'\0',1);q=json.loads(raw);self.commands.append(q)
+                    method=q['method'];answer={}
+                    if method=='Target.getTargets':
+                        item={'type':'page','url':self.page.fixture,'targetId':'originalOwnedPage','title':'private-not-exported'}
+                        if self.mode=='foreign':item['url']='https://foreign.invalid/private'
+                        answer={'targetInfos':[item]*(2 if self.mode=='duplicate' else 1)}
+                    elif method=='Target.attachToTarget':answer={'sessionId':'ownSession'}
+                    elif method=='Target.getTargetInfo':
+                        answer={'targetInfo':{'targetId':self.page.target,'type':'page','attached':True,'url':'https://private.invalid/SECRET'}}
+                        if self.mode=='closedtarget':answer['targetInfo']['attached']=False
+                    elif method=='Page.navigate':
+                        answer={'frameId':'ownFrame'}
+                        if self.mode=='naverror':answer['errorText']='SECRET_ERROR_URL'
+                        if self.mode=='download':answer['isDownload']=True
+                    elif method=='Page.getNavigationHistory':
+                        answer={'currentIndex':1,'entries':[
+                            {'id':7,'url':self.page.start_url,'title':'SECRET_HISTORY'},
+                            {'id':8,'url':'https://example.com/current','title':'SECRET_HISTORY'},
+                            {'id':9,'url':'https://example.com/next','title':'SECRET_HISTORY'}]}
+                        if self.mode=='historyfirst':answer['currentIndex']=0
+                        if self.mode=='historylast':answer['currentIndex']=2
+                        if self.mode=='historyfixture':answer['entries'][0]['url']=self.page.fixture
+                        if self.mode=='historybadindex':answer['currentIndex']=True
+                        if self.mode=='historybadid':answer['entries'][0]['id']=True
+                    elif method=='Runtime.evaluate':
+                        exp=q['params']['expression']
+                        if 'same:location.href===' in exp:
+                            value=dict(same=True,width=1920,height=1080,dpr=2,visible=True,focused=True)
+                            if self.mode=='fixturechanged':value['same']=False
+                            if self.mode=='booldpr':value['dpr']=True
+                        else:
+                            value=scalars()
+                            if self.mode=='nomedia':value=scalars(videoCount=0,video=None)
+                            if self.mode=='consent':value=scalars(videoCount=0,video=None,localStart=False)
+                            if self.mode=='secretvalue':value['title']='SECRET_PAGE_TITLE'
+                        answer={'result':{'type':'object','value':value}}
+                        if self.mode=='exception':answer['exceptionDetails']={'text':'SECRET_EXCEPTION'}
+                    reply={'id':q['id'],'result':answer}
+                    if 'sessionId' in q:reply['sessionId']=q['sessionId']
+                    if self.mode=='wrongsession' and method=='Runtime.evaluate':reply['sessionId']='other'
+                    if self.mode=='byteflood' and method=='Target.getTargetInfo':
+                        for _ in range(60):
+                            block=json.dumps({'event':'x'*5000}).encode()+b'\0'
+                            while block:
+                                count=os.write(self.w,block);block=block[count:]
+                    os.write(self.w,json.dumps(reply).encode()+b'\0')
+        except (BrokenPipeError,OSError):pass
+        except Exception as exc:self.error=exc
+        finally:os.close(self.r);os.close(self.w)
+    def close(self):
+        self.page.close();self.proof.close();self.thread.join(1)
+        if self.thread.is_alive():raise AssertionError('test wire not closed')
+        if self.error:raise self.error
+
+class PageTests(unittest.TestCase):
+    def test_same_owned_page_exact_navigation_one_reader(self):
+        w=Wire()
+        try:
+            w.proof.close();self.assertFalse(w.stdin.closed)
+            w.page.start();self.assertTrue(p.presented(w.page.snapshot()))
+            self.assertEqual([q['method']for q in w.commands],['Target.getTargets','Target.attachToTarget',
+                'Runtime.evaluate','Target.activateTarget','Page.navigate','Runtime.evaluate'])
+            nav=[q for q in w.commands if q['method']=='Page.navigate']
+            self.assertEqual(nav[0]['params'],{'url':'http://{{SPARK_IP}}:4177/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/start'})
+            self.assertEqual(w.commands[1]['params'],{'targetId':'originalOwnedPage','flatten':True})
+            with self.assertRaisesRegex(d.ProofError,'PAGE_SINGLE_USE'):w.page.start()
+            self.assertEqual(len([q for q in w.commands if q['method']=='Page.navigate']),1)
+            self.assertNotIn('private',json.dumps(w.page.evidence()))
+        finally:w.close()
+        self.assertTrue(w.stdin.closed and w.stdout.closed)
+
+    def test_no_foreign_or_ambiguous_target_selection(self):
+        for mode in ('foreign','duplicate','fixturechanged','booldpr'):
+            w=Wire(mode)
+            try:
+                with self.assertRaises(d.ProofError):w.page.start()
+                self.assertFalse(any(q['method']=='Page.navigate'for q in w.commands))
+            finally:w.close()
+
+    def test_navigation_rejection_is_sanitized_and_never_retried(self):
+        for mode in ('naverror','download','exception','wrongsession'):
+            w=Wire(mode)
+            try:
+                with self.assertRaises(d.ProofError) as ex:w.page.start()
+                self.assertNotIn('SECRET',str(ex.exception))
+                with self.assertRaises(d.ProofError):w.page.start()
+                self.assertLessEqual(len([q for q in w.commands if q['method']=='Page.navigate']),1)
+            finally:w.close()
+
+    def test_missing_video_or_consent_is_not_playback_proof(self):
+        for mode in ('nomedia','consent'):
+            w=Wire(mode)
+            try:
+                w.page.start();v=w.page.snapshot()
+                self.assertTrue(p.presented(v));self.assertEqual(v['videoCount'],0);self.assertIsNone(v['video'])
+                if mode=='consent':self.assertFalse(v['localStart'])
+            finally:w.close()
+
+    def test_scalar_projection_forbids_payload_fields(self):
+        w=Wire('secretvalue')
+        try:
+            w.page.start()
+            with self.assertRaisesRegex(d.ProofError,'PAGE_SCALAR_SHAPE'):w.page.snapshot()
+            self.assertNotIn('SECRET',json.dumps(w.page.evidence()))
+        finally:w.close()
+
+    def test_long_session_snapshots_and_no_arbitrary_methods(self):
+        w=Wire()
+        try:
+            w.page.start();w.page.snapshots=511;w.page.snapshot()
+            w.page.snapshot();self.assertEqual(w.page.snapshots,513)
+            for method in ('Network.getCookies','Page.resetNavigationHistory','Target.createTarget','Target.closeTarget'):
+                with self.assertRaisesRegex(d.ProofError,'PAGE_METHOD_SCOPE'):w.page._call(method,{})
+        finally:w.close()
+
+    def test_public_schema_bounds_and_truth(self):
+        for key,value in [('width',True),('height',8193),('dpr',float('nan')),('visible',1),
+                          ('documentReady','secret'),('videoCount',34),('videoCount',True)]:
+            b=scalars();b[key]=value
+            with self.assertRaises(d.ProofError):p.scalar_snapshot(b)
+        for key,value in [('paused',0),('width',True),('height',8193),('readyState',5)]:
+            b=scalars();b['video'][key]=value
+            with self.assertRaises(d.ProofError):p.scalar_snapshot(b)
+        self.assertFalse(p.presented(scalars(width=3840)))
+        self.assertFalse(p.presented(scalars(fixtureGone=False)))
+        self.assertTrue(p.presented(p.scalar_snapshot(scalars(video=dict(width=0,height=0,paused=True,readyState=0)))))
+        b=scalars(videoCount=2,video=None);self.assertEqual(p.scalar_snapshot(b),b)
+
+    def test_encoder_requires_owned_audio_proof(self):
+        # Generic builds render host parameters; historical workspace-source
+        # equality is not a deployment proof. Test the actual encoder gate.
+        tr=t.Trial(Path('/unused'),TOKEN,Mock());tr.display=':77';tr.env={'OWNED':'yes'};tr.spawn=Mock(return_value='owned-encoder')
+        with self.assertRaisesRegex(RuntimeError,'AUDIO_STARTUP_UNPROVED'):tr.encode()
+        tr.spawn.assert_not_called()
+        tr.audio=Mock(server='unix:/owned/private-pulse',monitor='owned.monitor');tr.audio_graph=Mock(spec=['assert_alive'])
+        tr.audio_preflight={'passed':False}
+        with self.assertRaisesRegex(RuntimeError,'AUDIO_STARTUP_UNPROVED'):tr.encode()
+        tr.spawn.assert_not_called()
+        tr.audio_preflight={'passed':True}
+        self.assertEqual(tr.encode(),'owned-encoder');tr.audio_graph.assert_alive.assert_called_once()
+        args=tr.spawn.call_args.args[0]
+        for key,value in [('-video_size','3840x2160'),('-framerate','60'),('-g','60'),('-frag_duration','33333'),('-max_interleave_delta','20000'),('-draw_mouse','0'),('-c:v','hevc_nvenc'),('-c:a','aac'),('-t','1800')]:
+            self.assertEqual(args[args.index(key)+1],value)
+        self.assertEqual([args[i+1]for i,key in enumerate(args[:-1])if key=='-i'],[':77.0','owned.monitor'])
+        self.assertEqual(args[args.index('-server')+1],'unix:/owned/private-pulse')
+        self.assertNotIn('-an',args);self.assertEqual(args[-1],'pipe:1')
+        self.assertEqual(tr.spawn.call_args.kwargs['env'],tr.env)
+
+class IntegrationTests(unittest.TestCase):
+    def test_stale_fixture_posts_refused_without_socket(self):
+        tr=t.Trial(Path('/unused'),TOKEN,Mock());tr.fixture={'preserved':True};tr.fixture_accepting=False
+        body=dict(width=1920,height=1080,dpr=2,inputCount=2,keyCount=1,clickCount=1,moveCount=0,selection=0)
+        raw=json.dumps(body).encode();cls=t.handler_for(tr);h=cls.__new__(cls)
+        h.route=lambda:'fixture-metrics';h.headers={'Content-Type':'application/json','Content-Length':str(len(raw))}
+        h.rfile=io.BytesIO(raw);h.reply=Mock();h.do_POST()
+        h.reply.assert_called_once_with(409);self.assertEqual(tr.fixture,{'preserved':True})
+
+    def test_stream_and_input_require_actual_page_readiness(self):
+        tr=t.Trial(Path('/unused'),TOKEN,Mock(),'mse');tr.input=Mock();tr.input.poll.return_value=None
+        tr.input_preflight={'qualified':True};tr.fixture=dict(width=1920,height=1080,dpr=2,inputCount=2,keyCount=1,clickCount=1,moveCount=0,selection=0)
+        tr.sandbox={'passed':True};tr.effective_dns={'qualified':True}
+        cls=t.handler_for(tr);h=cls.__new__(cls);h.route=lambda:'stream.mp4';h.headers={};h.reply=Mock()
+        h.do_GET();h.reply.assert_called_once_with(409);self.assertFalse(tr.stream_started)
+        self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}));tr.page_ready=True;tr.owner_verified_at=t.time.monotonic();tr.ready_at=t.time.monotonic()
+        self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}))
+
+    def test_exact_integration_navigation_block_checks_fresh_pin_and_snapshot(self):
+        main=next(n for n in ast.parse(Path(t.__file__).read_text()).body if isinstance(n,ast.FunctionDef) and n.name=='main')
+        body=next(n for n in main.body if isinstance(n,ast.Try)).body
+        first=next(i for i,n in enumerate(body) if isinstance(n,ast.With) and any(isinstance(v,ast.Assign) and any(isinstance(target,ast.Attribute) and target.attr=='fixture_accepting' for target in v.targets) for v in n.body))
+        last=next(i for i,n in enumerate(body[first:],first) if isinstance(n,ast.If) and isinstance(n.test,ast.Attribute) and n.test.attr=='preflight_only')
+        code=compile(ast.fix_missing_locations(ast.Module(body=copy.deepcopy(body[first:last]),type_ignores=[])),'actual-navigation-block','exec')
+        for mode in ('ok','wrongpin','stale','sandbox','protection'):
+            tr=t.Trial(Path('/unused'),TOKEN,Mock());tr.fixture={'width':3840};tr.token=TOKEN;tr.effective_dns=RECEIPT
+            tr.worker_command=Mock(return_value=dict(pinned=True,pin_valid=mode!='wrongpin',focused=True,matched=1,after={'width':3840,'height':2160}))
+            owner=Mock();owner.sandbox.return_value={'passed':mode!='sandbox'}
+            page=Mock();page.snapshot.return_value=scalars(fixtureGone=mode!='stale');page.evidence.return_value={'fixed':True}
+            for name in ('preflight','keyboard_preflight','direct_preflight','fullscreen_preflight'):getattr(page,name).return_value={'qualified':True}
+            layout=Mock(return_value={'qualified':True});scroll=Mock(return_value={'qualified':True});audio=Mock(return_value={'passed':True})
+            activation=Mock(return_value={"qualified":True})
+            if mode=="protection":activation.side_effect=p.ProofError("PROTECTION_NOT_PROVED")
+            staged=Mock();staged.bundle={"extensionId":"a"*32}
+            factory=Mock();factory.from_verified_dns.return_value=page
+            namespace=dict(protection=staged,prove_protection=activation,prove_popup_window=Mock(return_value=True),audio_preflight=audio,args=Mock(preflight_only=False),browser=Mock(),audio_graph=Mock(),layout_preflight=layout,scroll_preflight=scroll,prove_selected_tab=Mock(return_value=True),trial=tr,SessionPage=factory,dns_proof=Mock(),owner=owner,presented=p.presented,WIDTH=3840,HEIGHT=2160,time=Mock(monotonic=lambda:0,sleep=lambda n:None))
+            if mode=='ok':
+                exec(code,namespace);self.assertTrue(tr.page_ready);self.assertEqual(len(tr.page_samples),1);activation.assert_called_once_with(page,'a'*32);self.assertEqual(tr.protection_preflight,{'qualified':True})
+                for name in ('preflight','keyboard_preflight','direct_preflight','fullscreen_preflight'):getattr(page,name).assert_called_once()
+                layout.assert_called_once_with(tr,page);scroll.assert_called_once_with(tr,page);audio.assert_called_once();self.assertEqual(tr.audio_preflight,{'passed':True})
+                for name in ('tab_preflight','keyboard_preflight','direct_preflight','layout_preflight','scroll_preflight','fullscreen_preflight'):self.assertEqual(getattr(tr,name),{'qualified':True})
+            else:
+                with self.assertRaises(RuntimeError):exec(code,namespace)
+            self.assertFalse(tr.fixture_accepting);self.assertEqual(tr.fixture_preflight,{'width':3840})
+            self.assertEqual(tr.page_evidence,{'fixed':True});page.start.assert_called_once()
+
+class SessionTests(unittest.TestCase):
+    def trial(self):
+        tr=t.Trial(Path('/unused'),TOKEN,Mock(),'mse');tr.page_ready=True
+        tr.ready_at=tr.owner_verified_at=t.time.monotonic()
+        tr.input=Mock();tr.input.poll.return_value=None;tr.input_preflight={'qualified':True}
+        return tr
+    def post(self,tr,route,body):
+        # This business-logic fixture starts after media admission.
+        # Unstubbed real epoch/header/readiness gates are tested in test_server.
+        tr.media_stream.permits_input=Mock(return_value=True)
+        raw=json.dumps(body).encode();c=t.handler_for(tr);h=c.__new__(c)
+        h.route=lambda:route;h.headers={'Content-Type':'application/json','Content-Length':str(len(raw))}
+        h.rfile=io.BytesIO(raw);h.reply=Mock();h.do_POST();return h.reply.call_args.args[0]
+    def test_https_submission_and_fixed_routes(self):
+        from test_trial import headers
+        import protocol
+        for value in ['https://example.com','https://example.com/a?secret=abc#fragment','https://[2001:db8::1]:443/a']:
+            self.assertTrue(protocol.valid_navigation({'url':value}))
+        for value in ['http://example.com','javascript:alert(1)','file:///x','https://a:b@example.com','https://@example.com','https://example.com:99999','https://example.com/\n','https://example.com/%0d','https://bad_host','https://example.com/'+'a'*1600]:
+            self.assertFalse(protocol.valid_navigation({'url':value}),value)
+        self.assertFalse(protocol.valid_navigation({'url':'https://example.com','extra':1}))
+        for route,peer,method in [('start',protocol.SPARK,'GET'),('navigate',protocol.TV,'POST'),('end',protocol.TV,'POST')]:
+            self.assertEqual(protocol.route_request(peer,method,'/'+TOKEN+'/'+route,headers(),TOKEN),route)
+            self.assertIsNone(protocol.route_request('127.0.0.1',method,'/'+TOKEN+'/'+route,headers(),TOKEN))
+    def test_navigation_one_pending_no_input_or_url_export(self):
+        tr=self.trial();self.assertTrue(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertEqual(self.post(tr,'navigate',{'url':'https://example.com/private-secret'}),200)
+        self.assertEqual(len(tr.input_actions),0)
+        self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertEqual(self.post(tr,'navigate',{'url':'https://second.example'}),409)
+        self.assertEqual(tr.take_navigation(),'https://example.com/private-secret');self.assertIsNone(tr.navigation_pending)
+        self.assertTrue(tr.navigation_active);self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertNotIn('private-secret',json.dumps(tr.navigation_counts))
+        tr.request_stop('signal');self.assertTrue(tr.stop.is_set());self.assertIsNone(tr.navigation_pending)
+    def test_history_fixed_actions_share_pending_and_budget(self):
+        import protocol
+        from test_trial import headers
+        self.assertEqual(protocol.route_request(protocol.TV,'POST','/'+TOKEN+'/history',headers(),TOKEN),'history')
+        self.assertIsNone(protocol.route_request(protocol.SPARK,'POST','/'+TOKEN+'/history',headers(),TOKEN))
+        for bad in ({'action':'eval'},{'action':'back','url':'https://example.com'}, {'action':1},{}):
+            self.assertFalse(protocol.valid_history(bad))
+        tr=self.trial()
+        self.assertEqual(self.post(tr,'history',{'action':'back'}),200)
+        self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+        self.assertEqual(self.post(tr,'navigate',{'url':'https://example.com'}),409)
+        self.assertEqual(tr.take_navigation(),{'action':'back'})
+        self.assertTrue(tr.navigation_active)
+        tr.request_stop('signal');self.assertIsNone(tr.navigation_pending)
+
+    def test_back_forward_reload_owned_target_without_history_export(self):
+        w=Wire()
+        try:
+            w.page.start()
+            for action,entry in [('back',7),('forward',9)]:
+                self.assertTrue(w.page.history(action))
+                self.assertEqual(w.commands[-1],{'id':w.page.sequence,'method':'Page.navigateToHistoryEntry',
+                    'params':{'entryId':entry},'sessionId':'ownSession'})
+            self.assertTrue(w.page.history('reload'));self.assertEqual(w.commands[-1]['method'],'Page.reload')
+            for mode,action in [('historyfirst','back'),('historylast','forward'),('historyfixture','back')]:
+                w.mode=mode;self.assertFalse(w.page.history(action));self.assertEqual(w.commands[-1]['method'],'Page.getNavigationHistory')
+            for mode in ('historybadindex','historybadid'):
+                w.mode=mode
+                with self.assertRaisesRegex(d.ProofError,'PAGE_HISTORY_SHAPE'):w.page.history('back')
+            self.assertNotIn('SECRET',json.dumps(w.page.evidence()))
+            self.assertNotIn('example.com',json.dumps(w.page.evidence()))
+            with self.assertRaisesRegex(d.ProofError,'PAGE_HISTORY_SCOPE'):w.page.history('other')
+            w.page.navigations=64
+            self.assertTrue(w.page.history('reload'))
+            self.assertEqual(w.page.navigations,65)
+        finally:w.close()
+    def test_missing_viewer_and_owner_lease_stop_before_actions(self):
+        for kind in ['heartbeat','owner']:
+            tr=self.trial()
+            if kind=='heartbeat':tr.ready_at-=16
+            else:tr.owner_verified_at-=6
+            self.assertFalse(tr.capture_allowed());self.assertTrue(tr.stop.is_set())
+            self.assertFalse(tr.queue_input({'kind':'key','key':'Enter'}))
+            self.assertFalse(tr.queue_navigation({'url':'https://example.com'}))
+            self.assertEqual(tr.close_reason,'viewer-heartbeat-lost'if kind=='heartbeat'else'owner-proof-expired')
+    def test_metric_ring_and_final_end(self):
+        from test_trial import metrics
+        tr=self.trial();tr.metric_budget=Mock();tr.metric_budget.take.return_value=True
+        for i in range(140):
+            b=metrics();b['elapsedMs']=i*1000;self.assertEqual(self.post(tr,'metrics',b),200)
+        self.assertEqual(len(tr.metrics),128);self.assertEqual(tr.metrics_total,140)
+        self.assertNotIn('token',tr.metrics[0]);self.assertIsNotNone(tr.last_viewer_heartbeat)
+        self.assertEqual(self.post(tr,'end',{'extra':True}),400)
+        b['final']=True;self.assertEqual(self.post(tr,'metrics',b),200)
+        self.assertEqual(tr.close_reason,'viewer-ended');self.assertFalse(tr.page_ready)
+    def test_same_target_navigation_alive_and_fail_closed_context(self):
+        w=Wire()
+        try:
+            w.page.start();self.assertTrue(w.page.assert_alive())
+            w.page.navigate('https://example.com/private-secret')
+            self.assertEqual(w.commands[-1]['params'],{'url':'https://example.com/private-secret'})
+            self.assertEqual(w.commands[-1]['sessionId'],'ownSession')
+            self.assertNotIn('private-secret',json.dumps(w.page.evidence()))
+            w.mode='closedtarget'
+            with self.assertRaisesRegex(d.ProofError,'PAGE_OWNER_LOST'):w.page.assert_alive()
+            w.mode='exception'
+            with self.assertRaisesRegex(d.ProofError,'PAGE_EVALUATION'):w.page.snapshot()
+            w.page.navigations=64
+            w.mode='ok';self.assertTrue(w.page.navigate('https://example.com'))
+            self.assertTrue(w.page.history('reload'));self.assertEqual(w.page.navigations,66)
+            with self.assertRaisesRegex(d.ProofError,'PAGE_NAVIGATION_SCOPE'):w.page.navigate('http://example.com')
+        finally:w.close()
+    def test_command_budgets_do_not_expire_a_long_lived_owned_session(self):
+        w=Wire()
+        try:
+            w.page.start();w.page.frames=131072;w.page.total=268435456
+            self.assertTrue(w.page.assert_alive())
+            self.assertGreater(w.page.frames,131072);self.assertGreater(w.page.total,268435456)
+            self.assertTrue(w.page.assert_alive())
+        finally:w.close()
+    def test_each_command_still_bounds_unsolicited_frame_flood(self):
+        w=Wire()
+        try:
+            w.page.start();w.page.buffer.extend(b'{}\0'*65)
+            with self.assertRaisesRegex(d.ProofError,'CDP_FRAME_COUNT'):w.page.assert_alive()
+        finally:w.close()
+    def test_each_command_still_bounds_incoming_bytes(self):
+        w=Wire()
+        try:
+            w.page.start();w.mode='byteflood'
+            with self.assertRaisesRegex(d.ProofError,'CDP_TOTAL_SIZE'):w.page.assert_alive()
+        finally:w.close()
+    def test_30minute_cdp_budget_includes_liveness_snapshots_and_navigation(self):
+        w=Wire()
+        try:
+            w.page.start()
+            for _ in range(1800):w.page.assert_alive()
+            for _ in range(512):w.page.snapshot()
+            for _ in range(64):w.page.navigate('https://example.com')
+            self.assertLess(w.page.frames+64,4096) # reserve full original DNS frame budget
+            self.assertLess(w.page.total,16777216)
+            self.assertEqual(w.page.snapshots,512);self.assertEqual(w.page.navigations,64)
+        finally:w.close()
+
+    def test_scaled_exact_limits(self):
+        from test_trial import metrics
+        import protocol
+        b=metrics();b.update(elapsedMs=1800000,currentTimeMs=1800000,receivedBytes=6442450944,playbackSamples=1801,playableSamples=1801,nonseekingProgressMs=1800000)
+        self.assertTrue(protocol.valid_metrics(b,TOKEN))
+        for k in ('elapsedMs','currentTimeMs','receivedBytes','playbackSamples'):
+            v=copy.deepcopy(b);v[k]+=1;self.assertFalse(protocol.valid_metrics(v,TOKEN),k)
+        tr=self.trial();self.assertEqual(tr.deadline,float('inf'))
+        self.assertEqual(self.post(tr,'end',{}),200);self.assertTrue(tr.stop.is_set())
+
+if __name__=='__main__':unittest.main(verbosity=2)
+

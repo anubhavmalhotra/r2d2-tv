@@ -1,0 +1,175 @@
+"""Fixed-frame layout bookkeeping. No I/O, content access, or window discovery.
+
+The controller must serialize calls with input/navigation/editor work and must
+verify the owned window/context before resizing. A commit proves geometry, not
+that the receiver has displayed a frame captured after that commit.
+"""
+import math
+import re
+import secrets
+
+WIDTH, HEIGHT, DPR = 3840, 2160, 2
+MIN_HEIGHT, MAX_REVISIONS = 1500, 120
+
+
+def valid_height(value):
+    return type(value) is int and MIN_HEIGHT <= value <= HEIGHT and value % 2 == 0
+
+
+def valid_request(value):
+    return (type(value) is dict and set(value) == {'height', 'baseRevision'} and
+            valid_height(value['height']) and type(value['baseRevision']) is int and
+            0 <= value['baseRevision'] < MAX_REVISIONS)
+
+
+def desired_height(page_width, page_height):
+    """Uniformly fit active page; clamped ratios must retain contain rendering."""
+    if any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 or v > 16384
+           for v in (page_width, page_height)):
+        raise ValueError('LAYOUT_RECT')
+    return max(MIN_HEIGHT, min(HEIGHT, 2 * math.floor(WIDTH * page_height / page_width / 2)))
+
+
+def window_matches(report, height, focused=False):
+    if not valid_height(height) or type(report) is not dict:
+        return False
+    shape = report.get('after')
+    return (report.get('pinned') is True and report.get('pin_valid') is True and
+            type(report.get('matched')) is int and report['matched'] == 1 and type(shape) is dict and
+            all(type(shape.get(k)) is int and shape[k] == v for k, v in
+                {'x': 0, 'y': 0, 'width': WIDTH, 'height': height, 'border': 0}.items()) and
+            (not focused or report.get('focused') is True))
+
+
+def viewport_matches(viewport, height):
+    return (valid_height(height) and type(viewport) is dict and
+            type(viewport.get('width')) in (int, float) and viewport['width'] == WIDTH // DPR and
+            type(viewport.get('height')) in (int, float) and viewport['height'] == height // DPR and
+            type(viewport.get('dpr')) in (int, float) and viewport['dpr'] == DPR)
+
+
+def capture_point(x, y, height):
+    """Map active normalized coordinates to existing full-frame XTest protocol."""
+    if not valid_height(height) or any(type(v) not in (int, float) or
+            not math.isfinite(v) or not 0 <= v <= 1 for v in (x, y)):
+        raise ValueError('LAYOUT_POINT')
+    return x, y * (height - 1) / (HEIGHT - 1)
+
+
+def point_in_capture(body, height):
+    """After valid_input(), reject full-frame pointer coordinates in padding."""
+    if not valid_height(height) or type(body) is not dict:
+        return False
+    if body.get('kind') == 'key':
+        return True  # Existing fixed-key validator remains mandatory.
+    if body.get('kind') not in ('point','wheel'):
+        return False
+    x, y = body.get('x'), body.get('y')
+    return (all(type(v) in (int, float) and math.isfinite(v) for v in (x, y)) and
+            0 <= x <= 1 and 0 <= y <= (height - 1) / (HEIGHT - 1))
+
+
+def valid_marker(value):
+    return type(value) is str and re.fullmatch(r'[0-9a-f]{16}', value) is not None
+
+
+def marker_bits(value):
+    if not valid_marker(value): raise ValueError('LAYOUT_MARKER')
+    return tuple(int(bit) for byte in bytes.fromhex('a6' + value) for bit in format(byte, '08b'))
+
+
+class Layout:
+    """One request; geometry commit and decoded marker ACK are separate gates."""
+    def __init__(self):
+        self.height = HEIGHT
+        self.revision = 0
+        self._pending = None
+        self._marker = None
+        self._seen = False
+
+    def view(self):
+        marker = None if self._marker is None else {'value': self._marker,
+            'rect': {'x': WIDTH - 576, 'y': self.height - 16, 'width': 576, 'height': 16}}
+        return {'revision': self.revision, 'height': self.height,
+                'pending': self._pending is not None or self._marker is not None,
+                'captureRect': {'x': 0, 'y': 0, 'width': WIDTH, 'height': self.height},
+                'viewport': {'width': WIDTH // DPR, 'height': self.height // DPR, 'dpr': DPR},
+                'marker': marker}
+
+    def input_body(self, body):
+        # Call existing valid_input() on the returned body before dispatch.
+        if (type(body) is not dict or type(body.get('layoutRevision')) is not int or
+                body['layoutRevision'] != self.revision or self.view()['pending']):
+            return None
+        return {k:v for k,v in body.items() if k != 'layoutRevision'}
+
+    def queue(self, body):
+        if (not valid_request(body) or self._pending is not None or self._marker is not None or
+                body['baseRevision'] != self.revision):
+            return False
+        self._pending = dict(body)
+        self._pending['marker'] = secrets.token_hex(8)
+        return True
+
+    def request(self):
+        return dict(self._pending) if self._pending is not None else None
+
+    def requested_height(self):
+        return self._pending['height'] if self._pending is not None else None
+
+    def commit(self, window_report, viewport):
+        height = self.requested_height()
+        if (height is None or not window_matches(window_report, height) or not viewport_matches(viewport, height) or
+                window_report.get('layoutMarker') != self._pending['marker']):
+            # Native resize may have occurred. Keep pending and terminate the
+            # session on failure; never authorize old-coordinate input.
+            raise ValueError('LAYOUT_NOT_PROVED')
+        self.height = height
+        self.revision += 1
+        self._marker = self._pending['marker']
+        self._pending = None
+        return self.view()
+
+    def seen(self, body):
+        if (type(body) is not dict or set(body) != {'revision','marker'} or
+                type(body['revision']) is not int or body['revision'] != self.revision or
+                not valid_marker(body['marker']) or self._marker is None or
+                body['marker'] != self._marker or self._pending is not None):
+            return False
+        self._seen = True
+        return True  # Exact duplicate is acknowledgement only, no native replay.
+
+    def clear_request(self):
+        return self._marker if self._seen else None
+
+    def cleared(self, report):
+        if (not self._seen or self._marker is None or type(report) is not dict or
+                set(report) != {'cleared','height'} or report['cleared'] is not True or
+                type(report['height']) is not int or report['height'] != self.height):
+            raise ValueError('LAYOUT_CLEAR_NOT_PROVED')
+        self._seen = False
+        self._marker = None
+        return self.view()
+
+
+class FixedLayout(Layout):
+    """Production geometry never changes; old clients cannot request a resize.
+
+    The receiver contains this full frame while its controls are visible and
+    uses the whole TV when they are hidden. Input always addresses revision 0.
+    No decoded marker acknowledgement is necessary because there is no window
+    resize or coordinate-system transition to acknowledge.
+    """
+    fixed = True
+
+    def queue(self, body):
+        return False
+
+    def seen(self, body):
+        return False
+
+    def commit(self, window_report, viewport):
+        raise ValueError('FIXED_LAYOUT_RESIZE_FORBIDDEN')
+
+    def cleared(self, report):
+        raise ValueError('FIXED_LAYOUT_MARKER_FORBIDDEN')

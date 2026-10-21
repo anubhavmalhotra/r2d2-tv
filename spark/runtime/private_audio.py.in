@@ -1,0 +1,133 @@
+"""Three owned audio daemons, one private graph. No system audio configuration.
+No ALSA/BlueZ/camera/device monitors, hardware factories, persistent policy or DBus.
+Call prepare before browser launch; cleanup only after ProcessOwner verifies ALL children gone.
+"""
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import time
+from audio import AudioError,OwnedAudio,Pulse,SERVER
+
+BASE=Path('/run/user/1000/snap.chromium')
+CORE='r2d2-pipewire'
+COMMON_MODULES='''
+ { name = libpipewire-module-protocol-native }
+ { name = libpipewire-module-client-node }
+ { name = libpipewire-module-adapter }
+ { name = libpipewire-module-metadata }
+ { name = libpipewire-module-session-manager }
+ { name = libpipewire-module-spa-node-factory }
+'''
+SPA='''context.spa-libs = { audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }'''
+
+def configs(path):
+    if not re.fullmatch(r'/run/user/1000/snap\.chromium/r2d2-audio-[0-9a-f]{16}',str(path)):raise AudioError('AUDIO_ROOT_SCOPE')
+    core='''context.properties = { core.daemon = true core.name = r2d2-pipewire support.dbus = false default.clock.rate = 48000 default.clock.quantum = 256 default.clock.min-quantum = 128 default.clock.max-quantum = 1024 }
+'''+SPA+'''\ncontext.modules = ['''+COMMON_MODULES+'''
+ { name = libpipewire-module-link-factory }
+ { name = libpipewire-module-access args = { access.socket = { r2d2-pipewire = unrestricted } } }
+]\n'''
+    pulse='''context.properties = { remote.name = r2d2-pipewire support.dbus = false }
+'''+SPA+'''\ncontext.modules = [
+ { name = libpipewire-module-protocol-native }
+ { name = libpipewire-module-client-node }
+ { name = libpipewire-module-adapter }
+ { name = libpipewire-module-protocol-pulse args = { } }
+]
+pulse.properties = {
+ server.address = [ "unix:'''+str(path)+'''/pulse/native" ]
+ pulse.min.req = 128/48000
+ pulse.default.req = 256/48000
+ pulse.min.quantum = 128/48000
+ pulse.default.tlength = 2048/48000
+ pulse.default.frag = 1024/48000
+}
+'''
+    wp='''context.properties = { remote.name = r2d2-pipewire support.dbus = false log.level = 0 wireplumber.script-engine = lua-scripting }
+'''+SPA+'''\ncontext.modules = ['''+COMMON_MODULES+''']
+wireplumber.components = [
+ { name = libwireplumber-module-lua-scripting type = module }
+ { name = libwireplumber-module-metadata type = module }
+ { name = libwireplumber-module-si-node type = module }
+ { name = libwireplumber-module-si-audio-adapter type = module }
+ { name = libwireplumber-module-si-standard-link type = module }
+ { name = libwireplumber-module-si-audio-endpoint type = module }
+ { name = libwireplumber-module-default-nodes-api type = module }
+ { name = libwireplumber-module-mixer-api type = module }
+ { name = create-item.lua type = script/lua args = { audio.no-dsp = false } }
+ { name = policy-node.lua type = script/lua args = { move = false follow = false } }
+]
+'''
+    return {'pipewire.conf':core,'pipewire-pulse.conf':pulse,'wireplumber.conf':wp}
+
+class PrivateAudio:
+    def __init__(self,owner):
+        if os.getuid()!=1000 or os.geteuid()!=1000:raise AudioError('AUDIO_USER')
+        self.owner=owner;self.path=BASE/('r2d2-audio-'+secrets.token_hex(8))
+        self.children=[];self.shared=None;self.pulse=None;self.audio=None;self.created=False;self.removed=False
+        self.baseline=None;self.identity=None;self.stage="not-started"
+    def prepare(self):
+        if self.created:raise AudioError('AUDIO_GRAPH_REPLAY')
+        # Private runtime is already qualified tmpfs by the browser's PrivateProfile.
+        for p in (BASE,BASE.parent,BASE.parent.parent):
+            s=p.lstat()
+            if not stat.S_ISDIR(s.st_mode) or p.resolve()!=p:raise AudioError('AUDIO_PARENT')
+        s=BASE.lstat()
+        if s.st_uid!=1000 or stat.S_IMODE(s.st_mode)!=0o700:raise AudioError('AUDIO_PARENT')
+        self.shared=Pulse();self.baseline=self.shared.server()
+        self.path.mkdir(mode=0o700);self.created=True;self.identity=self.path.lstat()
+        for name in ('core','pulse','config','state','cache'):(self.path/name).mkdir(mode=0o700)
+        for name,text in configs(self.path).items():
+            fd=os.open(self.path/'config'/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w')as f:f.write(text)
+        env={'PATH':'/usr/bin:/bin','LC_ALL':'C','XDG_RUNTIME_DIR':'/run/user/1000',
+          'PIPEWIRE_RUNTIME_DIR':str(self.path/'core'),'PIPEWIRE_REMOTE':CORE,
+          'PIPEWIRE_CONFIG_DIR':str(self.path/'config'),'WIREPLUMBER_CONFIG_DIR':str(self.path/'config'),
+          'XDG_CONFIG_HOME':str(self.path/'config'),'XDG_STATE_HOME':str(self.path/'state'),'XDG_CACHE_HOME':str(self.path/'cache'),
+          'PIPEWIRE_DEBUG':'0','WIREPLUMBER_DEBUG':'2' if getattr(self.owner,'diagnostic_hook',None) else '0'}
+        self.stage='core-start'
+        core=self.owner.spawn(['/usr/bin/pipewire','-c','pipewire.conf'],env=env,stdout=subprocess.DEVNULL);self.children.append(core)
+        self._socket(self.path/'core'/CORE)
+        self.stage='policy-start'
+        wp=self.owner.spawn(['/usr/bin/wireplumber','-c','wireplumber.conf'],env=env,stdout=subprocess.DEVNULL);self.children.append(wp)
+        self.stage='pulse-start'
+        pulse=self.owner.spawn(['/usr/bin/pipewire-pulse','-c','pipewire-pulse.conf'],env=env,stdout=subprocess.DEVNULL);self.children.append(pulse)
+        self._socket(self.path/'pulse'/'native')
+        self.stage='sink-prepare'
+        self.pulse=Pulse('unix:'+str(self.path/'pulse'/'native'))
+        self.audio=OwnedAudio(self.pulse,private_graph=True);self.audio.prepare();self.assert_alive()
+        self.stage='ready'
+        return self.audio
+    def _socket(self,path):
+        end=time.monotonic()+4
+        while time.monotonic()<end:
+            if any(p.poll()is not None for p in self.children):raise AudioError('AUDIO_DAEMON_EXIT')
+            try:
+                s=path.lstat()
+                if not stat.S_ISSOCK(s.st_mode) or s.st_uid!=1000:raise AudioError('AUDIO_PRIVATE_SOCKET')
+                return
+            except FileNotFoundError:time.sleep(.02)
+        raise AudioError('AUDIO_DAEMON_TIMEOUT')
+    def assert_alive(self):
+        if len(self.children)!=3 or any(not self.owner.live(p.pid)for p in self.children):raise AudioError('AUDIO_DAEMON_EXIT')
+        if self.shared.server()!=self.baseline:raise AudioError('AUDIO_SHARED_DEFAULT_CHANGED')
+    def close_after_process_cleanup(self,verified):
+        if verified is not True:raise AudioError('AUDIO_CHILDREN_STILL_LIVE')
+        if any(p.poll()is None for p in self.children):raise AudioError('AUDIO_DAEMON_STILL_LIVE')
+        if self.pulse:self.pulse.close();self.pulse=None
+        unchanged=self.shared is None
+        if self.shared:
+            try:unchanged=self.shared.server()==self.baseline
+            except AudioError:unchanged=False
+            finally:self.shared.close();self.shared=None
+        if self.created:
+            s=self.path.lstat()
+            if (s.st_dev,s.st_ino,s.st_uid)!=(self.identity.st_dev,self.identity.st_ino,1000)or not stat.S_ISDIR(s.st_mode)or not shutil.rmtree.avoids_symlink_attacks:raise AudioError('AUDIO_ROOT_IDENTITY')
+            shutil.rmtree(self.path);self.removed=not self.path.exists()
+        else:self.removed=True
+        if self.audio:self.audio.removed=self.removed
+        return {'ownedAbsent':self.removed,'defaultsUnchanged':unchanged,'privateDaemonsExited':True}
