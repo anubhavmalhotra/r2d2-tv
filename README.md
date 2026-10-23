@@ -1,5 +1,7 @@
 # R2D2
 
+Demo: https://anubhavmalhotra.com/vibing/r2d2-webos/r2d2-demo.mp4
+
 Read the story behind the project: [R2D2 for webOS](https://anubhavmalhotra.com/vibing/r2d2-webos/).
 
 A local home screen, private remote browser, and push-to-talk voice assistant for webOS TVs. A Linux compute host runs Chromium and the voice models; the TV provides the display, applications, and remote control.
