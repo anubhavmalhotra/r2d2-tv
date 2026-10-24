@@ -7,6 +7,7 @@ const pathModule=require('path');
 const base=require('./legacy_provider');
 const ORIGINAL='/usr/sbin/voiceinput_hidraw';
 const ORIGINAL_SHA='2b9f9e318fba385801e160349159cb3238d1fc370136a385413168170879e28b';
+const LOCK_PATH='/tmp/voiceinput_hidraw.lock';
 const KEYS=['schema','stage','errorNumber','fdsVerified','imageVerified','deadlineExpired','ownerLost','gracefulStopRequested','ownerGraceExpired','tasksObserved','deniedSockets','deniedEscape','replacedReturns','recvmsgReplaced','allReaped','rootExit','rootSignal','supervisionComplete'];
 const SIGNALS={1:'SIGHUP',2:'SIGINT',3:'SIGQUIT',4:'SIGILL',5:'SIGTRAP',6:'SIGABRT',7:'SIGBUS',8:'SIGFPE',9:'SIGKILL',11:'SIGSEGV',13:'SIGPIPE',14:'SIGALRM',15:'SIGTERM',31:'SIGSYS'};
 function fail(){throw Error('OWNER_SUPERVISION_UNQUALIFIED');}
@@ -49,6 +50,19 @@ function descriptor(fd,expected,io=fs){
  }finally{bytes.fill(0);}
 }
 function validateOriginalFd(fd){descriptor(fd,ORIGINAL_SHA);return true;}
+function validLock(s){return Boolean(s&&typeof s.isFile==='function'&&s.isFile()&&(typeof s.isSymbolicLink!=='function'||!s.isSymbolicLink())&&s.uid===0&&s.gid===0&&s.nlink===1&&s.size===0&&(s.mode&0o6077)===0&&(s.mode&0o600)===0o600);}
+function ensureStartupLock(io=fs){
+ try{if(validLock(io.lstatSync(LOCK_PATH)))return true;}catch(e){if(!e||e.code!=='ENOENT')fail();}
+ try{io.unlinkSync(LOCK_PATH);}catch(e){if(!e||e.code!=='ENOENT')fail();}
+ const c=io.constants||fs.constants,fd=io.openSync(LOCK_PATH,c.O_WRONLY|c.O_CREAT|c.O_EXCL|c.O_NOFOLLOW,0o600);
+ try{
+  if(typeof io.fchmodSync==='function')io.fchmodSync(fd,0o600);
+  if(typeof io.fchownSync==='function')io.fchownSync(fd,0,0);
+  if(!validLock(io.fstatSync(fd)))fail();
+ }finally{io.closeSync(fd);}
+ if(!validLock(io.lstatSync(LOCK_PATH)))fail();
+ return true;
+}
 function receipt(raw){
  const x=JSON.parse(raw);
  if(!x||Array.isArray(x)||Object.keys(x).sort().join()!==KEYS.slice().sort().join()||x.schema!==1||!['preflight','descendant','exec-identity','syscall','options','owner-retirement'].includes(x.stage))fail();
@@ -101,6 +115,7 @@ function launch(options,done){
    const ids=fs.readdirSync('/proc').filter(x=>/^\d{1,10}$/.test(x));if(ids.length>1024)fail();
    for(const id of ids){try{const path='/proc/'+id+'/exe',target=fs.readlinkSync(path),running=fs.statSync(path);if(target===ORIGINAL||target===ORIGINAL+' (deleted)'||running.dev===image.dev&&running.ino===image.ino)fail();}catch(e){if(e.code==='ENOENT')continue;throw e;}}
    if(Object.keys(image).some(k=>image[k]!==fs.fstatSync(exe)[k]))fail();
+   ensureStartupLock();
    spawning=true;
    const child=cp.spawn(options.supervisorPath,['--owned',String(options.maxMs+1500)],{stdio:['ignore','ignore','pipe','pipe','pipe','pipe','pipe',exe,mod],env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C'}});
    const managed=facade(child);const session=new base.Session(managed,options,r=>{r.supervision=managed.supervision||null;r.cleanExit=Boolean(r.cleanExit&&r.supervision&&r.supervision.supervisionComplete);r.networkSealInstalled=Boolean(r.networkSealInstalled&&r.supervision&&r.supervision.imageVerified&&r.supervision.fdsVerified);done(r);});
@@ -108,4 +123,4 @@ function launch(options,done){
   }finally{for(const fd of [mod,tracer])if(Number.isInteger(fd))fs.closeSync(fd);}
  }catch(e){if(!spawning)throw unspawned();throw e;}
 }
-module.exports={launch,neverSpawned,facade,receipt,validateOriginalFd,_descriptor:descriptor,_protectedParents:protectedParents};
+module.exports={launch,neverSpawned,facade,receipt,validateOriginalFd,ensureStartupLock,_descriptor:descriptor,_protectedParents:protectedParents};

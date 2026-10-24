@@ -1,6 +1,6 @@
 'use strict';
 const assert=require('assert'),crypto=require('crypto');
-const {_descriptor:descriptor,validateOriginalFd,_protectedParents:protectedParents}=require('./supervised_provider');
+const {_descriptor:descriptor,validateOriginalFd,ensureStartupLock,_protectedParents:protectedParents}=require('./supervised_provider');
 const bytes=Buffer.from('held original image fixture'),expected=crypto.createHash('sha256').update(bytes).digest('hex');
 function fixture(change={}){
  const stat={dev:1,ino:2,mode:0o100755,uid:0,gid:0,nlink:1,size:bytes.length,mtimeMs:4,ctimeMs:5,isFile:()=>true,...change.stat};
@@ -29,4 +29,19 @@ for(const unsafe of ['/root/private','/root','/']){
  assert.throws(()=>protectedParents('/root/private/module.so',io),/OWNER_SUPERVISION_UNQUALIFIED/);
 }groups++;
 for(const change of [{uid:501},{isSymbolicLink:()=>true},{isDirectory:()=>false}])assert.throws(()=>protectedParents('/root/private/module.so',{realpathSync:p=>p,lstatSync:()=>({isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755,...change})}),/OWNER_SUPERVISION_UNQUALIFIED/);groups++;
+{
+ let created=0,unlinked=0,exists=false;
+ const lockStat={isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600};
+ const io={
+  lstatSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});return lockStat;},
+  unlinkSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');unlinked++;if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});},
+  openSync(p,flags,mode){assert.equal(p,'/tmp/voiceinput_hidraw.lock');assert.equal(mode,0o600);created++;exists=true;return 19;},
+  fchmodSync(fd,mode){assert.equal(fd,19);assert.equal(mode,0o600);},
+  fchownSync(fd,u,g){assert.equal(fd,19);assert.equal(u,0);assert.equal(g,0);},
+  fstatSync(fd){assert.equal(fd,19);return lockStat;},
+  closeSync(fd){assert.equal(fd,19);}
+ };
+ assert.equal(ensureStartupLock(io),true);assert.equal(created,1);assert.equal(unlinked,1);
+ assert.equal(ensureStartupLock(io),true);assert.equal(created,1);assert.equal(unlinked,1);
+}groups++;
 console.log(JSON.stringify({groups,nativeCalls:0,modelCalls:0}));

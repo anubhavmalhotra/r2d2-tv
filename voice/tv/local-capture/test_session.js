@@ -19,7 +19,7 @@ function world(change,fn){
  const stubs={
   fstatSync:fd=>fd===9?{...file}:{...file,ino:fd},readlinkSync:p=>p.startsWith('/proc/self/fd/')?'/held/original':p==='/proc/77/exe'&&change.liveOriginal?ORIGINAL:'/usr/bin/other',
   readFileSync:(p,enc)=>typeof p==='string'?'pos:\t0\nflags:\t0100000\n':Buffer.alloc(4,1),readSync:(fd,b,o,n,pos)=>{const k=Math.max(0,Math.min(n,4-pos));b.fill(1,o,o+k);return k;},
-  realpathSync:p=>p,lstatSync:()=>({isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755}),openSync:p=>p==='/m/supervisor'?11:10,closeSync(){},
+  realpathSync:p=>p,lstatSync:p=>p==='/tmp/voiceinput_hidraw.lock'?{isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600}:{isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755},openSync:p=>p==='/m/supervisor'?11:10,closeSync(){},
   statSync:p=>p==='/m/supervisor'?{...file,ino:11}:{...file,ino:99},readdirSync:()=>['77','self']};
  // Every image hash "matches": the held original's pinned SHA is not something a test can produce.
  const sha='2b9f9e318fba385801e160349159cb3238d1fc370136a385413168170879e28b',hash=crypto.createHash,spawn=cp.spawn;
