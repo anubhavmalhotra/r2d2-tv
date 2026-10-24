@@ -16,10 +16,15 @@ function cancelled(){const end=deferred();return{authenticatedTransportReady:tru
 function world(change,fn){
  const ORIGINAL='/usr/sbin/voiceinput_hidraw',saved={},platform=Object.getOwnPropertyDescriptor(process,'platform'),getuid=process.getuid;
  const file={dev:1,ino:2,mode:0o100755,uid:0,gid:0,nlink:1,size:4,mtimeMs:4,ctimeMs:5,isFile:()=>true};
+ const lockFile={isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600};
+ let lockCreated=false;
  const stubs={
-  fstatSync:fd=>fd===9?{...file}:{...file,ino:fd},readlinkSync:p=>p.startsWith('/proc/self/fd/')?'/held/original':p==='/proc/77/exe'&&change.liveOriginal?ORIGINAL:'/usr/bin/other',
+  fstatSync:fd=>fd===9?{...file}:fd===19?lockFile:{...file,ino:fd},readlinkSync:p=>p.startsWith('/proc/self/fd/')?'/held/original':p==='/proc/77/exe'&&change.liveOriginal?ORIGINAL:'/usr/bin/other',
   readFileSync:(p,enc)=>typeof p==='string'?'pos:\t0\nflags:\t0100000\n':Buffer.alloc(4,1),readSync:(fd,b,o,n,pos)=>{const k=Math.max(0,Math.min(n,4-pos));b.fill(1,o,o+k);return k;},
-  realpathSync:p=>p,lstatSync:p=>p==='/tmp/voiceinput_hidraw.lock'?{isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600}:{isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755},openSync:p=>p==='/m/supervisor'?11:10,closeSync(){},
+  realpathSync:p=>p,lstatSync:p=>{if(p==='/tmp/voiceinput_hidraw.lock'){if(change.lockError)throw Object.assign(Error('denied'),{code:'EACCES'});if(!lockCreated)throw Object.assign(Error('missing'),{code:'ENOENT'});return lockFile;}return{isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755};},
+  unlinkSync:p=>{if(p==='/tmp/voiceinput_hidraw.lock'&&!lockCreated)throw Object.assign(Error('missing'),{code:'ENOENT'});},
+  openSync:(p,flags,mode)=>{if(p==='/tmp/voiceinput_hidraw.lock'){assert.equal(mode,0o600);lockCreated=true;return 19;}return p==='/m/supervisor'?11:10;},
+  fchmodSync(){},fchownSync(){},closeSync(){},
   statSync:p=>p==='/m/supervisor'?{...file,ino:11}:{...file,ino:99},readdirSync:()=>['77','self']};
  // Every image hash "matches": the held original's pinned SHA is not something a test can produce.
  const sha='2b9f9e318fba385801e160349159cb3238d1fc370136a385413168170879e28b',hash=crypto.createHash,spawn=cp.spawn;
@@ -27,7 +32,7 @@ function world(change,fn){
   Object.defineProperty(process,'platform',{value:'linux',configurable:true});process.getuid=()=>0;
   for(const k of Object.keys(stubs)){saved[k]=fs[k];fs[k]=stubs[k];}
   crypto.createHash=()=>({update(){return this;},digest:()=>sha});
-  cp.spawn=change.spawn||(()=>{throw Error('spawn EAGAIN');});
+  cp.spawn=(...args)=>{assert.equal(lockCreated,true,'ensureStartupLock must run before spawn');return (change.spawn||(()=>{throw Error('spawn EAGAIN');}))(...args);};
   return fn({mode:'capture',device:'',maxMs:10000,backendProfile:1,heldOriginalFd:9,modulePath:'/m/module.so',moduleSha256:sha,supervisorPath:'/m/supervisor',supervisorSha256:sha});
  }finally{
   Object.defineProperty(process,'platform',platform);process.getuid=getuid;for(const k of Object.keys(saved))fs[k]=saved[k];crypto.createHash=hash;cp.spawn=spawn;
@@ -83,7 +88,8 @@ async function shutdownReceipt(change){
   const hooks={onReady(){},onPcm(){}},done=()=>{};
   for(const refuse of [()=>native.launch({...provider,...hooks},done),()=>native.launch(null,done),()=>native.launch({...provider,...hooks}),
    ()=>world({},o=>native.launch({...o,maxMs:50,...hooks},done)),()=>world({},o=>native.launch({...o,heldOriginalFd:2,...hooks},done)),
-   ()=>world({liveOriginal:true},o=>native.launch({...o,...hooks},done))]){
+   ()=>world({liveOriginal:true},o=>native.launch({...o,...hooks},done)),
+   ()=>world({lockError:true},o=>native.launch({...o,...hooks},done))]){
    const e=thrown(refuse);assert.equal(native.neverSpawned(e),true,String(e));assert.equal(e.message,'PROVIDER_NEVER_SPAWNED');
   }
   let spawned=0;

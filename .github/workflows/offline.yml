@@ -30,6 +30,7 @@ jobs:
       - run: node .build/ci/spark/runtime/test_history_back.js
       - run: python3 -B -m unittest discover -s tv/integration -p 'test_*.py'
       - run: python3 -B -m unittest discover -s voice -p 'test_*.py'
+      - run: python3 -B -m unittest discover -s voice/agent -p 'test_*.py'
       - run: python3 -B tools/check_voice_backend.py
       - run: node voice/backend/test_voice_route.js
       - run: node voice/backend/test_open_handoff.js
@@ -57,6 +58,7 @@ jobs:
       - run: node voice/tv/local-capture/test_bus_context.js
       - run: node voice/tv/local-capture/test_bootstrap_entry.js
       - run: node voice/tv/local-capture/test_held_original.js
+      - run: node voice/tv/local-capture/test_tv_maintenance.js
       - run: python3 -B -m unittest discover -s voice/tv/control -p 'test_*.py'
       - run: node voice/tv/control/test_retry.js
       - run: node voice/tv/transport/test_unit.js

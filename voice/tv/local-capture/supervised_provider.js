@@ -50,7 +50,7 @@ function descriptor(fd,expected,io=fs){
  }finally{bytes.fill(0);}
 }
 function validateOriginalFd(fd){descriptor(fd,ORIGINAL_SHA);return true;}
-function validLock(s){return Boolean(s&&typeof s.isFile==='function'&&s.isFile()&&(typeof s.isSymbolicLink!=='function'||!s.isSymbolicLink())&&s.uid===0&&s.gid===0&&s.nlink===1&&s.size===0&&(s.mode&0o6077)===0&&(s.mode&0o600)===0o600);}
+function validLock(s){return Boolean(s&&typeof s.isFile==='function'&&s.isFile()&&(typeof s.isSymbolicLink!=='function'||!s.isSymbolicLink())&&s.uid===0&&s.gid===0&&s.nlink===1&&s.size===0&&(s.mode&0o7777)===0o600);}
 function ensureStartupLock(io=fs){
  try{if(validLock(io.lstatSync(LOCK_PATH)))return true;}catch(e){if(!e||e.code!=='ENOENT')fail();}
  try{io.unlinkSync(LOCK_PATH);}catch(e){if(!e||e.code!=='ENOENT')fail();}

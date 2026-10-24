@@ -242,33 +242,50 @@ def orchestrate_tv_maintenance(
     st0 = ctl_call({"cmd": "status"}) if ctl_fn is ctl_call else ctl_fn({"cmd": "status"})
     res0 = ((st0.get("result") or {}).get("resident") or {}) if isinstance(st0, dict) and st0.get("ok") else {}
     initial_power = res0.get("tvPower") or ((st0.get("result") or {}).get("warm") or {}).get("warm", {}).get("power")
-    initial_polls = res0.get("residentPolls", 0)
+    initial_polls = res0.get("residentPolls", 0) if isinstance(res0.get("residentPolls"), int) else 0
     discovered_macs = list(res0.get("tvMacs") or [])
     all_macs = list(dict.fromkeys([*(known_macs or []), *discovered_macs]))
 
     woke_from_standby = False
     wol_packets_sent = 0
+    idle_foreground_apps = {"", "local.owner.applibrary", "com.webos.app.screensaver", "com.webos.app.home"}
 
     if mode == "update" and initial_power != "active":
         if all_macs:
             wol_packets_sent = wol_fn(all_macs)
+        if wol_packets_sent > 0:
             wake_deadline = monotonic_fn() + wake_wait_seconds
             while monotonic_fn() < wake_deadline:
                 sleep_fn(2.0)
                 st_wake = ctl_fn({"cmd": "status"})
                 if isinstance(st_wake, dict) and st_wake.get("ok"):
                     r_wake = (st_wake.get("result") or {}).get("resident") or {}
-                    p_wake = r_wake.get("tvPower") or (
-                        ((st_wake.get("result") or {}).get("warm") or {}).get("warm", {}).get("power")
+                    p_wake = r_wake.get("tvPower")
+                    polls_wake = r_wake.get("residentPolls", 0) if isinstance(r_wake.get("residentPolls"), int) else 0
+                    fg_raw = r_wake.get("foregroundAppId")
+                    has_idle_fg = (
+                        isinstance(fg_raw, str)
+                        and bool(fg_raw.strip())
+                        and fg_raw.strip() in idle_foreground_apps
                     )
-                    if p_wake == "active" or r_wake.get("residentPolls", 0) > initial_polls:
-                        woke_from_standby = True
+                    explicit_user_inactive = r_wake.get("userActive") is False
+                    positive_wake_owned = (
+                        r_wake.get("wakeOwned") is True
+                        or (
+                            "wakeOwned" not in r_wake
+                            and r_wake.get("wakeReason") in ("wol", "network", "magicPacket")
+                        )
+                    )
+                    if p_wake == "active" and polls_wake > initial_polls:
                         initial_power = "active"
+                        woke_from_standby = bool(
+                            positive_wake_owned and explicit_user_inactive and has_idle_fg
+                        )
                         break
 
-        if not woke_from_standby:
-            # Queue a deferred update on the agent so it triggers when the TV wakes and becomes idle
-            trig_def = ctl_fn({"cmd": "maintenance-update"})
+        if initial_power != "active":
+            # Queue an idle-gated deferred update so the TV only runs it after 30 minutes of verified idle
+            trig_def = ctl_fn({"cmd": "maintenance-update-idle"})
             req_id_def = (
                 trig_def.get("result", {}).get("reqId")
                 if isinstance(trig_def, dict) and trig_def.get("ok") and isinstance(trig_def.get("result"), dict)
@@ -283,6 +300,8 @@ def orchestrate_tv_maintenance(
                 },
                 "tvMaintenance": {
                     "status": "tv_off_deferred_to_idle_or_wake",
+                    "mode": "update-idle",
+                    "requiresIdle": True,
                     "reqId": req_id_def,
                     "wolPacketsSent": wol_packets_sent,
                     "wokeFromStandby": False,
@@ -291,14 +310,14 @@ def orchestrate_tv_maintenance(
 
     if mode == "check":
         cmd_name = "maintenance-check"
+    elif mode == "update-idle":
+        cmd_name = "maintenance-update-idle"
     elif woke_from_standby or mode == "update-standby":
         cmd_name = "maintenance-update-standby"
     else:
         cmd_name = "maintenance-update"
 
     trig = ctl_fn({"cmd": cmd_name})
-    if not (isinstance(trig, dict) and trig.get("ok")) and cmd_name == "maintenance-update-standby":
-        trig = ctl_fn({"cmd": "maintenance-update"})
 
     req_id = None
     if isinstance(trig, dict) and trig.get("ok") and isinstance(trig.get("result"), dict):

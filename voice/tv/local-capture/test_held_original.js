@@ -30,18 +30,25 @@ for(const unsafe of ['/root/private','/root','/']){
 }groups++;
 for(const change of [{uid:501},{isSymbolicLink:()=>true},{isDirectory:()=>false}])assert.throws(()=>protectedParents('/root/private/module.so',{realpathSync:p=>p,lstatSync:()=>({isDirectory:()=>true,isSymbolicLink:()=>false,uid:0,mode:0o40755,...change})}),/OWNER_SUPERVISION_UNQUALIFIED/);groups++;
 {
- let created=0,unlinked=0,exists=false;
+ let created=0,unlinked=0,exists=false,currentStat={isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600};
  const lockStat={isFile:()=>true,isSymbolicLink:()=>false,uid:0,gid:0,nlink:1,size:0,mode:0o100600};
  const io={
-  lstatSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});return lockStat;},
-  unlinkSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');unlinked++;if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});},
-  openSync(p,flags,mode){assert.equal(p,'/tmp/voiceinput_hidraw.lock');assert.equal(mode,0o600);created++;exists=true;return 19;},
+  lstatSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});return currentStat;},
+  unlinkSync(p){assert.equal(p,'/tmp/voiceinput_hidraw.lock');unlinked++;if(!exists)throw Object.assign(Error('missing'),{code:'ENOENT'});exists=false;},
+  openSync(p,flags,mode){assert.equal(p,'/tmp/voiceinput_hidraw.lock');assert.equal(mode,0o600);created++;exists=true;currentStat=lockStat;return 19;},
   fchmodSync(fd,mode){assert.equal(fd,19);assert.equal(mode,0o600);},
   fchownSync(fd,u,g){assert.equal(fd,19);assert.equal(u,0);assert.equal(g,0);},
-  fstatSync(fd){assert.equal(fd,19);return lockStat;},
+  fstatSync(fd){assert.equal(fd,19);return currentStat;},
   closeSync(fd){assert.equal(fd,19);}
  };
  assert.equal(ensureStartupLock(io),true);assert.equal(created,1);assert.equal(unlinked,1);
  assert.equal(ensureStartupLock(io),true);assert.equal(created,1);assert.equal(unlinked,1);
+ for(const badMode of [0o100700,0o101600,0o101700,0o100644,0o100400,0o104600,0o102600]){
+  currentStat={...lockStat,mode:badMode};
+  const prevCreated=created,prevUnlinked=unlinked;
+  assert.equal(ensureStartupLock(io),true);
+  assert.equal(unlinked,prevUnlinked+1);
+  assert.equal(created,prevCreated+1);
+ }
 }groups++;
 console.log(JSON.stringify({groups,nativeCalls:0,modelCalls:0}));

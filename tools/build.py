@@ -181,6 +181,7 @@ def build(cfg, out, key=None, include_tests=False, logos=None):
     runtime_files = (
         ('voice/runtime/pool.py', 'pool.py'),
         ('voice/runtime/result.py', 'result.py'),
+        ('voice/agent/nightly_maintenance.py', 'nightly_maintenance.py'),
         ('voice/agent/prototype/agent/warm.py', 'warm.py'),
         ('voice/agent/prototype/agent/errors.py', 'errors.py'),
     )
@@ -226,7 +227,7 @@ def build(cfg, out, key=None, include_tests=False, logos=None):
     # raw-HID main entry. No native binaries, migration record or identity ships.
     local_capture = (
         'main.js', 'bootstrap_entry.js', 'bus_context.js', 'power_reader.js', 'package.json', 'controller.js', 'service_port.js', 'owner_service.js',
-        'session.js', 'legacy_provider.js', 'supervised_provider.js',
+        'session.js', 'legacy_provider.js', 'supervised_provider.js', 'tv_maintenance.js',
         'ui_capture.js', 'ui_heartbeat.js', 'ui_qualification.js', 'ui_authority.hpp', 'voice_feedback.js',
         'quiescence.js', 'patch_keyfilter.py', 'build_native.py',
         'native_handoff.cpp', 'native_handoff.hpp', 'ble_callback.hpp', 'native_retirement.hpp',

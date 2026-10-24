@@ -20,10 +20,16 @@ let groups = 0;
 
     const windowOpen = maint.renderBlockedHosts(fullBlock, { allowAppStore: true });
     for (const d of maint.LG_PERMANENT_BLOCK_DOMAINS) {
-      assert(windowOpen.includes('0.0.0.0 ' + d), 'Permanent block must remain during appstore window: ' + d);
+      assert(
+        windowOpen.includes('0.0.0.0 ' + d),
+        'Permanent block must remain during appstore window: ' + d
+      );
     }
     for (const d of maint.LG_APPSTORE_DOMAINS) {
-      assert(!windowOpen.includes('0.0.0.0 ' + d), 'Appstore domain must be unblocked during window: ' + d);
+      assert(
+        !windowOpen.includes('0.0.0.0 ' + d),
+        'Appstore domain must be unblocked during window: ' + d
+      );
     }
 
     const stripped = maint.stripManagedHostsBlock(fullBlock);
@@ -31,15 +37,24 @@ let groups = 0;
     groups++;
   }
 
-  // 2. iptables rules block 156.147.69.32 permanently without blocking consumer CDNs
+  // 2. iptables rules block 156.147.69.32 permanently and block harvested App Store IPs when window closes
   {
-    const cmds = maint.buildIptablesCommands().map((c) => c.join(' '));
-    assert(cmds.includes('-A R2D2_LG_GUARD -d 156.147.69.32 -j REJECT'));
-    assert(cmds.includes('-A R2D2_LG_GUARD -j RETURN'));
+    const openCmds = maint
+      .buildIptablesCommands({ allowAppStore: true, appStoreIps: ['203.0.113.50'] })
+      .map((c) => c.join(' '));
+    assert(openCmds.includes('-A R2D2_LG_GUARD -d 156.147.69.32 -j REJECT'));
+    assert(!openCmds.includes('-A R2D2_LG_GUARD -d 203.0.113.50 -j REJECT'));
+
+    const closedCmds = maint
+      .buildIptablesCommands({ allowAppStore: false, appStoreIps: ['203.0.113.50'] })
+      .map((c) => c.join(' '));
+    assert(closedCmds.includes('-A R2D2_LG_GUARD -d 156.147.69.32 -j REJECT'));
+    assert(closedCmds.includes('-A R2D2_LG_GUARD -d 203.0.113.50 -j REJECT'));
+    assert(closedCmds.includes('-A R2D2_LG_GUARD -j RETURN'));
     groups++;
   }
 
-  // 3. Scheduler triggers at 3:00 AM and catches up after 30 minutes of idle if 3:00 AM was missed
+  // 3. Scheduler: 3 AM window, missed-window persistence, no pre-3-AM consumption, and 30-min idle requirement
   {
     const at3am = new Date(2026, 9, 25, 3, 5, 0);
     const r1 = maint.shouldRunScheduledUpdate(
@@ -65,42 +80,127 @@ let groups = 0;
     );
     assert.strictEqual(offAt3am.run, false);
     assert.strictEqual(offAt3am.reason, 'tv-not-active');
+    assert.strictEqual(offAt3am.recordMissedDay, '2026-10-25');
 
-    const afternoonShortIdle = new Date(2026, 9, 25, 14, 0, 0);
-    const r2 = maint.shouldRunScheduledUpdate(
+    // Before 3:00 AM (e.g. 00:40 AM on Oct 25) when Oct 24 already updated: must NOT run early and consume Oct 25
+    const before3am = new Date(2026, 9, 25, 0, 40, 0);
+    const rBefore3am = maint.shouldRunScheduledUpdate(
       { lastUpdateDay: '2026-10-24' },
-      afternoonShortIdle,
-      { tvPower: 'active', foregroundAppId: 'local.owner.applibrary', idleDurationMs: 10 * 60 * 1000 }
+      before3am,
+      {
+        tvPower: 'active',
+        foregroundAppId: 'local.owner.applibrary',
+        idleDurationMs: 45 * 60 * 1000
+      }
     );
-    assert.strictEqual(r2.run, false);
+    assert.strictEqual(rBefore3am.run, false);
 
-    const r3 = maint.shouldRunScheduledUpdate(
-      { lastUpdateDay: '2026-10-24' },
-      afternoonShortIdle,
-      { tvPower: 'active', foregroundAppId: 'local.owner.applibrary', idleDurationMs: 30 * 60 * 1000 }
+    // Before 3:00 AM when yesterday (Oct 24) was missed: catches up Oct 24 without consuming Oct 25
+    const rMissedYesterdayBefore3am = maint.shouldRunScheduledUpdate(
+      { lastUpdateDay: '2026-10-23', missedWindowDay: '2026-10-24' },
+      before3am,
+      {
+        tvPower: 'active',
+        foregroundAppId: 'local.owner.applibrary',
+        idleDurationMs: 45 * 60 * 1000
+      }
     );
-    assert.strictEqual(r3.run, true);
-    assert.strictEqual(r3.reason, 'idle-catchup');
+    assert.strictEqual(rMissedYesterdayBefore3am.run, true);
+    assert.strictEqual(rMissedYesterdayBefore3am.targetDay, '2026-10-24');
+
+    // Persistent=true timer trigger firing at 10:00 AM after missed 3:00 AM must defer to 30-min idle
+    const at10am = new Date(2026, 9, 25, 10, 0, 0);
+    const consumed = maint.consumeUpdaterTrigger(
+      { reqId: 'tv-timer-123', mode: 'update' },
+      at10am,
+      { lastUpdateDay: '2026-10-24' }
+    );
+    assert.strictEqual(consumed.immediate, false);
+    assert.strictEqual(consumed.deferredToIdle, true);
+    assert.strictEqual(consumed.state.missedWindowDay, '2026-10-25');
+
+    const rShortIdle = maint.shouldRunScheduledUpdate(consumed.state, at10am, {
+      tvPower: 'active',
+      foregroundAppId: 'local.owner.applibrary',
+      idleDurationMs: 10 * 60 * 1000
+    });
+    assert.strictEqual(rShortIdle.run, false);
+
+    const r30MinIdle = maint.shouldRunScheduledUpdate(consumed.state, at10am, {
+      tvPower: 'active',
+      foregroundAppId: 'local.owner.applibrary',
+      idleDurationMs: 30 * 60 * 1000
+    });
+    assert.strictEqual(r30MinIdle.run, true);
+    assert.strictEqual(r30MinIdle.reason, 'idle-catchup');
+    assert.strictEqual(r30MinIdle.reqId, 'tv-timer-123');
     groups++;
   }
 
-  // 4. All installed apps with updateYN === 'Y' are updated; foreground app and Home/retired apps are protected
+  // 4. Empty installed-app inventory never broadens eligibility; Home Input resets idle timer
+  {
+    const emptyRes = maint.selectUpdatableApps(
+      [],
+      [{ id: 'netflix', updateYN: 'Y', version: '2.1.0' }],
+      null
+    );
+    assert.deepStrictEqual(emptyRes.updatable, []);
+
+    let clock = 1000;
+    let irqText = ' 42: 100 gpio-keys\n';
+    let fg = 'local.owner.applibrary';
+    const tracker = maint.createActivityTracker({
+      nowMs: () => clock,
+      readInterrupts: () => irqText,
+      queryForegroundSync: () => fg
+    });
+    tracker.sampleSync();
+    clock += 20 * 60 * 1000;
+    let snap = tracker.sampleSync();
+    assert.strictEqual(snap.idleDurationMs, 20 * 60 * 1000);
+
+    // Input on Home (local.owner.applibrary) must reset the idle timer
+    clock += 1000;
+    irqText = ' 42: 101 gpio-keys\n';
+    snap = tracker.sampleSync();
+    assert.strictEqual(snap.idleDurationMs, 0);
+    groups++;
+  }
+
+  // 5. Foreground recheck before every install & foreground change during update prevents standby
   {
     const windowTransitions = [];
-    const lunaCalls = [];
+    const installCalls = [];
+    const powerCalls = [];
+    let fgApp = 'local.owner.applibrary';
+    let clock = 10000;
+
     const res = await maint.runUpdateWorkflow({
-      mode: 'update',
+      mode: 'update-standby',
       tvPower: 'active',
-      allowlistApps: ['netflix', 'youtube.leanback.v4'],
+      nowMs: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      allowlistApps: ['youtube.leanback.v4', 'netflix'],
       setLgEgressWindow: async (open) => {
         windowTransitions.push(open);
+        return true;
       },
       callLunaSend: async (uri, payload) => {
-        lunaCalls.push({ uri, payload });
+        if (uri.includes('tvpower')) {
+          powerCalls.push({ uri, payload });
+          return { returnValue: true };
+        }
         if (uri === 'luna://com.webos.applicationManager/getForegroundAppInfo') {
-          return { returnValue: true, appId: 'netflix' };
+          return { returnValue: true, appId: fgApp };
         }
         if (uri === 'luna://com.webos.appInstallService/install') {
+          installCalls.push(payload.id);
+          // While youtube is installing, user switches foreground to netflix!
+          if (payload.id === 'youtube.leanback.v4') {
+            fgApp = 'netflix';
+          }
           return { returnValue: true };
         }
         return { returnValue: true };
@@ -111,10 +211,8 @@ let groups = 0;
             returnValue: true,
             apps: [
               { id: 'local.owner.applibrary', version: '1.0.0' },
-              { id: 'netflix', version: '2.0.0' },
               { id: 'youtube.leanback.v4', version: '3.0.0' },
-              { id: 'plex', version: '4.1.0' },
-              { id: 'com.webos.app.adapp', version: '1.0.0' }
+              { id: 'netflix', version: '2.0.0' }
             ]
           };
         }
@@ -123,11 +221,8 @@ let groups = 0;
             returnValue: true,
             status: {
               apps: [
-                { id: 'local.owner.applibrary', updateYN: 'Y', version: '9.9.9' },
-                { id: 'netflix', updateYN: 'Y', version: '2.1.0' },
                 { id: 'youtube.leanback.v4', updateYN: 'Y', version: '3.1.0' },
-                { id: 'plex', updateYN: 'Y', version: '4.2.0' },
-                { id: 'com.webos.app.adapp', updateYN: 'Y', version: '2.0.0' }
+                { id: 'netflix', updateYN: 'Y', version: '2.1.0' }
               ]
             }
           };
@@ -136,10 +231,7 @@ let groups = 0;
           return {
             returnValue: true,
             status: {
-              apps: [
-                { id: 'youtube.leanback.v4', state: 'installed' },
-                { id: 'plex', state: 'installed' }
-              ]
+              apps: [{ id: 'youtube.leanback.v4', state: 'installed' }]
             }
           };
         }
@@ -148,23 +240,40 @@ let groups = 0;
     });
 
     assert.deepStrictEqual(windowTransitions, [true, false]);
+    assert.deepStrictEqual(installCalls, ['youtube.leanback.v4']);
+    assert.deepStrictEqual(res.updatesCompleted, ['youtube.leanback.v4']);
     assert.deepStrictEqual(res.updatesSkippedForeground, ['netflix']);
-    assert.deepStrictEqual(res.updatesAttempted, ['youtube.leanback.v4', 'plex']);
-    assert.deepStrictEqual(res.updatesCompleted, ['youtube.leanback.v4', 'plex']);
-    assert.strictEqual(res.screenTurnedOff, false);
+    assert.strictEqual(res.userActivityDetected, true);
     assert.strictEqual(res.returnedToStandby, false);
+    assert.strictEqual(res.maintenanceComplete, false);
+    assert.deepStrictEqual(res.pendingApps, ['netflix']);
+
+    const nextState = maint.computeNextUpdaterState(
+      { lastUpdateDay: '2026-10-24' },
+      res,
+      { nowDate: new Date(2026, 9, 25, 3, 10, 0), targetDay: '2026-10-25', reqId: 'req-1' }
+    );
+    assert.strictEqual(nextState.lastUpdateDay, '2026-10-24');
+    assert.strictEqual(nextState.pendingRetryDay, '2026-10-25');
+    assert.deepStrictEqual(nextState.pendingApps, ['netflix']);
     groups++;
   }
 
-  // 5. Woken-from-standby 3 AM mode ('update-standby') turns off screen, updates all apps, and returns to standby
+  // 6. Woken-from-standby 3 AM mode ('update-standby') with idle foreground completes all updates and returns to standby
   {
     const windowTransitions = [];
     const powerCalls = [];
+    let clock = 5000;
     const res = await maint.runUpdateWorkflow({
       mode: 'update-standby',
       tvPower: 'active',
+      nowMs: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
       setLgEgressWindow: async (open) => {
         windowTransitions.push(open);
+        return true;
       },
       callLunaSend: async (uri, payload) => {
         if (uri.includes('tvpower')) {
@@ -172,7 +281,7 @@ let groups = 0;
           return { returnValue: true };
         }
         if (uri === 'luna://com.webos.applicationManager/getForegroundAppInfo') {
-          return { returnValue: true, appId: 'netflix' };
+          return { returnValue: true, appId: 'local.owner.applibrary' };
         }
         if (uri === 'luna://com.webos.appInstallService/install') {
           return { returnValue: true };
@@ -208,37 +317,101 @@ let groups = 0;
 
     assert.deepStrictEqual(windowTransitions, [true, false]);
     assert.deepStrictEqual(res.updatesCompleted, ['netflix']);
+    assert.strictEqual(res.maintenanceComplete, true);
     assert.strictEqual(res.screenTurnedOff, true);
     assert.strictEqual(res.returnedToStandby, true);
     assert.strictEqual(powerCalls.length, 2);
     assert.strictEqual(powerCalls[0].uri, 'luna://com.webos.service.tvpower/power/turnOffScreen');
     assert.strictEqual(powerCalls[1].uri, 'luna://com.webos.service.tvpower/power/turnOff');
+
+    const nextState = maint.computeNextUpdaterState(
+      { lastUpdateDay: '2026-10-24', missedWindowDay: '2026-10-25' },
+      res,
+      { nowDate: new Date(2026, 9, 25, 3, 10, 0), targetDay: '2026-10-25', reqId: 'req-2' }
+    );
+    assert.strictEqual(nextState.lastUpdateDay, '2026-10-25');
+    assert.strictEqual(nextState.pendingRetryDay, null);
+    assert.deepStrictEqual(nextState.pendingApps, []);
     groups++;
   }
 
-  // 6. If user activity occurs during a 3 AM 'update-standby' run, TV remains on instead of powering off
+  // 7. Null/error status responses and stalled 45s downloads are NOT treated as completed and prevent standby
   {
+    let clock = 1000;
+    const cancelCalls = [];
     const powerCalls = [];
+    let statusCallCount = 0;
+
     const res = await maint.runUpdateWorkflow({
       mode: 'update-standby',
       tvPower: 'active',
-      hasUserActivitySince: () => true,
+      nowMs: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      installTimeoutMs: 10000,
+      maxInstallTimeoutMs: 12000,
+      pollIntervalMs: 3000,
+      setLgEgressWindow: async () => true,
       callLunaSend: async (uri, payload) => {
         if (uri.includes('tvpower')) {
-          powerCalls.push({ uri, payload });
+          powerCalls.push(uri);
+          return { returnValue: true };
+        }
+        if (uri === 'luna://com.webos.appInstallService/cancel') {
+          cancelCalls.push(payload.id);
+          return { returnValue: true };
+        }
+        if (uri === 'luna://com.webos.applicationManager/getForegroundAppInfo') {
+          return { returnValue: true, appId: 'local.owner.applibrary' };
+        }
+        if (uri === 'luna://com.webos.appInstallService/install') {
+          return { returnValue: true };
         }
         return { returnValue: true };
       },
-      callLunaSendLarge: async () => ({ returnValue: true, apps: [], status: { apps: [] } })
+      callLunaSendLarge: async (uri) => {
+        if (uri === 'luna://com.webos.applicationManager/listApps') {
+          return {
+            returnValue: true,
+            apps: [{ id: 'netflix', version: '2.0.0' }]
+          };
+        }
+        if (uri === 'luna://com.webos.appUpdateService/statusAll') {
+          return {
+            returnValue: true,
+            status: {
+              apps: [{ id: 'netflix', updateYN: 'Y', version: '2.1.0' }]
+            }
+          };
+        }
+        if (uri === 'luna://com.webos.appInstallService/status') {
+          statusCallCount++;
+          if (statusCallCount === 1) {
+            return null; // Null/error status response must NOT be treated as completed!
+          }
+          // Ongoing stalled download at deadline
+          return {
+            returnValue: true,
+            status: {
+              apps: [{ id: 'netflix', state: 'downloading', progress: 15 }]
+            }
+          };
+        }
+        return { returnValue: true };
+      }
     });
-    assert.strictEqual(res.screenTurnedOff, true);
+
+    assert.deepStrictEqual(res.updatesCompleted, []);
+    assert.deepStrictEqual(res.updatesTimedOut, ['netflix']);
+    assert.deepStrictEqual(cancelCalls, ['netflix']);
     assert.strictEqual(res.returnedToStandby, false);
-    assert.strictEqual(powerCalls.length, 1);
-    assert.strictEqual(powerCalls[0].uri, 'luna://com.webos.service.tvpower/power/turnOffScreen');
+    assert.strictEqual(res.maintenanceComplete, false);
+    assert(!powerCalls.includes('luna://com.webos.service.tvpower/power/turnOff'));
     groups++;
   }
 
-  // 7. Even if an exception occurs mid-update, setLgEgressWindow(false) is guaranteed to run in finally
+  // 8. Even if setLgEgressWindow(true) throws after partial change, finally calls setLgEgressWindow(false)
   {
     const windowTransitions = [];
     let caught = false;
@@ -248,20 +421,506 @@ let groups = 0;
         tvPower: 'active',
         setLgEgressWindow: async (open) => {
           windowTransitions.push(open);
+          if (open === true) {
+            throw new Error('simulated opener failure after partial mutation');
+          }
+          return true;
         },
         callLunaSend: async () => ({ returnValue: true, appId: 'local.owner.applibrary' }),
-        callLunaSendLarge: async (uri) => {
-          if (uri.includes('statusAll')) {
-            throw new Error('simulated bus timeout');
-          }
-          return { returnValue: true, apps: [] };
-        }
+        callLunaSendLarge: async () => ({
+          returnValue: true,
+          apps: [{ id: 'netflix', version: '1.0.0' }]
+        })
       });
     } catch (_) {
       caught = true;
     }
     assert.strictEqual(caught, true);
     assert.deepStrictEqual(windowTransitions, [true, false]);
+    groups++;
+  }
+
+  // 9. Network guard & manifest retirement verify command results, effective file hashes, and retry on failure
+  {
+    const files = new Map([
+      ['/etc/hosts', Buffer.from('127.0.0.1\tlocalhost\n', 'utf8')],
+      ['/usr/sbin/iptables', Buffer.from('', 'utf8')]
+    ]);
+    const mounted = new Map();
+    let failAllSubprocesses = false;
+
+    const fakeFs = {
+      existsSync: (p) => files.has(p),
+      readFileSync: (p, enc) => {
+        if (!files.has(p)) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        const b = files.get(p);
+        return enc ? b.toString(enc) : b;
+      },
+      unlinkSync: (p) => files.delete(p)
+    };
+
+    const guard = maint.createLgNetworkGuard({
+      fs: fakeFs,
+      getMountedTargets: () => mounted,
+      writeAtomic: (p, buf) => files.set(p, Buffer.from(buf)),
+      spawnSync: (cmd, args) => {
+        if (failAllSubprocesses) {
+          return { status: 1, stdout: Buffer.alloc(0) };
+        }
+        if (cmd.endsWith('/getent')) {
+          return {
+            status: 0,
+            stdout: Buffer.from('203.0.113.50 STREAM store\n2001:db8::50 STREAM store\n', 'utf8')
+          };
+        }
+        if (cmd === '/bin/umount') {
+          mounted.delete('/etc/hosts');
+          return { status: 0 };
+        }
+        if (cmd === '/bin/mount' && args.includes('--bind')) {
+          files.set('/etc/hosts', Buffer.from(files.get('/tmp/r2d2-hosts')));
+          mounted.set('/etc/hosts', { mountId: '1', opts: 'rw' });
+          return { status: 0 };
+        }
+        if (cmd === '/bin/mount' && args.some((a) => a.includes('remount'))) {
+          mounted.set('/etc/hosts', { mountId: '1', opts: 'ro' });
+          return { status: 0 };
+        }
+        return { status: 0, stdout: Buffer.alloc(0) };
+      }
+    });
+
+    // Open App Store window succeeds
+    assert.strictEqual(guard.apply(true), true);
+    assert.strictEqual(guard.isWindowOpen(), true);
+    assert.strictEqual(guard.isBlocked(), false);
+
+    // Simulate restoration with previous open-window mount retained and all subprocesses failing:
+    // MUST report false (not blocked) and MUST retry on the next call!
+    failAllSubprocesses = true;
+    assert.strictEqual(guard.apply(false), false);
+    assert.strictEqual(guard.isBlocked(), false);
+
+    // Next call when subprocesses recover must retry and succeed
+    failAllSubprocesses = false;
+    assert.strictEqual(guard.apply(false), true);
+    assert.strictEqual(guard.isBlocked(), true);
+    assert.strictEqual(guard.isWindowOpen(), false);
+
+    // Manifest retirement enforcer checks command status and retries failed removals
+    let lunaShouldFail = true;
+    const enforcer = maint.createPrivacyRetirementEnforcer({
+      fs: {
+        mkdirSync() {},
+        chmodSync() {},
+        existsSync: (p) => p === '/usr/share/luna-service2/manifests.d/ad.manifest.json'
+      },
+      getAllMountPoints: () => new Set(),
+      retirePrivacyProcesses: () => 0,
+      ls2Manifests: ['/usr/share/luna-service2/manifests.d/ad.manifest.json'],
+      binTargets: [],
+      dirTargets: [],
+      spawnSync: () => ({
+        status: lunaShouldFail ? 1 : 0,
+        stdout: Buffer.from(JSON.stringify({ returnValue: !lunaShouldFail }), 'utf8')
+      })
+    });
+
+    const rFail = enforcer.enforce();
+    assert.strictEqual(rFail.ok, false);
+    assert.strictEqual(rFail.manifestsRemovedCount, 0);
+
+    lunaShouldFail = false;
+    const rOk = enforcer.enforce();
+    assert.strictEqual(rOk.ok, true);
+    assert.strictEqual(rOk.manifestsRemovedCount, 1);
+    groups++;
+  }
+
+  // 10. ResidentMaintenanceController: activity sampling while maintenanceRunning, deferred triggers, and shutdown block restoration
+  {
+    let clock = new Date(2026, 9, 25, 10, 0, 0).getTime();
+    let tvPower = 'active';
+    let fgApp = 'local.owner.applibrary';
+    let irqText = ' 42: 10 gpio-keys\n';
+    let persistedState = { schema: 1, lastUpdateDay: '2026-10-24' };
+    let triggerFileContent = JSON.stringify({ reqId: 'timer-post-3am', mode: 'update' });
+    const windowHistory = [];
+    const scheduledFns = [];
+
+    const tracker = maint.createActivityTracker({
+      nowMs: () => clock,
+      readInterrupts: () => irqText,
+      queryForegroundSync: () => fgApp
+    });
+
+    const ctrl = maint.createResidentMaintenanceController({
+      fs: {
+        existsSync: (p) => p === '/tmp/r2d2-trigger-updater.json' && triggerFileContent !== null,
+        readFileSync: () => triggerFileContent,
+        unlinkSync: () => {
+          triggerFileContent = null;
+        }
+      },
+      nowMs: () => clock,
+      sleep: async (ms) => {
+        clock += ms;
+      },
+      getTvPower: () => tvPower,
+      activityTracker: tracker,
+      readUpdaterState: () => persistedState,
+      writeUpdaterState: (st) => {
+        persistedState = st;
+      },
+      applyLgNetworkBlock: (open) => {
+        windowHistory.push(Boolean(open));
+        return true;
+      },
+      scheduleImmediate: (fn) => scheduledFns.push(fn),
+      callLunaSend: async (uri) => {
+        if (uri === 'luna://com.webos.applicationManager/getForegroundAppInfo') {
+          return { returnValue: true, appId: fgApp };
+        }
+        return { returnValue: true };
+      },
+      callLunaSendLarge: async (uri) => {
+        if (uri === 'luna://com.webos.applicationManager/listApps') {
+          return { returnValue: true, apps: [{ id: 'netflix', version: '2.0.0' }] };
+        }
+        if (uri === 'luna://com.webos.appUpdateService/statusAll') {
+          return {
+            returnValue: true,
+            status: { apps: [{ id: 'netflix', updateYN: 'Y', version: '2.1.0' }] }
+          };
+        }
+        if (uri === 'luna://com.webos.appInstallService/status') {
+          return {
+            returnValue: true,
+            status: { apps: [{ id: 'netflix', state: 'installed' }] }
+          };
+        }
+        return { returnValue: true };
+      }
+    });
+
+    // At 10:00 AM with 0 ms idle, consuming /tmp/r2d2-trigger-updater.json must defer to idle, NOT run immediately!
+    const t1 = ctrl.maybeTriggerScheduledOrIdleUpdate('vk');
+    assert.strictEqual(t1.triggered, false);
+    assert.strictEqual(triggerFileContent, null);
+    assert.strictEqual(persistedState.missedWindowDay, '2026-10-25');
+    assert.strictEqual(persistedState.pendingReqId, 'timer-post-3am');
+    assert.strictEqual(scheduledFns.length, 0);
+
+    // After 30 minutes of verified idle on Home, maybeTriggerScheduledOrIdleUpdate triggers catch-up
+    clock += 30 * 60 * 1000;
+    const t2 = ctrl.maybeTriggerScheduledOrIdleUpdate('vk');
+    assert.strictEqual(t2.triggered, true);
+    assert.strictEqual(t2.reason, 'idle-catchup');
+    assert.strictEqual(t2.reqId, 'timer-post-3am');
+    assert.strictEqual(scheduledFns.length, 1);
+
+    // Run the scheduled maintenance job
+    await scheduledFns.shift()();
+    assert.strictEqual(persistedState.lastUpdateDay, '2026-10-25');
+    assert.strictEqual(persistedState.pendingRetryDay, null);
+
+    // Shutdown always closes the LG egress window
+    assert.strictEqual(ctrl.shutdown(), true);
+    assert.strictEqual(windowHistory[windowHistory.length - 1], false);
+    groups++;
+  }
+
+  // 11. Adversarial edge cases: failed foreground queries, active viewer screen-off gate, unobservable install cancel+reconcile, pre-3am retry, 03:20 update-idle, 10:00 delayed header, firewall loss repair, DNS harvest failure + IPv6 rules, empty manifest reply, and lease expiry
+  {
+    // 11a. Failed foreground reads must NOT install or return to standby
+    {
+      let clock = 1000;
+      const calls = [];
+      const out = await maint.runUpdateWorkflow({
+        mode: 'update-standby',
+        tvPower: 'active',
+        nowMs: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+        setLgEgressWindow: async () => true,
+        callLunaSend: async (uri, payload) => {
+          calls.push({ uri, payload });
+          if (uri.endsWith('/getForegroundAppInfo')) return null;
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [{ id: 'netflix', version: '1.0' }] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return {
+              returnValue: true,
+              status: { apps: [{ id: 'netflix', updateYN: 'Y', version: '2.0' }] }
+            };
+          }
+          if (uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+      assert.deepStrictEqual(out.updatesAttempted, []);
+      assert.strictEqual(out.screenTurnedOff, false);
+      assert.strictEqual(out.returnedToStandby, false);
+      assert.strictEqual(out.maintenanceComplete, false);
+    }
+
+    // 11b. Known active viewer (e.g. Netflix foreground) must NOT turn off screen or return to standby
+    {
+      let clock = 1000;
+      const out = await maint.runUpdateWorkflow({
+        mode: 'update-standby',
+        tvPower: 'active',
+        nowMs: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+        setLgEgressWindow: async () => true,
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'netflix' };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [{ id: 'netflix', version: '1.0' }] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return {
+              returnValue: true,
+              status: { apps: [{ id: 'netflix', updateYN: 'Y', version: '2.0' }] }
+            };
+          }
+          return { returnValue: true, status: { apps: [] } };
+        }
+      });
+      assert.strictEqual(out.userActivityDetected, true);
+      assert.strictEqual(out.screenTurnedOff, false);
+      assert.strictEqual(out.returnedToStandby, false);
+    }
+
+    // 11c. Unobservable install (status returns null) calls cancel and records updatesInProgress
+    {
+      let clock = 1000;
+      const calls = [];
+      const out = await maint.runUpdateWorkflow({
+        mode: 'update-standby',
+        tvPower: 'active',
+        nowMs: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+        installTimeoutMs: 6000,
+        maxInstallTimeoutMs: 6000,
+        pollIntervalMs: 2000,
+        setLgEgressWindow: async () => true,
+        callLunaSend: async (uri, payload) => {
+          calls.push({ uri, payload });
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/cancel')) return { returnValue: false };
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [{ id: 'netflix', version: '1.0' }] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return {
+              returnValue: true,
+              status: { apps: [{ id: 'netflix', updateYN: 'Y', version: '2.0' }] }
+            };
+          }
+          if (uri.endsWith('/status')) return null;
+          return { returnValue: true };
+        }
+      });
+      assert.strictEqual(out.maintenanceComplete, false);
+      assert.deepStrictEqual(out.updatesTimedOut, ['netflix']);
+      assert.strictEqual(calls.filter((x) => x.uri.endsWith('/cancel')).length, 1);
+      assert.deepStrictEqual(out.updatesInProgress, ['netflix']);
+      assert.strictEqual(out.returnedToStandby, false);
+    }
+
+    // 11d. Pre-3am retry targets the prior missed day and does NOT suppress today's 3:00 AM run
+    {
+      const at = new Date(2026, 9, 25, 0, 40);
+      const state = {
+        lastUpdateDay: '2026-10-23',
+        missedWindowDay: '2026-10-24',
+        pendingRetryDay: '2026-10-24',
+        pendingReqId: 'old-retry',
+        pendingApps: ['netflix']
+      };
+      const decision = maint.shouldRunScheduledUpdate(state, at, {
+        tvPower: 'active',
+        foregroundAppId: 'local.owner.applibrary',
+        idleDurationMs: 1800000
+      });
+      assert.strictEqual(decision.run, true);
+      assert.strictEqual(decision.targetDay, '2026-10-24');
+      const next = maint.computeNextUpdaterState(
+        state,
+        { maintenanceComplete: true },
+        { nowDate: at, targetDay: decision.targetDay }
+      );
+      const three = maint.shouldRunScheduledUpdate(next, new Date(2026, 9, 25, 3, 0), {
+        tvPower: 'active'
+      });
+      assert.strictEqual(three.run, true);
+      assert.strictEqual(three.reason, 'nightly-3am');
+    }
+
+    // 11e. update-idle at 03:20 with 0 idle time defers to 30-min idle, and delayed update header at 10:00 also defers
+    {
+      let state = { lastUpdateDay: '2026-10-24' };
+      const scheduled = [];
+      const clock320 = new Date(2026, 9, 25, 3, 20).getTime();
+      const ctrl320 = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => clock320,
+        readUpdaterState: () => state,
+        writeUpdaterState: (s) => {
+          state = s;
+        },
+        scheduleImmediate: (fn) => scheduled.push(fn)
+      });
+      const res320 = ctrl320.handleMaintenanceHeader('key', 'failed-wake:update-idle');
+      assert.strictEqual(res320.triggered, false);
+      assert.strictEqual(res320.deferredToIdle, true);
+      assert.strictEqual(scheduled.length, 0);
+
+      let state10 = { lastUpdateDay: '2026-10-24' };
+      const scheduled10 = [];
+      const ctrl10 = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => new Date(2026, 9, 25, 10, 0).getTime(),
+        readUpdaterState: () => state10,
+        writeUpdaterState: (s) => {
+          state10 = s;
+        },
+        scheduleImmediate: (fn) => scheduled10.push(fn)
+      });
+      const res10 = ctrl10.handleMaintenanceHeader('key', 'delayed-request:update');
+      assert.strictEqual(res10.triggered, false);
+      assert.strictEqual(res10.deferredToIdle, true);
+      assert.strictEqual(scheduled10.length, 0);
+    }
+
+    // 11f. Firewall rule loss repair, DNS harvest failure refusal, IPv6 coverage, lease expiry, and non-empty manifest reply
+    {
+      function makeGuard({ dnsFail = false } = {}) {
+        const files = new Map([
+          ['/etc/hosts', Buffer.from('127.0.0.1 localhost\n')],
+          ['/usr/sbin/iptables', Buffer.alloc(0)]
+        ]);
+        const mounted = new Map();
+        const commands = [];
+        let rules = [];
+        let clock = 1000;
+        const io = {
+          existsSync: (p) => files.has(p),
+          readFileSync: (p, enc) => {
+            if (!files.has(p)) throw new Error('missing ' + p);
+            const b = files.get(p);
+            return enc ? b.toString(enc) : b;
+          },
+          unlinkSync: (p) => files.delete(p)
+        };
+        const guard = maint.createLgNetworkGuard({
+          fs: io,
+          nowMs: () => clock,
+          getMountedTargets: () => mounted,
+          writeAtomic: (p, b) => files.set(p, Buffer.from(b)),
+          spawnSync: (cmd, args) => {
+            commands.push([cmd, ...args]);
+            if (cmd === '/bin/umount') {
+              mounted.delete('/etc/hosts');
+              return { status: 0 };
+            }
+            if (cmd === '/bin/mount' && args.includes('--bind')) {
+              files.set('/etc/hosts', Buffer.from(files.get('/tmp/r2d2-hosts')));
+              mounted.set('/etc/hosts', {});
+              return { status: 0 };
+            }
+            if (cmd.endsWith('/getent')) {
+              return dnsFail
+                ? { status: 127 }
+                : { status: 0, stdout: Buffer.from('203.0.113.50 STREAM store\n') };
+            }
+            if (cmd.endsWith('/iptables')) {
+              if (args[0] === '-F') rules = [];
+              if (args[0] === '-A') rules.push(args.join(' '));
+            }
+            return { status: 0, stdout: Buffer.alloc(0) };
+          }
+        });
+        return {
+          guard,
+          commands,
+          files,
+          advanceClock: (ms) => {
+            clock += ms;
+          },
+          clearRules: () => {
+            rules = [];
+          },
+          getRules: () => rules
+        };
+      }
+
+      const fx1 = makeGuard();
+      assert.strictEqual(fx1.guard.apply(false), true);
+      fx1.clearRules();
+      const before = fx1.commands.length;
+      assert.strictEqual(fx1.guard.apply(false), true);
+      assert(fx1.commands.length > before);
+      assert(fx1.getRules().length > 0);
+      assert(fx1.commands.some((x) => x[0].endsWith('ip6tables')));
+
+      // Open window writes lease; advancing clock past lease expiry and calling enforceLease closes window
+      assert.strictEqual(fx1.guard.apply(true), true);
+      assert(fx1.files.has('/tmp/r2d2-appstore-window.json'));
+      fx1.advanceClock(11 * 60 * 1000);
+      const leaseRes = fx1.guard.enforceLease();
+      assert.strictEqual(leaseRes.expired, true);
+      assert.strictEqual(leaseRes.blocked, true);
+      assert.strictEqual(fx1.guard.isBlocked(), true);
+      assert(!fx1.files.has('/tmp/r2d2-appstore-window.json'));
+
+      // DNS failure at open refuses to open window and refuses to report blocked without harvested App Store IPs
+      const fxDns = makeGuard({ dnsFail: true });
+      assert.strictEqual(fxDns.guard.apply(true), false);
+      assert.strictEqual(fxDns.guard.isWindowOpen(), false);
+      assert.strictEqual(fxDns.guard.apply(false), false);
+      assert.strictEqual(fxDns.guard.isBlocked(), false);
+
+      // Empty manifest reply is rejected and retried on next enforcement
+      let manifestCalls = 0;
+      const enforcer = maint.createPrivacyRetirementEnforcer({
+        fs: { existsSync: () => true, mkdirSync() {}, chmodSync() {} },
+        getAllMountPoints: () => new Set(),
+        ls2Manifests: ['/manifest'],
+        spawnSync: () => {
+          manifestCalls++;
+          return { status: 0, stdout: Buffer.alloc(0) };
+        }
+      });
+      const first = enforcer.enforce();
+      enforcer.enforce();
+      assert.strictEqual(first.ok, false);
+      assert.strictEqual(first.manifestsRemovedCount, 0);
+      assert.strictEqual(manifestCalls, 2);
+    }
+
     groups++;
   }
 

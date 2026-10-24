@@ -64,7 +64,7 @@ class BuildTests(unittest.TestCase):
                             archived_notices[notice]=archive.extractfile(member).read()
                 offset+=size+(size%2)
             self.assertEqual(archived_notices,{name:(ROOT/name).read_bytes() for name in ('LICENSE.md','THIRD_PARTY_NOTICES.md')})
-            for shipped in ('pool.py','result.py','warm.py','shared_owner.py','service.py','model_worker.py','pinned_models.py','model_assets.py','resident_utterance.py','resident_entry.py','ui_capture_broker.py','resident_manager.py','tv_transport.py','voice_status.py','voice_copy.py','voice_card_push.py','physical_capture/ram_credentials.py'):
+            for shipped in ('pool.py','result.py','nightly_maintenance.py','warm.py','shared_owner.py','service.py','model_worker.py','pinned_models.py','model_assets.py','resident_utterance.py','resident_entry.py','ui_capture_broker.py','resident_manager.py','tv_transport.py','voice_status.py','voice_copy.py','voice_card_push.py','physical_capture/ram_credentials.py'):
                 self.assertTrue((left/'spark/voice_control'/shipped).is_file(),shipped)
                 self.assertIn('spark/voice_control/'+shipped,a['files'])
             for shipped in ('main.js','resident_mic.js','resident_hid.js','owner_key.js','device_identity.js','tls_pcm_client.js','decoder/decode_reports.c'):
@@ -72,7 +72,7 @@ class BuildTests(unittest.TestCase):
             self.assertFalse((left/'tv-resident/resident_config.json').exists())
             self.assertFalse((left/'tv-resident/decode-reports').exists())
             for shipped in ('local-capture/main.js','local-capture/bootstrap_entry.js','local-capture/bus_context.js','local-capture/power_reader.js','local-capture/package.json','local-capture/controller.js',
-                            'local-capture/owner_service.js','local-capture/quiescence.js',
+                            'local-capture/owner_service.js','local-capture/quiescence.js','local-capture/tv_maintenance.js',
                             'local-capture/ui_capture.js','local-capture/ui_heartbeat.js','local-capture/ui_qualification.js','local-capture/ui_authority.hpp','local-capture/voice_feedback.js',
                             'local-capture/owned_provider.cpp','local-capture/startup_lock.hpp','local-capture/build_native.py',
                             'transport/pcm_provider_adapter.js','patch_firmware.py'):
@@ -98,7 +98,7 @@ Module._load=function(name,parent,isMain){
   if(name==='http')for(const k of ['request','get','createServer'])value[k]=()=>{throw Error('NETWORK_FORBIDDEN');};
   return value;
 };
-for(const name of ['main','bootstrap_entry','bus_context','power_reader','controller','service_port','owner_service','session','legacy_provider','supervised_provider','quiescence','ui_capture','ui_heartbeat','ui_qualification','voice_feedback'])
+for(const name of ['main','bootstrap_entry','bus_context','power_reader','controller','service_port','owner_service','session','legacy_provider','supervised_provider','tv_maintenance','quiescence','ui_capture','ui_heartbeat','ui_qualification','voice_feedback'])
   require(path.join(root,'local-capture',name+'.js'));
 const entry=require(path.join(root,'local-capture'));
 if(Object.keys(entry).length||'run' in entry)throw Error('BOOTSTRAP_ENTRY_EXPORT');
