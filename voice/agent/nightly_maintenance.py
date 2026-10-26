@@ -420,6 +420,11 @@ def run_maintenance(
                 "tvReportReceived": tv_report is not None,
                 "tvFences": tv_report.get("fences") if tv_report else None,
                 "tvLgServerBlocked": tv_report.get("lgServerBlocked") if tv_report else None,
+                "tvVoiceLeveling": (
+                    (tv_report.get("voiceLeveling") or {}).get("status")
+                    if isinstance(tv_report, dict) and isinstance(tv_report.get("voiceLeveling"), dict)
+                    else None
+                ),
                 "tvInstalledCount": tv_report.get("installedCount") if tv_report else None,
                 "tvUpdatesAttempted": len(tv_report.get("updatesAttempted") or []) if tv_report else 0,
                 "tvUpdatesCompleted": len(tv_report.get("updatesCompleted") or []) if tv_report else 0,

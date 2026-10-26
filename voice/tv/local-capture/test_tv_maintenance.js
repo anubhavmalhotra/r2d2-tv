@@ -924,6 +924,344 @@ let groups = 0;
     groups++;
   }
 
+  // 12. Auto Voice Leveling Enforcer: boot enforcement, steady-state cache, app switch + post-splash recheck, standby/wake, enum & key fallbacks, readback verification, disk hydration, and maintenance report integration
+  {
+    // 12a. Boot enforcement, steady-state cache, app switch + 7s post-splash recheck, and standby/wake re-enforcement
+    {
+      let clock = 10000;
+      const files = new Map();
+      const lunaCalls = [];
+      let tvSettings = {
+        autoVolume: 'off',
+        soundMode: 'standard',
+        soundOutput: 'tv_speaker'
+      };
+
+      const enforcer = maint.createAutoVoiceLevelingEnforcer({
+        fs: {
+          existsSync: (p) => files.has(p),
+          readFileSync: (p, enc) => {
+            const b = files.get(p);
+            return enc ? b.toString(enc) : b;
+          }
+        },
+        writeAtomic: (p, b) => files.set(p, Buffer.from(b)),
+        nowMs: () => clock,
+        recheckIntervalMs: 60000,
+        postSwitchRecheckDelayMs: 7000,
+        spawnSync: (_cmd, args) => {
+          const uri = args[4];
+          const payload = JSON.parse(args[5]);
+          lunaCalls.push({ uri, payload });
+          if (uri.endsWith('/getSystemSettings')) {
+            return {
+              status: 0,
+              stdout: Buffer.from(
+                JSON.stringify({ returnValue: true, settings: { ...tvSettings } }),
+                'utf8'
+              )
+            };
+          }
+          if (uri.endsWith('/setSystemSettings')) {
+            tvSettings = { ...tvSettings, ...(payload.settings || {}) };
+            return {
+              status: 0,
+              stdout: Buffer.from(JSON.stringify({ returnValue: true }), 'utf8')
+            };
+          }
+          return { status: 1, stdout: Buffer.alloc(0) };
+        }
+      });
+
+      // Boot enforcement on Home
+      const rBoot = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'local.owner.applibrary'
+      });
+      assert.strictEqual(rBoot.ok, true);
+      assert.strictEqual(rBoot.status, 'on');
+      assert.strictEqual(rBoot.autoVolume, 'on');
+      assert.strictEqual(rBoot.soundMode, 'clearVoice');
+      assert.strictEqual(rBoot.enforceCount, 1);
+      assert.strictEqual(rBoot.cached, false);
+      assert(files.has('/var/lib/local.owner.r2d2mic/voice-leveling-state.json'));
+
+      // Steady-state poll 8s later on same app: 0 Luna calls, cached=true
+      const callsAfterBoot = lunaCalls.length;
+      clock += 8000;
+      const rCached = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'local.owner.applibrary'
+      });
+      assert.strictEqual(rCached.ok, true);
+      assert.strictEqual(rCached.cached, true);
+      assert.strictEqual(lunaCalls.length, callsAfterBoot);
+
+      // User switches to Netflix; Netflix resets soundMode to 'cinema' and autoVolume to 'off'
+      clock += 2000;
+      tvSettings.autoVolume = 'off';
+      tvSettings.soundMode = 'cinema';
+      const rSwitch = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rSwitch.ok, true);
+      assert.strictEqual(rSwitch.status, 'on');
+      assert.strictEqual(rSwitch.autoVolume, 'on');
+      assert.strictEqual(rSwitch.soundMode, 'clearVoice');
+      assert.strictEqual(rSwitch.enforceCount, 2);
+      assert.strictEqual(rSwitch.cached, false);
+
+      // 3s after switch (before 7s post-switch delay): uses cache
+      const callsAfterSwitch = lunaCalls.length;
+      clock += 3000;
+      const rPreSplash = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rPreSplash.cached, true);
+      assert.strictEqual(lunaCalls.length, callsAfterSwitch);
+
+      // 8s after switch (>= 7s post-switch delay): Netflix media pipeline overrides soundMode to 'cinema' after splash
+      clock += 5000;
+      tvSettings.soundMode = 'cinema';
+      const rPostSplash = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rPostSplash.ok, true);
+      assert.strictEqual(rPostSplash.cached, false);
+      assert.strictEqual(rPostSplash.soundMode, 'clearVoice');
+      assert.strictEqual(rPostSplash.enforceCount, 3);
+
+      // Subsequent poll 8s later: post-switch recheck already completed, so cached=true and 0 Luna calls
+      const callsAfterPostSplash = lunaCalls.length;
+      clock += 8000;
+      const rSteadyNetflix = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rSteadyNetflix.cached, true);
+      assert.strictEqual(lunaCalls.length, callsAfterPostSplash);
+
+      // Standby transition makes 0 Luna calls and reports standby; waking back up re-verifies immediately
+      const rStandby = enforcer.enforceSync({
+        tvPower: 'standby',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rStandby.status, 'standby');
+      assert.strictEqual(lunaCalls.length, callsAfterPostSplash);
+
+      tvSettings.autoVolume = 'off';
+      const rWake = enforcer.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rWake.ok, true);
+      assert.strictEqual(rWake.status, 'on');
+      assert.strictEqual(rWake.autoVolume, 'on');
+      assert.strictEqual(rWake.cached, false);
+      assert.strictEqual(rWake.enforceCount, 4);
+
+      // New enforcer instance hydrates resolvedSoundMode='clearVoice' and enforceCount=4 from disk
+      const enforcerRebooted = maint.createAutoVoiceLevelingEnforcer({
+        fs: {
+          existsSync: (p) => files.has(p),
+          readFileSync: (p, enc) => {
+            const b = files.get(p);
+            return enc ? b.toString(enc) : b;
+          }
+        },
+        writeAtomic: (p, b) => files.set(p, Buffer.from(b)),
+        nowMs: () => clock,
+        spawnSync: (_cmd, args) => {
+          const uri = args[4];
+          if (uri.endsWith('/getSystemSettings')) {
+            return {
+              status: 0,
+              stdout: Buffer.from(
+                JSON.stringify({ returnValue: true, settings: { ...tvSettings } }),
+                'utf8'
+              )
+            };
+          }
+          return { status: 0, stdout: Buffer.from(JSON.stringify({ returnValue: true }), 'utf8') };
+        }
+      });
+      const rHydrated = enforcerRebooted.enforceSync({
+        tvPower: 'active',
+        fgAppId: 'local.owner.applibrary'
+      });
+      assert.strictEqual(rHydrated.ok, true);
+      assert.strictEqual(rHydrated.status, 'on');
+      assert.strictEqual(rHydrated.resolvedSoundMode, 'clearVoice');
+      assert.strictEqual(rHydrated.enforceCount, 4);
+    }
+
+    // 12b. Async enforcement with individual-key query fallback, enum fallback (clearVoicePro / aiSoundPro), boolean autoVolume, and partial/error states
+    {
+      let clock = 5000;
+      let tvSettings = {
+        autoVolume: false,
+        soundMode: 'standard'
+      };
+      let failAllReads = false;
+      let ignoreSoundModeWrites = false;
+      const setAttempts = [];
+
+      const asyncEnforcer = maint.createAutoVoiceLevelingEnforcer({
+        nowMs: () => clock,
+        callLunaSend: async (uri, payload) => {
+          if (failAllReads) return null;
+          if (uri.endsWith('/getSystemSettings')) {
+            // Simulate firmware that rejects batch query containing 'soundOutput'
+            if (Array.isArray(payload.keys) && payload.keys.includes('soundOutput')) {
+              return { returnValue: false, errorText: 'There is no matched result' };
+            }
+            const k = payload.keys && payload.keys[0];
+            if (k && k in tvSettings) {
+              return { returnValue: true, settings: { [k]: tvSettings[k] } };
+            }
+            return { returnValue: false };
+          }
+          if (uri.endsWith('/setSystemSettings')) {
+            setAttempts.push(payload.settings);
+            const s = payload.settings || {};
+            if ('autoVolume' in s) {
+              // Only accept boolean true on this simulated firmware
+              if (s.autoVolume === true) {
+                tvSettings.autoVolume = true;
+                return { returnValue: true };
+              }
+              return { returnValue: false };
+            }
+            if ('soundMode' in s) {
+              if (ignoreSoundModeWrites) {
+                // Simulate firmware returning returnValue:true while ignoring the write
+                return { returnValue: true };
+              }
+              // Only accept 'clearVoicePro' on this simulated firmware
+              if (s.soundMode === 'clearVoicePro') {
+                tvSettings.soundMode = 'clearVoicePro';
+                return { returnValue: true };
+              }
+              return { returnValue: true }; // Returned true for clearVoice, but readback stays 'standard'!
+            }
+          }
+          return { returnValue: false };
+        }
+      });
+
+      const rAsync = await asyncEnforcer.enforceAsync({
+        tvPower: 'active',
+        fgAppId: 'youtube.leanback.v4'
+      });
+      assert.strictEqual(rAsync.ok, true);
+      assert.strictEqual(rAsync.status, 'on');
+      assert.strictEqual(rAsync.autoVolume, true);
+      assert.strictEqual(rAsync.soundMode, 'clearVoicePro');
+      assert.strictEqual(rAsync.resolvedSoundMode, 'clearVoicePro');
+
+      // When soundMode writes are ignored on readback, status is 'partial' (ok=false) and NOT cached as 'on'
+      tvSettings.soundMode = 'sports';
+      ignoreSoundModeWrites = true;
+      const rPartial = await asyncEnforcer.enforceAsync({
+        tvPower: 'active',
+        fgAppId: 'cdp-30'
+      });
+      assert.strictEqual(rPartial.ok, false);
+      assert.strictEqual(rPartial.status, 'partial');
+      assert.strictEqual(rPartial.autoVolumeActive, true);
+      assert.strictEqual(rPartial.soundModeActive, false);
+
+      // When Luna read fails completely, status is 'err' (ok=false)
+      failAllReads = true;
+      const rErr = await asyncEnforcer.enforceAsync({
+        tvPower: 'active',
+        fgAppId: 'cdp-30'
+      });
+      assert.strictEqual(rErr.ok, false);
+      assert.strictEqual(rErr.status, 'err');
+
+      // Hard anti-telemetry gate: refuses to call settingsservice if LG network block is not verified active
+      let gatedCalls = 0;
+      let lgBlocked = false;
+      const gatedEnforcer = maint.createAutoVoiceLevelingEnforcer({
+        isLgServerBlocked: () => lgBlocked,
+        callLunaSend: async () => {
+          gatedCalls++;
+          return {
+            returnValue: true,
+            settings: { autoVolume: 'on', soundMode: 'clearVoice', soundOutput: 'tv_speaker' }
+          };
+        }
+      });
+      const rDeferred = await gatedEnforcer.enforceAsync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rDeferred.ok, false);
+      assert.strictEqual(rDeferred.status, 'deferred-until-lg-blocked');
+      assert.strictEqual(gatedCalls, 0);
+
+      lgBlocked = true;
+      const rAllowed = await gatedEnforcer.enforceAsync({
+        tvPower: 'active',
+        fgAppId: 'netflix'
+      });
+      assert.strictEqual(rAllowed.ok, true);
+      assert.strictEqual(rAllowed.status, 'on');
+      assert.strictEqual(gatedCalls, 1);
+    }
+
+    // 12c. ResidentMaintenanceController includes voiceLeveling in maintenance reports
+    {
+      let postedReport = null;
+      const ctrl = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        getTvPower: () => 'active',
+        ensureAutoVoiceLeveling: async (opts) => ({
+          enabled: true,
+          ok: true,
+          status: 'on',
+          autoVolume: 'on',
+          soundMode: 'clearVoice',
+          foregroundAppId: opts.fgAppId,
+          forced: opts.force
+        }),
+        postMaintenanceReport: async (_vk, rep) => {
+          postedReport = rep;
+          return true;
+        },
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [{ id: 'local.owner.applibrary', version: '1.0.0' }] };
+          }
+          if (uri.endsWith('/statusAll') || uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+
+      const rep = await ctrl.executeTvMaintenance('vk', 'req-vl', 'check');
+      assert(rep && rep.voiceLeveling);
+      assert.strictEqual(rep.voiceLeveling.status, 'on');
+      assert.strictEqual(rep.voiceLeveling.soundMode, 'clearVoice');
+      assert.strictEqual(rep.voiceLeveling.foregroundAppId, 'local.owner.applibrary');
+      assert.strictEqual(rep.voiceLeveling.forced, true);
+      assert.strictEqual(postedReport.voiceLeveling.status, 'on');
+    }
+
+    groups++;
+  }
+
   process.stdout.write(JSON.stringify({ groups, nativeCalls: 0, modelCalls: 0 }) + '\n');
 })().catch((err) => {
   console.error(err);
