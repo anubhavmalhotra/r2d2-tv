@@ -34,6 +34,12 @@ const LG_PERMANENT_BLOCK_DOMAINS = Object.freeze([
   'kic.info.lgsmartad.com',
   'cdpbeacon.lgtvcommon.com',
   'homeprv.lgtvcommon.com',
+  'lgtvcommon.com',
+  'rdx.lgtvsdp.com',
+  'us.rdx.lgtvsdp.com',
+  'aic.rdx.lgtvsdp.com',
+  'eic.rdx.lgtvsdp.com',
+  'kic.rdx.lgtvsdp.com',
   'rdx2.lgtvsdp.com',
   'us.rdx2.lgtvsdp.com',
   'aic.rdx2.lgtvsdp.com',
@@ -54,6 +60,11 @@ const LG_PERMANENT_BLOCK_DOMAINS = Object.freeze([
   'aic.smartshare.lgtvsdp.com',
   'eic.smartshare.lgtvsdp.com',
   'kic.smartshare.lgtvsdp.com',
+  'common.lgappstv.com',
+  'us.common.lgappstv.com',
+  'aic.common.lgappstv.com',
+  'eic.common.lgappstv.com',
+  'kic.common.lgappstv.com',
   'ibs.lgappstv.com',
   'us.ibs.lgappstv.com',
   'aic.ibs.lgappstv.com',
@@ -137,6 +148,34 @@ const IDLE_FOREGROUND_APPS = new Set([
 const DEFAULT_IDLE_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_INSTALL_TIMEOUT_MS = 45 * 1000;
 const DEFAULT_MAX_INSTALL_TIMEOUT_MS = 180 * 1000;
+const DEFAULT_VOICE_LEVELING_RECHECK_MS = 60 * 1000;
+const DEFAULT_POST_SWITCH_RECHECK_DELAY_MS = 7 * 1000;
+
+const PREFERRED_VOICE_SOUND_MODES = Object.freeze([
+  'clearVoice',
+  'clearVoicePro',
+  'clearVoiceIII',
+  'clearVoiceIV'
+]);
+
+// Strictly restrict to pure local hardware DSP Clear Voice modes (never AI/cloud/telemetry modes).
+const FALLBACK_VOICE_SOUND_MODES = Object.freeze([]);
+
+const VOICE_LEVELING_SOUND_MODES = Object.freeze([
+  ...PREFERRED_VOICE_SOUND_MODES
+]);
+
+function isAutoVolumeEnabled(val) {
+  return val === 'on' || val === true || val === 'true' || val === 1;
+}
+
+function isPreferredVoiceSoundMode(val) {
+  return typeof val === 'string' && PREFERRED_VOICE_SOUND_MODES.includes(val.trim());
+}
+
+function isVoiceLevelingSoundMode(val) {
+  return typeof val === 'string' && VOICE_LEVELING_SOUND_MODES.includes(val.trim());
+}
 
 function sha256Hex(input) {
   const buf = Buffer.isBuffer(input) ? input : Buffer.from(String(input || ''), 'utf8');
@@ -1814,6 +1853,575 @@ function createPrivacyRetirementEnforcer(deps = {}) {
   };
 }
 
+function createAutoVoiceLevelingEnforcer(deps = {}) {
+  const io = deps.fs || fs;
+  const spawnSync = deps.spawnSync || cp.spawnSync;
+  const callLunaSend = typeof deps.callLunaSend === 'function' ? deps.callLunaSend : null;
+  const writeAtomic = typeof deps.writeAtomic === 'function' ? deps.writeAtomic : null;
+  const env = deps.env || process.env;
+  const statePath = deps.statePath || '/var/lib/local.owner.r2d2mic/voice-leveling-state.json';
+  const nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
+  const recheckIntervalMs =
+    typeof deps.recheckIntervalMs === 'number' && deps.recheckIntervalMs > 0
+      ? deps.recheckIntervalMs
+      : DEFAULT_VOICE_LEVELING_RECHECK_MS;
+  const postSwitchRecheckDelayMs =
+    typeof deps.postSwitchRecheckDelayMs === 'number' && deps.postSwitchRecheckDelayMs >= 0
+      ? deps.postSwitchRecheckDelayMs
+      : DEFAULT_POST_SWITCH_RECHECK_DELAY_MS;
+  const isLgServerBlocked =
+    typeof deps.isLgServerBlocked === 'function' ? deps.isLgServerBlocked : () => true;
+  const log = typeof deps.log === 'function' ? deps.log : () => {};
+
+  let hydratedFromDisk = false;
+  let verifiedForCurrentCycle = false;
+  let currentStatus = 'init';
+  let currentAutoVolume = null;
+  let currentSoundMode = null;
+  let currentSoundOutput = null;
+  let resolvedAutoVolumeValue = null;
+  let resolvedSoundMode = null;
+  let preferredProbed = false;
+  let lastVerifiedFgAppId = null;
+  let lastObservedFgAppId = null;
+  let lastFgSwitchAtMs = 0;
+  let postSwitchRecheckPending = false;
+  let lastVerifiedAtMs = 0;
+  let lastVerifiedAtIso = null;
+  let lastEnforcedAtIso = null;
+  let lastPower = 'unknown';
+  let enforceCount = 0;
+
+  function loadPersistedStateOnce() {
+    if (hydratedFromDisk) return;
+    hydratedFromDisk = true;
+    try {
+      if (io && typeof io.existsSync === 'function' && io.existsSync(statePath)) {
+        const raw = io.readFileSync(statePath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object') {
+          if (isAutoVolumeEnabled(parsed.resolvedAutoVolumeValue)) {
+            resolvedAutoVolumeValue = parsed.resolvedAutoVolumeValue === true ? true : 'on';
+          }
+          if (isVoiceLevelingSoundMode(parsed.resolvedSoundMode)) {
+            resolvedSoundMode = parsed.resolvedSoundMode.trim();
+            if (isPreferredVoiceSoundMode(resolvedSoundMode)) {
+              preferredProbed = true;
+            }
+          }
+          if (typeof parsed.preferredProbed === 'boolean') {
+            preferredProbed = parsed.preferredProbed;
+          }
+          if (typeof parsed.enforceCount === 'number' && parsed.enforceCount >= 0) {
+            enforceCount = parsed.enforceCount;
+          }
+          if (typeof parsed.lastEnforcedAt === 'string') {
+            lastEnforcedAtIso = parsed.lastEnforcedAt;
+          }
+          if (typeof parsed.lastVerifiedAt === 'string') {
+            lastVerifiedAtIso = parsed.lastVerifiedAt;
+          }
+          if (parsed.autoVolume !== undefined) {
+            currentAutoVolume = parsed.autoVolume;
+          }
+          if (typeof parsed.soundMode === 'string') {
+            currentSoundMode = parsed.soundMode;
+          }
+          if (typeof parsed.soundOutput === 'string') {
+            currentSoundOutput = parsed.soundOutput;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  function persistState() {
+    if (typeof writeAtomic !== 'function') return;
+    try {
+      const payload = {
+        schema: 1,
+        enabled: true,
+        status: currentStatus,
+        autoVolume: currentAutoVolume,
+        soundMode: currentSoundMode,
+        soundOutput: currentSoundOutput,
+        resolvedAutoVolumeValue,
+        resolvedSoundMode,
+        preferredProbed,
+        lastForegroundAppId: lastVerifiedFgAppId,
+        lastEnforcedAt: lastEnforcedAtIso,
+        lastVerifiedAt: lastVerifiedAtIso,
+        enforceCount
+      };
+      writeAtomic(statePath, Buffer.from(JSON.stringify(payload, null, 2) + '\n', 'utf8'), 0o600);
+    } catch (_) {}
+  }
+
+  function invokeLunaSync(uri, payload, timeoutMs = 1800) {
+    try {
+      const res = spawnSync(
+        '/usr/bin/luna-send',
+        ['-n', '1', '-w', String(timeoutMs), uri, JSON.stringify(payload || {})],
+        { env, timeout: timeoutMs + 400 }
+      );
+      if (!res || res.status !== 0 || !res.stdout) return null;
+      const text = Buffer.isBuffer(res.stdout)
+        ? res.stdout.toString('utf8').trim()
+        : String(res.stdout).trim();
+      if (!text) return null;
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function invokeLunaAsync(uri, payload, timeoutMs = 1800) {
+    if (callLunaSend) {
+      try {
+        return await callLunaSend(uri, payload || {}, timeoutMs);
+      } catch (_) {
+        return null;
+      }
+    }
+    return invokeLunaSync(uri, payload, timeoutMs);
+  }
+
+  function extractValidSettings(reply) {
+    if (
+      reply &&
+      reply.returnValue === true &&
+      reply.settings &&
+      typeof reply.settings === 'object'
+    ) {
+      return reply.settings;
+    }
+    return null;
+  }
+
+  function querySoundSettingsSync() {
+    const batch = invokeLunaSync(
+      'luna://com.webos.settingsservice/getSystemSettings',
+      { category: 'sound', keys: ['autoVolume', 'soundMode', 'soundOutput'] },
+      1800
+    );
+    const batchSettings = extractValidSettings(batch);
+    if (
+      batchSettings &&
+      ('autoVolume' in batchSettings || 'soundMode' in batchSettings)
+    ) {
+      return { ok: true, settings: { ...batchSettings } };
+    }
+    const merged = {};
+    let anyKeyOk = false;
+    for (const k of ['autoVolume', 'soundMode', 'soundOutput']) {
+      const single = invokeLunaSync(
+        'luna://com.webos.settingsservice/getSystemSettings',
+        { category: 'sound', keys: [k] },
+        1500
+      );
+      const s = extractValidSettings(single);
+      if (s && k in s) {
+        merged[k] = s[k];
+        if (k === 'autoVolume' || k === 'soundMode') {
+          anyKeyOk = true;
+        }
+      }
+    }
+    return { ok: anyKeyOk, settings: merged };
+  }
+
+  async function querySoundSettingsAsync() {
+    const batch = await invokeLunaAsync(
+      'luna://com.webos.settingsservice/getSystemSettings',
+      { category: 'sound', keys: ['autoVolume', 'soundMode', 'soundOutput'] },
+      1800
+    );
+    const batchSettings = extractValidSettings(batch);
+    if (
+      batchSettings &&
+      ('autoVolume' in batchSettings || 'soundMode' in batchSettings)
+    ) {
+      return { ok: true, settings: { ...batchSettings } };
+    }
+    const merged = {};
+    let anyKeyOk = false;
+    for (const k of ['autoVolume', 'soundMode', 'soundOutput']) {
+      const single = await invokeLunaAsync(
+        'luna://com.webos.settingsservice/getSystemSettings',
+        { category: 'sound', keys: [k] },
+        1500
+      );
+      const s = extractValidSettings(single);
+      if (s && k in s) {
+        merged[k] = s[k];
+        if (k === 'autoVolume' || k === 'soundMode') {
+          anyKeyOk = true;
+        }
+      }
+    }
+    return { ok: anyKeyOk, settings: merged };
+  }
+
+  function buildSnapshot(extra = {}) {
+    const autoVolumeActive = isAutoVolumeEnabled(currentAutoVolume);
+    const soundModeActive = isVoiceLevelingSoundMode(currentSoundMode);
+    return {
+      enabled: true,
+      ok: currentStatus === 'on',
+      status: currentStatus,
+      autoVolume: currentAutoVolume,
+      autoVolumeActive,
+      soundMode: currentSoundMode,
+      soundModeActive,
+      soundOutput: currentSoundOutput,
+      resolvedSoundMode,
+      foregroundAppId: lastVerifiedFgAppId,
+      lastEnforcedAt: lastEnforcedAtIso,
+      lastVerifiedAt: lastVerifiedAtIso,
+      enforceCount,
+      cached: Boolean(extra.cached),
+      tvPower: extra.tvPower || lastPower
+    };
+  }
+
+  function prepareCycleAndCheckCache(options = {}) {
+    loadPersistedStateOnce();
+    const now = nowMs();
+    const tvPower = typeof options.tvPower === 'string' && options.tvPower ? options.tvPower : 'active';
+    const fgAppId = typeof options.fgAppId === 'string' ? options.fgAppId.trim() : '';
+    const force = Boolean(options.force === true);
+
+    if (tvPower !== 'active') {
+      verifiedForCurrentCycle = false;
+      postSwitchRecheckPending = false;
+      lastPower = tvPower;
+      return {
+        skip: true,
+        snapshot: {
+          ...buildSnapshot({ cached: true, tvPower }),
+          status: currentStatus === 'on' ? 'standby' : currentStatus
+        }
+      };
+    }
+
+    if (!isLgServerBlocked()) {
+      verifiedForCurrentCycle = false;
+      lastPower = tvPower;
+      return {
+        skip: true,
+        snapshot: {
+          ...buildSnapshot({ cached: false, tvPower }),
+          ok: false,
+          status: 'deferred-until-lg-blocked'
+        }
+      };
+    }
+
+    if (lastObservedFgAppId !== null && fgAppId !== lastObservedFgAppId) {
+      lastFgSwitchAtMs = now;
+      postSwitchRecheckPending = true;
+    }
+    lastObservedFgAppId = fgAppId;
+
+    const dueForPostSwitchRecheck =
+      postSwitchRecheckPending && now - lastFgSwitchAtMs >= postSwitchRecheckDelayMs;
+
+    if (
+      !force &&
+      !dueForPostSwitchRecheck &&
+      verifiedForCurrentCycle &&
+      currentStatus === 'on' &&
+      lastPower === 'active' &&
+      fgAppId === lastVerifiedFgAppId &&
+      now - lastVerifiedAtMs < recheckIntervalMs
+    ) {
+      return {
+        skip: true,
+        snapshot: buildSnapshot({ cached: true, tvPower })
+      };
+    }
+
+    return {
+      skip: false,
+      now,
+      tvPower,
+      fgAppId,
+      dueForPostSwitchRecheck
+    };
+  }
+
+  function buildAutoVolumeCandidates(currentVal) {
+    const cands = [];
+    if (resolvedAutoVolumeValue !== null) {
+      cands.push(resolvedAutoVolumeValue);
+    }
+    if (typeof currentVal === 'boolean') {
+      if (!cands.includes(true)) cands.push(true);
+      if (!cands.includes('on')) cands.push('on');
+    } else {
+      if (!cands.includes('on')) cands.push('on');
+      if (!cands.includes(true)) cands.push(true);
+    }
+    return cands;
+  }
+
+  function buildSoundModeCandidates() {
+    const cands = [];
+    if (resolvedSoundMode && isPreferredVoiceSoundMode(resolvedSoundMode)) {
+      cands.push(resolvedSoundMode);
+    }
+    for (const m of PREFERRED_VOICE_SOUND_MODES) {
+      if (!cands.includes(m)) cands.push(m);
+    }
+    if (resolvedSoundMode && !cands.includes(resolvedSoundMode)) {
+      cands.push(resolvedSoundMode);
+    }
+    for (const m of FALLBACK_VOICE_SOUND_MODES) {
+      if (!cands.includes(m)) cands.push(m);
+    }
+    return cands;
+  }
+
+  function isSoundModeAlreadySatisfied(modeVal) {
+    if (isPreferredVoiceSoundMode(modeVal)) {
+      resolvedSoundMode = modeVal.trim();
+      preferredProbed = true;
+      return true;
+    }
+    if (preferredProbed && isVoiceLevelingSoundMode(modeVal)) {
+      resolvedSoundMode = modeVal.trim();
+      return true;
+    }
+    return false;
+  }
+
+  function finalizeCycle(settings, changedAny, meta) {
+    const { tvPower, fgAppId, dueForPostSwitchRecheck } = meta;
+    const now = nowMs();
+    const autoVolumeActive = isAutoVolumeEnabled(settings.autoVolume);
+    const soundModeActive = isVoiceLevelingSoundMode(settings.soundMode);
+
+    if (settings.autoVolume !== undefined) {
+      currentAutoVolume = settings.autoVolume;
+    }
+    if (typeof settings.soundMode === 'string' && settings.soundMode.trim()) {
+      currentSoundMode = settings.soundMode.trim();
+    }
+    if (typeof settings.soundOutput === 'string' && settings.soundOutput.trim()) {
+      currentSoundOutput = settings.soundOutput.trim();
+    }
+
+    lastPower = tvPower;
+    if (autoVolumeActive && soundModeActive) {
+      currentStatus = 'on';
+      verifiedForCurrentCycle = true;
+      lastVerifiedFgAppId = fgAppId;
+      lastVerifiedAtMs = now;
+      lastVerifiedAtIso = new Date(now).toISOString();
+      if (dueForPostSwitchRecheck) {
+        postSwitchRecheckPending = false;
+      }
+    } else if (autoVolumeActive || soundModeActive) {
+      currentStatus = 'partial';
+      verifiedForCurrentCycle = false;
+      lastVerifiedAtIso = new Date(now).toISOString();
+    } else {
+      currentStatus = 'off';
+      verifiedForCurrentCycle = false;
+    }
+
+    if (changedAny) {
+      enforceCount += 1;
+      lastEnforcedAtIso = new Date(now).toISOString();
+      log('voice_leveling_enforced', {
+        status: currentStatus,
+        autoVolume: currentAutoVolume,
+        soundMode: currentSoundMode,
+        soundOutput: currentSoundOutput,
+        fgAppId,
+        enforceCount
+      });
+    }
+
+    if (currentStatus === 'on' || changedAny) {
+      persistState();
+    }
+
+    return buildSnapshot({ cached: false, tvPower });
+  }
+
+  function enforceSync(options = {}) {
+    const prep = prepareCycleAndCheckCache(options);
+    if (prep.skip) return prep.snapshot;
+
+    const initialRead = querySoundSettingsSync();
+    if (!initialRead.ok) {
+      verifiedForCurrentCycle = false;
+      currentStatus = 'err';
+      lastPower = prep.tvPower;
+      return buildSnapshot({ cached: false, tvPower: prep.tvPower });
+    }
+
+    let settings = { ...initialRead.settings };
+    let changedAny = false;
+
+    if (isAutoVolumeEnabled(settings.autoVolume)) {
+      resolvedAutoVolumeValue = settings.autoVolume === true ? true : 'on';
+    } else {
+      for (const avCandidate of buildAutoVolumeCandidates(settings.autoVolume)) {
+        const setRes = invokeLunaSync(
+          'luna://com.webos.settingsservice/setSystemSettings',
+          { category: 'sound', settings: { autoVolume: avCandidate } },
+          1800
+        );
+        if (setRes && setRes.returnValue === true) {
+          const rb = querySoundSettingsSync();
+          if (rb.ok) {
+            settings = { ...settings, ...rb.settings };
+            if (isAutoVolumeEnabled(settings.autoVolume)) {
+              resolvedAutoVolumeValue = settings.autoVolume === true ? true : 'on';
+              changedAny = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!isSoundModeAlreadySatisfied(settings.soundMode)) {
+      const modeCandidates = buildSoundModeCandidates();
+      for (const modeCandidate of modeCandidates) {
+        if (
+          FALLBACK_VOICE_SOUND_MODES.includes(modeCandidate) &&
+          typeof settings.soundMode === 'string' &&
+          settings.soundMode.trim() === modeCandidate
+        ) {
+          preferredProbed = true;
+          resolvedSoundMode = modeCandidate;
+          break;
+        }
+        const setRes = invokeLunaSync(
+          'luna://com.webos.settingsservice/setSystemSettings',
+          { category: 'sound', settings: { soundMode: modeCandidate } },
+          1800
+        );
+        if (setRes && setRes.returnValue === true) {
+          const rb = querySoundSettingsSync();
+          if (rb.ok) {
+            settings = { ...settings, ...rb.settings };
+            const activeMode =
+              typeof settings.soundMode === 'string' ? settings.soundMode.trim() : '';
+            if (activeMode === modeCandidate || isPreferredVoiceSoundMode(activeMode)) {
+              resolvedSoundMode = activeMode;
+              if (isPreferredVoiceSoundMode(activeMode)) {
+                preferredProbed = true;
+              }
+              changedAny = true;
+              break;
+            }
+          }
+        }
+        if (modeCandidate === PREFERRED_VOICE_SOUND_MODES[PREFERRED_VOICE_SOUND_MODES.length - 1]) {
+          preferredProbed = true;
+        }
+      }
+    }
+
+    return finalizeCycle(settings, changedAny, prep);
+  }
+
+  async function enforceAsync(options = {}) {
+    const prep = prepareCycleAndCheckCache(options);
+    if (prep.skip) return prep.snapshot;
+
+    const initialRead = await querySoundSettingsAsync();
+    if (!initialRead.ok) {
+      verifiedForCurrentCycle = false;
+      currentStatus = 'err';
+      lastPower = prep.tvPower;
+      return buildSnapshot({ cached: false, tvPower: prep.tvPower });
+    }
+
+    let settings = { ...initialRead.settings };
+    let changedAny = false;
+
+    if (isAutoVolumeEnabled(settings.autoVolume)) {
+      resolvedAutoVolumeValue = settings.autoVolume === true ? true : 'on';
+    } else {
+      for (const avCandidate of buildAutoVolumeCandidates(settings.autoVolume)) {
+        const setRes = await invokeLunaAsync(
+          'luna://com.webos.settingsservice/setSystemSettings',
+          { category: 'sound', settings: { autoVolume: avCandidate } },
+          1800
+        );
+        if (setRes && setRes.returnValue === true) {
+          const rb = await querySoundSettingsAsync();
+          if (rb.ok) {
+            settings = { ...settings, ...rb.settings };
+            if (isAutoVolumeEnabled(settings.autoVolume)) {
+              resolvedAutoVolumeValue = settings.autoVolume === true ? true : 'on';
+              changedAny = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    if (!isSoundModeAlreadySatisfied(settings.soundMode)) {
+      const modeCandidates = buildSoundModeCandidates();
+      for (const modeCandidate of modeCandidates) {
+        if (
+          FALLBACK_VOICE_SOUND_MODES.includes(modeCandidate) &&
+          typeof settings.soundMode === 'string' &&
+          settings.soundMode.trim() === modeCandidate
+        ) {
+          preferredProbed = true;
+          resolvedSoundMode = modeCandidate;
+          break;
+        }
+        const setRes = await invokeLunaAsync(
+          'luna://com.webos.settingsservice/setSystemSettings',
+          { category: 'sound', settings: { soundMode: modeCandidate } },
+          1800
+        );
+        if (setRes && setRes.returnValue === true) {
+          const rb = await querySoundSettingsAsync();
+          if (rb.ok) {
+            settings = { ...settings, ...rb.settings };
+            const activeMode =
+              typeof settings.soundMode === 'string' ? settings.soundMode.trim() : '';
+            if (activeMode === modeCandidate || isPreferredVoiceSoundMode(activeMode)) {
+              resolvedSoundMode = activeMode;
+              if (isPreferredVoiceSoundMode(activeMode)) {
+                preferredProbed = true;
+              }
+              changedAny = true;
+              break;
+            }
+          }
+        }
+        if (modeCandidate === PREFERRED_VOICE_SOUND_MODES[PREFERRED_VOICE_SOUND_MODES.length - 1]) {
+          preferredProbed = true;
+        }
+      }
+    }
+
+    return finalizeCycle(settings, changedAny, prep);
+  }
+
+  return {
+    enforceSync,
+    enforceAsync,
+    getStatus: () => currentStatus,
+    getSnapshot: () => buildSnapshot({ cached: true, tvPower: lastPower }),
+    resetCache: () => {
+      verifiedForCurrentCycle = false;
+      postSwitchRecheckPending = false;
+    }
+  };
+}
+
 function createResidentMaintenanceController(deps = {}) {
   const io = deps.fs || fs;
   const nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
@@ -1831,6 +2439,16 @@ function createResidentMaintenanceController(deps = {}) {
       : () => ({ ok: true });
   const ensureWakeOnLanEnabled =
     typeof deps.ensureWakeOnLanEnabled === 'function' ? deps.ensureWakeOnLanEnabled : () => {};
+  const ensureAutoVoiceLeveling =
+    typeof deps.ensureAutoVoiceLeveling === 'function'
+      ? deps.ensureAutoVoiceLeveling
+      : async () => ({
+          enabled: true,
+          ok: true,
+          status: 'on',
+          autoVolume: 'on',
+          soundMode: 'clearVoice'
+        });
   const applyLgNetworkBlock =
     typeof deps.applyLgNetworkBlock === 'function' ? deps.applyLgNetworkBlock : () => true;
   const isLgServerBlocked =
@@ -1908,6 +2526,20 @@ function createResidentMaintenanceController(deps = {}) {
         writeUpdaterState(nextState);
       }
 
+      applyLgNetworkBlock(false);
+      let voiceLevelingReport = null;
+      if (isLgServerBlocked()) {
+        try {
+          voiceLevelingReport = await Promise.resolve(
+            ensureAutoVoiceLeveling({
+              tvPower: currentPower,
+              fgAppId: wf.foregroundAppId || '',
+              force: true
+            })
+          );
+        } catch (_) {}
+      }
+
       const diag = collectDiagnostics() || {};
       const report = {
         schema: 1,
@@ -1921,6 +2553,7 @@ function createResidentMaintenanceController(deps = {}) {
         privacy: diag.privacyStatus || 'ok',
         privacyRetirements: diag.privacyStatus || 'ok',
         lgServerBlocked: isLgServerBlocked(),
+        voiceLeveling: voiceLevelingReport,
         privacyManifestsRemoved:
           typeof diag.privacyManifestsRemovedCount === 'number'
             ? diag.privacyManifestsRemovedCount
@@ -2128,6 +2761,14 @@ module.exports = {
   DEFAULT_IDLE_THRESHOLD_MS,
   DEFAULT_INSTALL_TIMEOUT_MS,
   DEFAULT_MAX_INSTALL_TIMEOUT_MS,
+  DEFAULT_VOICE_LEVELING_RECHECK_MS,
+  DEFAULT_POST_SWITCH_RECHECK_DELAY_MS,
+  PREFERRED_VOICE_SOUND_MODES,
+  FALLBACK_VOICE_SOUND_MODES,
+  VOICE_LEVELING_SOUND_MODES,
+  isAutoVolumeEnabled,
+  isPreferredVoiceSoundMode,
+  isVoiceLevelingSoundMode,
   sha256Hex,
   stripManagedHostsBlock,
   renderBlockedHosts,
@@ -2146,5 +2787,6 @@ module.exports = {
   runUpdateWorkflow,
   createLgNetworkGuard,
   createPrivacyRetirementEnforcer,
+  createAutoVoiceLevelingEnforcer,
   createResidentMaintenanceController
 };
