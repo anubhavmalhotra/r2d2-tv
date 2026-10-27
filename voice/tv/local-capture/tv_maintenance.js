@@ -165,6 +165,2017 @@ const VOICE_LEVELING_SOUND_MODES = Object.freeze([
   ...PREFERRED_VOICE_SOUND_MODES
 ]);
 
+const SPORTS_SEASON_CATALOG = Object.freeze([
+  Object.freeze({
+    id: 'nfl',
+    title: 'NFL',
+    name: 'NFL Football',
+    appId: 'amazon',
+    startMonth: 9,
+    endMonth: 2,
+    season: 'Sep–Feb',
+    endMonthName: 'February',
+    reason: 'You follow NFL (Sep–Feb). Prime Video carries live Thursday Night Football.',
+    exit: 'NFL season ended in February. Remove Prime Video until kickoff in September?'
+  }),
+  Object.freeze({
+    id: 'nba',
+    title: 'NBA',
+    name: 'NBA Basketball',
+    appId: 'amazon',
+    startMonth: 10,
+    endMonth: 6,
+    season: 'Oct–Jun',
+    endMonthName: 'June',
+    reason:
+      'You follow NBA (Oct–Jun). Prime Video streams live regular-season, Play-In, and playoff games.',
+    exit: 'NBA season ended in June. Remove Prime Video until tip-off in October?'
+  }),
+  Object.freeze({
+    id: 'mlb',
+    title: 'MLB',
+    name: 'MLB Baseball',
+    appId: 'com.apple.appletv',
+    startMonth: 3,
+    endMonth: 11,
+    season: 'Mar–Nov',
+    endMonthName: 'November',
+    reason: 'You follow MLB (Mar–Nov). Apple TV streams live Friday Night Baseball.',
+    exit: 'MLB season ended in November. Remove Apple TV until Opening Day in March?'
+  }),
+  Object.freeze({
+    id: 'nhl',
+    title: 'NHL',
+    name: 'NHL Hockey',
+    appId: 'hulu',
+    startMonth: 10,
+    endMonth: 6,
+    season: 'Oct–Jun',
+    endMonthName: 'June',
+    reason: 'You follow NHL (Oct–Jun). Hulu streams live out-of-market and national hockey.',
+    exit: 'NHL season ended in June. Remove Hulu until the puck drops in October?'
+  }),
+  Object.freeze({
+    id: 'f1',
+    title: 'Formula 1',
+    name: 'Formula 1',
+    appId: 'com.apple.appletv',
+    startMonth: 3,
+    endMonth: 12,
+    season: 'Mar–Dec',
+    endMonthName: 'December',
+    reason:
+      'You follow Formula 1 (Mar–Dec). Apple TV streams every Grand Prix practice, qualifying, Sprint, and race.',
+    exit: 'Formula 1 season ended in December. Remove Apple TV until lights out in March?'
+  }),
+  Object.freeze({
+    id: 'soccer',
+    title: 'Soccer',
+    name: 'UCL & Premier League',
+    appId: 'com.movenetworks.app.sling-tv-sling-production',
+    startMonth: 8,
+    endMonth: 5,
+    season: 'Aug–May',
+    endMonthName: 'May',
+    reason: 'You follow Soccer (Aug–May). Sling TV streams live league and cup matches.',
+    exit: 'European soccer season ended in May. Remove Sling TV until kickoff in August?'
+  }),
+  Object.freeze({
+    id: 'mls',
+    title: 'MLS',
+    name: 'MLS Soccer',
+    appId: 'com.apple.appletv',
+    startMonth: 2,
+    endMonth: 12,
+    season: 'Feb–Dec',
+    endMonthName: 'December',
+    reason: 'You follow MLS (Feb–Dec). Apple TV carries every live MLS Season Pass match.',
+    exit: 'MLS season ended in December. Remove Apple TV until kickoff in February?'
+  }),
+  Object.freeze({
+    id: 'cricket',
+    title: 'Cricket',
+    name: 'Cricket (IPL & ICC)',
+    appId: 'com.movenetworks.app.sling-tv-sling-production',
+    startMonth: 3,
+    endMonth: 11,
+    season: 'Mar–Nov',
+    endMonthName: 'November',
+    reason: 'You follow Cricket (Mar–Nov). Sling TV carries Willow and live tournament play.',
+    exit: 'Cricket season ended in November. Remove Sling TV until tournament play in March?'
+  }),
+  Object.freeze({
+    id: 'tennis',
+    title: 'Tennis',
+    name: 'Grand Slam Tennis',
+    appId: 'hulu',
+    startMonth: 1,
+    endMonth: 9,
+    season: 'Jan–Sep',
+    endMonthName: 'September',
+    reason: 'You follow Tennis (Jan–Sep). Hulu carries live Grand Slam championship courts.',
+    exit: 'Grand Slam tennis ended in September. Remove Hulu until Melbourne in January?'
+  })
+]);
+
+const SPORTS_MONTH_SHORT = Object.freeze([
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec'
+]);
+
+const SPORTS_MONTH_LONG = Object.freeze([
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December'
+]);
+
+function isMonthInSportSeason(sport, month) {
+  if (
+    !sport ||
+    !Number.isInteger(sport.startMonth) ||
+    !Number.isInteger(sport.endMonth) ||
+    sport.startMonth < 1 ||
+    sport.startMonth > 12 ||
+    sport.endMonth < 1 ||
+    sport.endMonth > 12
+  ) {
+    return false;
+  }
+  return sport.startMonth <= sport.endMonth
+    ? month >= sport.startMonth && month <= sport.endMonth
+    : month >= sport.startMonth || month <= sport.endMonth;
+}
+
+function isSportInSeason(sport, dateObj) {
+  if (
+    !sport ||
+    !Number.isInteger(sport.startMonth) ||
+    !Number.isInteger(sport.endMonth) ||
+    sport.startMonth < 1 ||
+    sport.startMonth > 12 ||
+    sport.endMonth < 1 ||
+    sport.endMonth > 12
+  ) {
+    return false;
+  }
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj !== undefined ? dateObj : Date.now());
+  if (!Number.isFinite(d.getTime())) return false;
+  return isMonthInSportSeason(sport, d.getUTCMonth() + 1);
+}
+
+function combinedSeasonalGroupWindow(group, dateObj) {
+  const list = Array.isArray(group) ? group : [];
+  if (list.length === 0) {
+    return { yearRound: false, season: '', endMonthName: null };
+  }
+  if (list.length === 1) {
+    const single = list[0];
+    const singleAllMonths = single.startMonth === 1 && single.endMonth === 12;
+    return {
+      yearRound: singleAllMonths,
+      season: singleAllMonths ? 'Year-round' : single.season,
+      endMonthName: singleAllMonths ? null : single.endMonthName
+    };
+  }
+  const activeMonths = new Set();
+  for (let m = 1; m <= 12; m++) {
+    if (list.some((s) => isMonthInSportSeason(s, m))) {
+      activeMonths.add(m);
+    }
+  }
+  if (activeMonths.size === 12) {
+    return { yearRound: true, season: 'Year-round', endMonthName: null };
+  }
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj !== undefined ? dateObj : Date.now());
+  const curMonth = Number.isFinite(d.getTime()) ? d.getUTCMonth() + 1 : list[0].startMonth;
+  const anchor = activeMonths.has(curMonth) ? curMonth : list[0].startMonth;
+  let startM = anchor;
+  let endM = anchor;
+  for (let i = 0; i < 12; i++) {
+    const prevM = ((startM + 10) % 12) + 1;
+    if (!activeMonths.has(prevM)) break;
+    startM = prevM;
+  }
+  for (let j = 0; j < 12; j++) {
+    const nextM = (endM % 12) + 1;
+    if (!activeMonths.has(nextM)) break;
+    endM = nextM;
+  }
+  return {
+    yearRound: false,
+    season: SPORTS_MONTH_SHORT[startM - 1] + '–' + SPORTS_MONTH_SHORT[endM - 1],
+    endMonthName: SPORTS_MONTH_LONG[endM - 1]
+  };
+}
+
+function sportCycleKey(sport, dateObj, inSeason) {
+  if (!sport || typeof sport.id !== 'string') return '';
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj !== undefined ? dateObj : Date.now());
+  if (!Number.isFinite(d.getTime())) return '';
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + 1;
+  const active = typeof inSeason === 'boolean' ? inSeason : isSportInSeason(sport, d);
+  if (sport.startMonth <= sport.endMonth) {
+    return sport.id + (active ? ':in:' + year : ':off:' + (month < sport.startMonth ? year - 1 : year));
+  }
+  return sport.id + (active ? ':in:' + (month >= sport.startMonth ? year : year - 1) : ':off:' + year);
+}
+
+function normalizeSeasonalSportsState(raw, catalogSports = SPORTS_SEASON_CATALOG) {
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (_) {
+      parsed = null;
+    }
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    parsed = {};
+  }
+  const sportsList = Array.isArray(catalogSports) ? catalogSports : SPORTS_SEASON_CATALOG;
+  const validSports = new Set();
+  const validApps = new Set();
+  for (const s of sportsList) {
+    if (s && typeof s.id === 'string') validSports.add(s.id);
+    if (s && typeof s.appId === 'string') validApps.add(s.appId);
+  }
+  const followed = [];
+  const seenFollowed = new Set();
+  if (Array.isArray(parsed.followed)) {
+    for (const id of parsed.followed) {
+      if (typeof id === 'string' && validSports.has(id) && !seenFollowed.has(id)) {
+        seenFollowed.add(id);
+        followed.push(id);
+      }
+    }
+  }
+  const dismissed = {};
+  if (parsed.dismissed && typeof parsed.dismissed === 'object' && !Array.isArray(parsed.dismissed)) {
+    for (const [k, v] of Object.entries(parsed.dismissed)) {
+      const parts = k.split(':');
+      if (parts.length === 3 && validSports.has(parts[0]) && parts[1] === 'in' && /^\d{4}$/.test(parts[2]) && v === true) {
+        dismissed[k] = true;
+      }
+    }
+  }
+  const kept = {};
+  if (parsed.kept && typeof parsed.kept === 'object' && !Array.isArray(parsed.kept)) {
+    for (const [k, v] of Object.entries(parsed.kept)) {
+      const parts = k.split(':');
+      if (parts.length === 3 && validSports.has(parts[0]) && parts[1] === 'off' && /^\d{4}$/.test(parts[2]) && v === true) {
+        kept[k] = true;
+      }
+    }
+  }
+  const seasonalInstalls = {};
+  if (
+    parsed.seasonalInstalls &&
+    typeof parsed.seasonalInstalls === 'object' &&
+    !Array.isArray(parsed.seasonalInstalls)
+  ) {
+    for (const [appId, v] of Object.entries(parsed.seasonalInstalls)) {
+      if (validApps.has(appId) && v === true) {
+        seasonalInstalls[appId] = true;
+      }
+    }
+  }
+  const autoRemove = {};
+  if (
+    parsed.autoRemove &&
+    typeof parsed.autoRemove === 'object' &&
+    !Array.isArray(parsed.autoRemove)
+  ) {
+    for (const [appId, v] of Object.entries(parsed.autoRemove)) {
+      if (validApps.has(appId) && seasonalInstalls[appId] === true && v === true) {
+        autoRemove[appId] = true;
+      }
+    }
+  }
+  const installTokens = {};
+  if (
+    parsed.installTokens &&
+    typeof parsed.installTokens === 'object' &&
+    !Array.isArray(parsed.installTokens)
+  ) {
+    for (const [appId, v] of Object.entries(parsed.installTokens)) {
+      if (
+        validApps.has(appId) &&
+        seasonalInstalls[appId] === true &&
+        (typeof v === 'string' || typeof v === 'number') &&
+        String(v).trim().length > 0 &&
+        String(v).length <= 64
+      ) {
+        installTokens[appId] = String(v).trim();
+      }
+    }
+  }
+  const result = { followed, dismissed, kept, seasonalInstalls, autoRemove };
+  Object.defineProperty(result, 'installTokens', {
+    value: installTokens,
+    writable: true,
+    configurable: true,
+    enumerable: Object.keys(installTokens).length > 0
+  });
+  return result;
+}
+
+function evaluateSeasonalSports(
+  installedApps,
+  rawState,
+  dateObj = new Date(),
+  catalogSports = SPORTS_SEASON_CATALOG
+) {
+  const state = normalizeSeasonalSportsState(rawState, catalogSports);
+  const d = dateObj instanceof Date ? dateObj : new Date(dateObj !== undefined ? dateObj : Date.now());
+  const sportsList = Array.isArray(catalogSports) ? catalogSports : SPORTS_SEASON_CATALOG;
+  const byAppId = new Map();
+  for (const app of Array.isArray(installedApps) ? installedApps : []) {
+    if (app && typeof app.id === 'string' && app.visible !== false && app.type !== 'stub') {
+      const id = app.id.trim();
+      if (id) byAppId.set(id, app);
+    }
+  }
+
+  const byAppFollowed = new Map();
+  const appOrder = [];
+  for (const sport of sportsList) {
+    if (!sport || typeof sport.id !== 'string' || !state.followed.includes(sport.id)) continue;
+    const inSeason = isSportInSeason(sport, d);
+    const cycleKey = sportCycleKey(sport, d, inSeason);
+    const inst = byAppId.get(sport.appId) || null;
+    const removable = Boolean(
+      inst &&
+        inst.removable === true &&
+        inst.systemApp === false &&
+        !NEVER_UPDATE_APPS.has(sport.appId)
+    );
+    const entry = {
+      ...sport,
+      inSeason,
+      cycleKey,
+      carrierInstalled: Boolean(inst),
+      carrierRemovable: removable
+    };
+    if (!byAppFollowed.has(sport.appId)) {
+      byAppFollowed.set(sport.appId, []);
+      appOrder.push(sport.appId);
+    }
+    byAppFollowed.get(sport.appId).push(entry);
+  }
+
+  const suggestions = [];
+  const exits = [];
+  const autoRemoveIds = [];
+
+  for (const appId of appOrder) {
+    const group = byAppFollowed.get(appId) || [];
+    const combined = combinedSeasonalGroupWindow(group, d);
+    const inSeasonGroup = group.filter((s) => s.inSeason);
+    const offSeasonGroup = group.filter((s) => !s.inSeason);
+    const installed = byAppId.get(appId) || null;
+
+    if (!installed && inSeasonGroup.length > 0) {
+      const activeSuggest = inSeasonGroup.filter((s) => !state.dismissed[s.cycleKey]);
+      if (activeSuggest.length > 0) {
+        const first = activeSuggest[0];
+        const sportTitle = activeSuggest.map((s) => s.title).join(' & ');
+        suggestions.push({
+          kind: 'suggest',
+          appId,
+          sports: activeSuggest.map((s) => s.id),
+          sportTitle,
+          season: combined.season,
+          endMonthName: combined.endMonthName,
+          yearRound: combined.yearRound,
+          reason: first.reason,
+          cycleKeys: activeSuggest.map((s) => s.cycleKey)
+        });
+      }
+    } else if (
+      installed &&
+      inSeasonGroup.length === 0 &&
+      offSeasonGroup.length > 0 &&
+      offSeasonGroup[0].carrierRemovable
+    ) {
+      const activeExit = offSeasonGroup.filter((s) => !state.kept[s.cycleKey]);
+      if (activeExit.length > 0) {
+        const first = activeExit[0];
+        const sportTitle = activeExit.map((s) => s.title).join(' & ');
+        const seasonalInstall = Boolean(state.seasonalInstalls[appId]);
+        const autoRemoveConsent = Boolean(
+          seasonalInstall && state.autoRemove && state.autoRemove[appId] === true
+        );
+        exits.push({
+          kind: 'exit',
+          appId,
+          sports: activeExit.map((s) => s.id),
+          sportTitle,
+          season: combined.season,
+          endMonthName: combined.endMonthName,
+          yearRound: false,
+          exit: first.exit,
+          cycleKeys: activeExit.map((s) => s.cycleKey),
+          seasonalInstall,
+          autoRemove: autoRemoveConsent
+        });
+        if (autoRemoveConsent) {
+          autoRemoveIds.push(appId);
+        }
+      }
+    }
+  }
+
+  return {
+    state,
+    suggestions,
+    exits,
+    autoRemoveIds
+  };
+}
+
+const DEFAULT_SEASONAL_STATE_PATH = '/var/lib/local.owner.r2d2mic/seasonal-sports-state.json';
+const DEFAULT_HOME_SPORTS_BRIDGE_PATH = null;
+const DEFAULT_WEBOS_LOCALSTORAGE_DIRS = Object.freeze([
+  '/var/luna/preferences/webos_webappmgr/Local Storage/leveldb',
+  '/media/cryptofs/apps/usr/palm/applications/local.owner.applibrary/Local Storage/leveldb',
+  '/media/cryptofs/apps/usr/palm/applications/local.owner.applibrary/localstorage/leveldb',
+  '/var/palm/webappmgr/localstorage/leveldb'
+]);
+const DEFAULT_HOME_STORAGE_ORIGINS = Object.freeze([
+  'http://home.test',
+  'https://home.test',
+  'file://',
+  'app://local.owner.applibrary',
+  'http://local.owner.applibrary',
+  'https://local.owner.applibrary'
+]);
+const LEVELDB_TABLE_MAGIC = Buffer.from([0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb]);
+
+function extractBalancedJsonObject(str, startIdx) {
+  if (typeof str !== 'string' || startIdx < 0 || startIdx >= str.length || str[startIdx] !== '{') {
+    return null;
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = startIdx; i < str.length && i - startIdx <= 16384; i++) {
+    const ch = str[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+    } else if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return str.slice(startIdx, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function isSportsStateJsonObject(obj) {
+  return Boolean(
+    obj &&
+      typeof obj === 'object' &&
+      !Array.isArray(obj) &&
+      (Array.isArray(obj.followed) ||
+        (obj.seasonalInstalls && typeof obj.seasonalInstalls === 'object') ||
+        (obj.kept && typeof obj.kept === 'object') ||
+        (obj.dismissed && typeof obj.dismissed === 'object'))
+  );
+}
+
+function readLevelDbVarint(buf, offset) {
+  let result = 0n;
+  let shift = 0n;
+  let pos = offset;
+  while (pos < buf.length && shift <= 63n) {
+    const byte = buf[pos++];
+    result |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return { value: Number(result), bigint: result, nextOffset: pos };
+    }
+    shift += 7n;
+  }
+  return null;
+}
+
+function uncompressSnappyBuffer(src) {
+  if (!Buffer.isBuffer(src) || src.length === 0) return null;
+  const lenInfo = readLevelDbVarint(src, 0);
+  if (!lenInfo || lenInfo.value < 0 || lenInfo.value > 16 * 1024 * 1024) return null;
+  const out = Buffer.alloc(lenInfo.value);
+  let pos = lenInfo.nextOffset;
+  let outPos = 0;
+
+  while (pos < src.length) {
+    const tag = src[pos++];
+    const tagType = tag & 0x03;
+    if (tagType === 0) {
+      let litLen = (tag >>> 2) + 1;
+      if (litLen > 60) {
+        const extraBytes = litLen - 60;
+        if (pos + extraBytes > src.length) return null;
+        let lenVal = 0;
+        for (let i = 0; i < extraBytes; i++) {
+          lenVal |= src[pos++] << (i * 8);
+        }
+        litLen = (lenVal >>> 0) + 1;
+      }
+      if (pos + litLen > src.length || outPos + litLen > out.length) return null;
+      src.copy(out, outPos, pos, pos + litLen);
+      pos += litLen;
+      outPos += litLen;
+    } else {
+      let copyLen = 0;
+      let copyOffset = 0;
+      if (tagType === 1) {
+        if (pos >= src.length) return null;
+        copyLen = ((tag >>> 2) & 0x07) + 4;
+        copyOffset = ((tag & 0xe0) << 3) | src[pos++];
+      } else if (tagType === 2) {
+        if (pos + 2 > src.length) return null;
+        copyLen = (tag >>> 2) + 1;
+        copyOffset = src[pos] | (src[pos + 1] << 8);
+        pos += 2;
+      } else {
+        if (pos + 4 > src.length) return null;
+        copyLen = (tag >>> 2) + 1;
+        copyOffset =
+          (src[pos] |
+            (src[pos + 1] << 8) |
+            (src[pos + 2] << 16) |
+            (src[pos + 3] << 24)) >>>
+          0;
+        pos += 4;
+      }
+      if (copyOffset <= 0 || copyOffset > outPos || outPos + copyLen > out.length) return null;
+      for (let i = 0; i < copyLen; i++) {
+        out[outPos] = out[outPos - copyOffset];
+        outPos++;
+      }
+    }
+  }
+  return outPos === out.length ? out : null;
+}
+
+function readLevelDbBlock(fileBuf, offset, size) {
+  if (
+    !Buffer.isBuffer(fileBuf) ||
+    offset < 0 ||
+    size < 0 ||
+    offset + size + 5 > fileBuf.length
+  ) {
+    return null;
+  }
+  const compressionType = fileBuf[offset + size];
+  const rawPayload = fileBuf.subarray(offset, offset + size);
+  if (compressionType === 0) {
+    return rawPayload;
+  }
+  if (compressionType === 1) {
+    return uncompressSnappyBuffer(rawPayload);
+  }
+  return null;
+}
+
+function decodeLevelDbBlockEntries(blockBuf) {
+  if (!Buffer.isBuffer(blockBuf) || blockBuf.length < 4) return null;
+  const numRestarts = blockBuf.readUInt32LE(blockBuf.length - 4);
+  if (numRestarts > 1048576 || 4 * (numRestarts + 1) > blockBuf.length) return null;
+  const limit = blockBuf.length - 4 * (numRestarts + 1);
+  let pos = 0;
+  let prevKey = Buffer.alloc(0);
+  const entries = [];
+
+  while (pos < limit) {
+    const sharedVar = readLevelDbVarint(blockBuf, pos);
+    if (!sharedVar) return null;
+    const nonSharedVar = readLevelDbVarint(blockBuf, sharedVar.nextOffset);
+    if (!nonSharedVar) return null;
+    const valueLenVar = readLevelDbVarint(blockBuf, nonSharedVar.nextOffset);
+    if (!valueLenVar) return null;
+    pos = valueLenVar.nextOffset;
+    const shared = sharedVar.value;
+    const nonShared = nonSharedVar.value;
+    const valueLen = valueLenVar.value;
+    if (shared > prevKey.length || pos + nonShared + valueLen > limit) return null;
+    const keyDelta = blockBuf.subarray(pos, pos + nonShared);
+    pos += nonShared;
+    const valSlice = blockBuf.subarray(pos, pos + valueLen);
+    pos += valueLen;
+    const fullKey =
+      shared === 0 ? keyDelta : Buffer.concat([prevKey.subarray(0, shared), keyDelta]);
+    prevKey = fullKey;
+    entries.push({ key: fullKey, value: valSlice });
+  }
+  return pos === limit ? entries : null;
+}
+
+function readLevelDbTableRecords(buf, allowedKeyInfo = null) {
+  if (
+    !Buffer.isBuffer(buf) ||
+    buf.length < 48 ||
+    !buf.subarray(buf.length - 8).equals(LEVELDB_TABLE_MAGIC)
+  ) {
+    return null;
+  }
+  const footer = buf.subarray(buf.length - 48, buf.length - 8);
+  const metaOff = readLevelDbVarint(footer, 0);
+  if (!metaOff) return null;
+  const metaSize = readLevelDbVarint(footer, metaOff.nextOffset);
+  if (!metaSize) return null;
+  const idxOff = readLevelDbVarint(footer, metaSize.nextOffset);
+  if (!idxOff) return null;
+  const idxSize = readLevelDbVarint(footer, idxOff.nextOffset);
+  if (!idxSize) return null;
+
+  const indexBlock = readLevelDbBlock(buf, idxOff.value, idxSize.value);
+  if (!indexBlock) return null;
+  const indexEntries = decodeLevelDbBlockEntries(indexBlock);
+  if (!indexEntries) return null;
+  const records = [];
+
+  for (const idxEntry of indexEntries) {
+    const bOff = readLevelDbVarint(idxEntry.value, 0);
+    if (!bOff) return null;
+    const bSize = readLevelDbVarint(idxEntry.value, bOff.nextOffset);
+    if (!bSize) return null;
+    const dataBlock = readLevelDbBlock(buf, bOff.value, bSize.value);
+    if (!dataBlock) return null;
+    const dataEntries = decodeLevelDbBlockEntries(dataBlock);
+    if (!dataEntries) return null;
+    for (const dEntry of dataEntries) {
+      if (dEntry.key.length < 8) return null;
+      const userKey = dEntry.key.subarray(0, dEntry.key.length - 8);
+      const tag = dEntry.key.readBigUInt64LE(dEntry.key.length - 8);
+      const valueType = Number(tag & 0xffn);
+      if (valueType !== 0 && valueType !== 1) return null;
+      if (
+        allowedKeyInfo &&
+        valueType === 1 &&
+        isHomeSportsStorageKey(userKey, allowedKeyInfo) &&
+        decodeDomStorageSportsJsonValue(dEntry.value) === null
+      ) {
+        return null;
+      }
+      const seq = tag >> 8n;
+      records.push({ userKey, valueType, seq, value: dEntry.value });
+    }
+  }
+  return records;
+}
+
+function readLevelDbWalLogicalPayloads(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length === 0) {
+    return { payloads: [], corrupt: false };
+  }
+  if (buf.length < 7) {
+    const looksLikeTextOrRaw = buf[0] === 0x5f || buf[0] === 0x7b;
+    return { payloads: [], corrupt: !looksLikeTextOrRaw };
+  }
+  const BLOCK_SIZE = 32768;
+  const payloads = [];
+  let fragChunks = [];
+
+  for (let blockStart = 0; blockStart < buf.length; blockStart += BLOCK_SIZE) {
+    const blockEnd = Math.min(buf.length, blockStart + BLOCK_SIZE);
+    let pos = blockStart;
+    while (pos + 7 <= blockEnd) {
+      const length = buf.readUInt16LE(pos + 4);
+      const recType = buf[pos + 6];
+      if (recType === 0 && length === 0) {
+        for (let i = pos; i < blockEnd; i++) {
+          if (buf[i] !== 0) {
+            return { payloads: [], corrupt: true };
+          }
+        }
+        pos = blockEnd;
+        break;
+      }
+      if (recType < 1 || recType > 4) {
+        if (blockStart === 0 && pos === 0) {
+          return { payloads: [], corrupt: false };
+        }
+        return { payloads: [], corrupt: true };
+      }
+      if (pos + 7 + length > blockEnd) {
+        return { payloads: [], corrupt: true };
+      }
+      const chunk = buf.subarray(pos + 7, pos + 7 + length);
+      pos += 7 + length;
+      if (recType === 1) {
+        if (fragChunks.length > 0) {
+          return { payloads: [], corrupt: true };
+        }
+        payloads.push(chunk);
+      } else if (recType === 2) {
+        if (fragChunks.length > 0) {
+          return { payloads: [], corrupt: true };
+        }
+        fragChunks = [chunk];
+      } else if (recType === 3) {
+        if (fragChunks.length === 0) {
+          return { payloads: [], corrupt: true };
+        }
+        fragChunks.push(chunk);
+      } else if (recType === 4) {
+        if (fragChunks.length === 0) {
+          return { payloads: [], corrupt: true };
+        }
+        fragChunks.push(chunk);
+        payloads.push(Buffer.concat(fragChunks));
+        fragChunks = [];
+      }
+    }
+    if (pos < blockEnd) {
+      if (blockEnd < blockStart + BLOCK_SIZE) {
+        return { payloads: [], corrupt: true };
+      }
+      for (let i = pos; i < blockEnd; i++) {
+        if (buf[i] !== 0) {
+          return { payloads: [], corrupt: true };
+        }
+      }
+    }
+  }
+  if (fragChunks.length > 0) {
+    return { payloads: [], corrupt: true };
+  }
+  return { payloads, corrupt: false };
+}
+
+function readLevelDbWalRecords(buf, allowedKeyInfo = null) {
+  const wal = readLevelDbWalLogicalPayloads(buf);
+  if (wal.corrupt) return { records: null, corrupt: true };
+  const batches = wal.payloads;
+  if (batches.length === 0) return { records: null, corrupt: false };
+  const records = [];
+  let validBatches = 0;
+
+  for (const batch of batches) {
+    if (batch.length < 12) return { records: null, corrupt: true };
+    const baseSeq = batch.readBigUInt64LE(0);
+    const count = batch.readUInt32LE(8);
+    if (count === 0 || count > 1000000) return { records: null, corrupt: true };
+    let bPos = 12;
+    let batchOk = true;
+    const batchRecs = [];
+    for (let i = 0; i < count; i++) {
+      if (bPos >= batch.length) {
+        batchOk = false;
+        break;
+      }
+      const opType = batch[bPos++];
+      if (opType !== 0 && opType !== 1) {
+        batchOk = false;
+        break;
+      }
+      const keyLen = readLevelDbVarint(batch, bPos);
+      if (!keyLen || keyLen.nextOffset + keyLen.value > batch.length) {
+        batchOk = false;
+        break;
+      }
+      const userKey = batch.subarray(keyLen.nextOffset, keyLen.nextOffset + keyLen.value);
+      bPos = keyLen.nextOffset + keyLen.value;
+      let valBuf = Buffer.alloc(0);
+      if (opType === 1) {
+        const valLen = readLevelDbVarint(batch, bPos);
+        if (!valLen || valLen.nextOffset + valLen.value > batch.length) {
+          batchOk = false;
+          break;
+        }
+        valBuf = batch.subarray(valLen.nextOffset, valLen.nextOffset + valLen.value);
+        bPos = valLen.nextOffset + valLen.value;
+        if (allowedKeyInfo && isHomeSportsStorageKey(userKey, allowedKeyInfo)) {
+          if (decodeDomStorageSportsJsonValue(valBuf) === null) {
+            return { records: null, corrupt: true };
+          }
+        }
+      }
+      batchRecs.push({
+        userKey,
+        valueType: opType,
+        seq: baseSeq + BigInt(i),
+        value: valBuf
+      });
+    }
+    if (!batchOk || bPos !== batch.length) {
+      return { records: null, corrupt: true };
+    }
+    validBatches++;
+    for (const r of batchRecs) records.push(r);
+  }
+  return { records: validBatches > 0 ? records : null, corrupt: false };
+}
+
+function parseLevelDbManifest(manifestBuf) {
+  const wal = readLevelDbWalLogicalPayloads(manifestBuf);
+  if (wal.corrupt || wal.payloads.length === 0) return null;
+  const edits = wal.payloads;
+  const liveFiles = new Map();
+  let logNumber = 0;
+  let prevLogNumber = 0;
+  let validEdits = 0;
+
+  for (const edit of edits) {
+    let pos = 0;
+    let editOk = true;
+    while (pos < edit.length) {
+      const tagVar = readLevelDbVarint(edit, pos);
+      if (!tagVar) {
+        editOk = false;
+        break;
+      }
+      pos = tagVar.nextOffset;
+      const tag = tagVar.value;
+      if (tag === 1) {
+        const cmpLen = readLevelDbVarint(edit, pos);
+        if (!cmpLen || cmpLen.nextOffset + cmpLen.value > edit.length) {
+          editOk = false;
+          break;
+        }
+        pos = cmpLen.nextOffset + cmpLen.value;
+      } else if (tag === 2) {
+        const v = readLevelDbVarint(edit, pos);
+        if (!v) {
+          editOk = false;
+          break;
+        }
+        logNumber = v.value;
+        pos = v.nextOffset;
+      } else if (tag === 3 || tag === 4) {
+        const v = readLevelDbVarint(edit, pos);
+        if (!v) {
+          editOk = false;
+          break;
+        }
+        pos = v.nextOffset;
+      } else if (tag === 5) {
+        const lvl = readLevelDbVarint(edit, pos);
+        if (!lvl) {
+          editOk = false;
+          break;
+        }
+        const keySlice = readLevelDbVarint(edit, lvl.nextOffset);
+        if (!keySlice || keySlice.nextOffset + keySlice.value > edit.length) {
+          editOk = false;
+          break;
+        }
+        pos = keySlice.nextOffset + keySlice.value;
+      } else if (tag === 6) {
+        const lvl = readLevelDbVarint(edit, pos);
+        if (!lvl) {
+          editOk = false;
+          break;
+        }
+        const fNum = readLevelDbVarint(edit, lvl.nextOffset);
+        if (!fNum) {
+          editOk = false;
+          break;
+        }
+        liveFiles.delete(fNum.value);
+        pos = fNum.nextOffset;
+      } else if (tag === 7) {
+        const lvl = readLevelDbVarint(edit, pos);
+        if (!lvl) {
+          editOk = false;
+          break;
+        }
+        const fNum = readLevelDbVarint(edit, lvl.nextOffset);
+        if (!fNum) {
+          editOk = false;
+          break;
+        }
+        const fSize = readLevelDbVarint(edit, fNum.nextOffset);
+        if (!fSize) {
+          editOk = false;
+          break;
+        }
+        const smallKey = readLevelDbVarint(edit, fSize.nextOffset);
+        if (!smallKey || smallKey.nextOffset + smallKey.value > edit.length) {
+          editOk = false;
+          break;
+        }
+        const largeKey = readLevelDbVarint(edit, smallKey.nextOffset + smallKey.value);
+        if (!largeKey || largeKey.nextOffset + largeKey.value > edit.length) {
+          editOk = false;
+          break;
+        }
+        liveFiles.set(fNum.value, lvl.value);
+        pos = largeKey.nextOffset + largeKey.value;
+      } else if (tag === 9) {
+        const v = readLevelDbVarint(edit, pos);
+        if (!v) {
+          editOk = false;
+          break;
+        }
+        prevLogNumber = v.value;
+        pos = v.nextOffset;
+      } else {
+        editOk = false;
+        break;
+      }
+    }
+    if (!editOk) return null;
+    validEdits++;
+  }
+  return validEdits > 0 ? { liveFiles, logNumber, prevLogNumber } : null;
+}
+
+function buildAllowedHomeKeyBuffers(allowedOrigins = DEFAULT_HOME_STORAGE_ORIGINS) {
+  const keyUtf8 = Buffer.from('baaz.sports.v1', 'utf8');
+  const keyUtf16 = Buffer.from('baaz.sports.v1', 'utf16le');
+  const keyVariants = [
+    Buffer.concat([Buffer.from([0x01]), keyUtf8]),
+    Buffer.concat([Buffer.from([0x00]), keyUtf16]),
+    Buffer.concat([Buffer.from([0x00, 0x00]), keyUtf16]),
+    keyUtf8,
+    keyUtf16
+  ];
+  const exactKeys = [];
+  const originPrefixes = [];
+  for (const origin of allowedOrigins) {
+    if (typeof origin !== 'string' || !origin) continue;
+    const prefix = Buffer.from(`_${origin}\x00`, 'utf8');
+    originPrefixes.push(prefix);
+    for (const kv of keyVariants) {
+      exactKeys.push(Buffer.concat([prefix, kv]));
+    }
+  }
+  return { exactKeys, originPrefixes, keyUtf8, keyUtf16 };
+}
+
+function isHomeSportsStorageKey(userKey, allowedKeyInfo) {
+  if (!Buffer.isBuffer(userKey)) return false;
+  for (const exact of allowedKeyInfo.exactKeys) {
+    if (userKey.equals(exact)) return true;
+  }
+  return false;
+}
+
+function decodeDomStorageSportsJsonValue(valBuf) {
+  if (!Buffer.isBuffer(valBuf) || valBuf.length === 0) return null;
+  const candidateStrings = [];
+  if (valBuf[0] === 0x01) {
+    candidateStrings.push(valBuf.subarray(1).toString('utf8'));
+  }
+  if (valBuf[0] === 0x00 && valBuf.length > 1) {
+    if ((valBuf.length - 1) % 2 === 0) {
+      candidateStrings.push(valBuf.subarray(1).toString('utf16le'));
+    }
+    if (valBuf.length > 2 && valBuf[1] === 0x00 && (valBuf.length - 2) % 2 === 0) {
+      candidateStrings.push(valBuf.subarray(2).toString('utf16le'));
+    }
+  }
+  candidateStrings.push(valBuf.toString('utf8'));
+  if (valBuf.length % 2 === 0) {
+    candidateStrings.push(valBuf.toString('utf16le'));
+  }
+
+  for (const raw of candidateStrings) {
+    const braceIdx = raw.indexOf('{');
+    if (braceIdx === -1) continue;
+    const jsonCandidate = extractBalancedJsonObject(raw, braceIdx);
+    if (!jsonCandidate) continue;
+    try {
+      const parsed = JSON.parse(jsonCandidate);
+      if (isSportsStateJsonObject(parsed)) {
+        return JSON.stringify(parsed);
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+function extractBaazSportsFromBuffer(input, options = {}) {
+  const buf = Buffer.isBuffer(input)
+    ? input
+    : typeof input === 'string'
+      ? Buffer.from(input, 'utf8')
+      : null;
+  if (!buf || buf.length === 0) return { found: false, rawJson: null, seq: -1n };
+
+  const allowedOrigins = Array.isArray(options.allowedOrigins)
+    ? options.allowedOrigins
+    : DEFAULT_HOME_STORAGE_ORIGINS;
+  const allowedKeyInfo = buildAllowedHomeKeyBuffers(allowedOrigins);
+
+  const utf8Text = buf.toString('utf8').trim();
+  if (utf8Text.startsWith('{') && utf8Text.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(utf8Text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (Object.prototype.hasOwnProperty.call(parsed, 'baaz.sports.v1')) {
+          const val = parsed['baaz.sports.v1'];
+          if (val === null || val === undefined || val === '') {
+            return { found: true, rawJson: null, seq: 0n };
+          }
+          const rawJson = typeof val === 'string' ? val : JSON.stringify(val);
+          return { found: true, rawJson, seq: 0n };
+        }
+        if (isSportsStateJsonObject(parsed)) {
+          return { found: true, rawJson: JSON.stringify(parsed), seq: 0n };
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 1. Authoritative LevelDB SSTable (.ldb / .sst) reader (supports Snappy + prefix compression)
+  const hasTableMagic =
+    buf.length >= 48 && buf.subarray(buf.length - 8).equals(LEVELDB_TABLE_MAGIC);
+  const tableRecords = readLevelDbTableRecords(buf, allowedKeyInfo);
+  if (hasTableMagic && tableRecords === null) {
+    return { found: false, rawJson: null, seq: -1n, corrupt: true };
+  }
+  if (tableRecords !== null) {
+    let best = null;
+    for (const rec of tableRecords) {
+      if (!isHomeSportsStorageKey(rec.userKey, allowedKeyInfo)) continue;
+      if (!best || rec.seq >= best.seq) {
+        best = rec;
+      }
+    }
+    if (!best) return { found: false, rawJson: null, seq: -1n, corrupt: false };
+    if (best.valueType === 0) return { found: true, rawJson: null, seq: best.seq, corrupt: false };
+    const decoded = decodeDomStorageSportsJsonValue(best.value);
+    if (decoded === null) {
+      return { found: false, rawJson: null, seq: -1n, corrupt: true };
+    }
+    return { found: true, rawJson: decoded, seq: best.seq, corrupt: false };
+  }
+
+  // 2. Authoritative LevelDB Write-Ahead Log (.log) reader
+  const walResult = readLevelDbWalRecords(buf, allowedKeyInfo);
+  if (walResult.corrupt) {
+    return { found: false, rawJson: null, seq: -1n, corrupt: true };
+  }
+  if (walResult.records !== null) {
+    let best = null;
+    for (const rec of walResult.records) {
+      if (!isHomeSportsStorageKey(rec.userKey, allowedKeyInfo)) continue;
+      if (!best || rec.seq >= best.seq) {
+        best = rec;
+      }
+    }
+    if (!best) return { found: false, rawJson: null, seq: -1n, corrupt: false };
+    if (best.valueType === 0) return { found: true, rawJson: null, seq: best.seq, corrupt: false };
+    const decoded = decodeDomStorageSportsJsonValue(best.value);
+    if (decoded === null) {
+      return { found: false, rawJson: null, seq: -1n, corrupt: true };
+    }
+    return { found: true, rawJson: decoded, seq: best.seq, corrupt: false };
+  }
+
+  // 3. Fallback for synthetic buffers: require an allowed Home origin prefix immediately before baaz.sports.v1
+  const candidates = [];
+  for (const exactKey of allowedKeyInfo.exactKeys) {
+    let offset = 0;
+    while (offset < buf.length) {
+      const idx = buf.indexOf(exactKey, offset);
+      if (idx === -1) break;
+      const afterKey = idx + exactKey.length;
+      const windowEnd = Math.min(buf.length, afterKey + 32768);
+      const slice = buf.subarray(afterKey, windowEnd);
+      const decoded = decodeDomStorageSportsJsonValue(slice);
+      if (decoded === null) {
+        return { found: false, rawJson: null, seq: -1n, corrupt: true };
+      }
+      candidates.push({ pos: idx, rawJson: decoded });
+      offset = afterKey;
+    }
+  }
+
+  if (candidates.length === 0) {
+    return { found: false, rawJson: null, seq: -1n, corrupt: false };
+  }
+  candidates.sort((a, b) => a.pos - b.pos);
+  return {
+    found: true,
+    rawJson: candidates[candidates.length - 1].rawJson,
+    seq: BigInt(candidates.length),
+    corrupt: false
+  };
+}
+
+function createSeasonalSportsStateStore(deps = {}) {
+  const io = deps.fs || fs;
+  const seasonalStatePath = deps.seasonalStatePath || DEFAULT_SEASONAL_STATE_PATH;
+  const homeStateBridgePath = deps.homeStateBridgePath || DEFAULT_HOME_SPORTS_BRIDGE_PATH;
+  const localStorageDirs = Array.isArray(deps.localStorageDirs)
+    ? deps.localStorageDirs
+    : DEFAULT_WEBOS_LOCALSTORAGE_DIRS;
+  const allowedOrigins = Array.isArray(deps.allowedOrigins)
+    ? deps.allowedOrigins
+    : DEFAULT_HOME_STORAGE_ORIGINS;
+  const catalogSports = deps.catalogSports || SPORTS_SEASON_CATALOG;
+  let domStorage = deps.localStorage || null;
+  if (!domStorage && typeof globalThis !== 'undefined') {
+    if (globalThis.__r2d2HomeLocalStorage) {
+      domStorage = globalThis.__r2d2HomeLocalStorage;
+    } else if (typeof window !== 'undefined' && window === globalThis) {
+      try {
+        domStorage = window.localStorage;
+      } catch (_) {}
+    }
+  }
+  const getHomeLocalStorageItem =
+    typeof deps.getHomeLocalStorageItem === 'function'
+      ? deps.getHomeLocalStorageItem
+      : domStorage && typeof domStorage.getItem === 'function'
+        ? (key) => domStorage.getItem(key)
+        : null;
+  const setHomeLocalStorageItem =
+    typeof deps.setHomeLocalStorageItem === 'function'
+      ? deps.setHomeLocalStorageItem
+      : domStorage && typeof domStorage.setItem === 'function'
+        ? (key, val) => domStorage.setItem(key, val)
+        : null;
+
+  const writeFileAtomic =
+    typeof deps.writeAtomic === 'function'
+      ? deps.writeAtomic
+      : (targetPath, dataBuffer) => {
+          const dir = path.dirname(targetPath);
+          if (typeof io.mkdirSync === 'function' && !io.existsSync(dir)) {
+            io.mkdirSync(dir, { recursive: true, mode: 0o700 });
+          }
+          const tmp = `${targetPath}.tmp.${process.pid}`;
+          io.writeFileSync(tmp, dataBuffer, { mode: 0o600 });
+          if (typeof io.chmodSync === 'function') io.chmodSync(tmp, 0o600);
+          io.renameSync(tmp, targetPath);
+        };
+
+  let lastReadHomeHash = null;
+  let lastReadHomeRawJson = null;
+  let lastReadHomeState = null;
+
+  function hashString(str) {
+    if (typeof str !== 'string') return null;
+    return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
+  }
+
+  function hasHomeOriginInBuffer(buf, allowedKeyInfo) {
+    if (!Buffer.isBuffer(buf) || buf.length === 0) return false;
+    const tableRecords = readLevelDbTableRecords(buf);
+    if (tableRecords !== null) {
+      for (const rec of tableRecords) {
+        for (const pfx of allowedKeyInfo.originPrefixes) {
+          if (rec.userKey.length >= pfx.length && rec.userKey.subarray(0, pfx.length).equals(pfx)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    const walResult = readLevelDbWalRecords(buf, allowedKeyInfo);
+    if (walResult.corrupt) return false;
+    if (walResult.records !== null) {
+      for (const rec of walResult.records) {
+        for (const pfx of allowedKeyInfo.originPrefixes) {
+          if (rec.userKey.length >= pfx.length && rec.userKey.subarray(0, pfx.length).equals(pfx)) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+    for (const pfx of allowedKeyInfo.originPrefixes) {
+      if (buf.indexOf(pfx) !== -1) return true;
+    }
+    return false;
+  }
+
+  function extractAppInstallToken(rawJson, appId) {
+    if (typeof rawJson !== 'string' || !appId) return null;
+    try {
+      const parsed = JSON.parse(rawJson);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      if (
+        parsed.installTokens &&
+        typeof parsed.installTokens === 'object' &&
+        !Array.isArray(parsed.installTokens) &&
+        (typeof parsed.installTokens[appId] === 'string' ||
+          typeof parsed.installTokens[appId] === 'number') &&
+        String(parsed.installTokens[appId]).trim().length > 0
+      ) {
+        return 'tok:' + String(parsed.installTokens[appId]).trim();
+      }
+      if (
+        parsed.seasonalInstalls &&
+        typeof parsed.seasonalInstalls === 'object' &&
+        !Array.isArray(parsed.seasonalInstalls) &&
+        parsed.seasonalInstalls[appId] === true
+      ) {
+        return 'val:true';
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function readTrustedBridgeBuffer(bridgePath) {
+    if (typeof bridgePath !== 'string' || !bridgePath.trim()) return null;
+    const normalizedPath = path.posix
+      ? path.posix.normalize(bridgePath.trim())
+      : path.normalize(bridgePath.trim());
+    if (
+      normalizedPath === '/tmp' ||
+      normalizedPath.startsWith('/tmp/') ||
+      normalizedPath === '/var/tmp' ||
+      normalizedPath.startsWith('/var/tmp/') ||
+      normalizedPath === '/private/tmp' ||
+      normalizedPath.startsWith('/private/tmp/')
+    ) {
+      return null;
+    }
+    if (typeof io.lstatSync !== 'function') return null;
+    try {
+      const allowedUids = new Set([0, typeof process.getuid === 'function' ? process.getuid() : 0]);
+      const parentDir = path.dirname(normalizedPath);
+      const dirSt = io.lstatSync(parentDir);
+      if (
+        !dirSt ||
+        typeof dirSt.isSymbolicLink !== 'function' ||
+        dirSt.isSymbolicLink() ||
+        typeof dirSt.isDirectory !== 'function' ||
+        !dirSt.isDirectory() ||
+        typeof dirSt.uid !== 'number' ||
+        !allowedUids.has(dirSt.uid) ||
+        typeof dirSt.mode !== 'number' ||
+        (dirSt.mode & 0o022) !== 0
+      ) {
+        return null;
+      }
+      const fileSt = io.lstatSync(normalizedPath);
+      if (
+        !fileSt ||
+        typeof fileSt.isSymbolicLink !== 'function' ||
+        fileSt.isSymbolicLink() ||
+        typeof fileSt.isFile !== 'function' ||
+        !fileSt.isFile() ||
+        typeof fileSt.uid !== 'number' ||
+        !allowedUids.has(fileSt.uid) ||
+        typeof fileSt.mode !== 'number' ||
+        (fileSt.mode & 0o077) !== 0
+      ) {
+        return null;
+      }
+      if (
+        typeof io.openSync === 'function' &&
+        typeof io.fstatSync === 'function' &&
+        typeof io.closeSync === 'function'
+      ) {
+        const flags =
+          (fs.constants && typeof fs.constants.O_RDONLY === 'number' ? fs.constants.O_RDONLY : 0) |
+          (fs.constants && typeof fs.constants.O_NOFOLLOW === 'number'
+            ? fs.constants.O_NOFOLLOW
+            : 0);
+        const fd = io.openSync(normalizedPath, flags);
+        try {
+          const fdSt = io.fstatSync(fd);
+          if (
+            !fdSt ||
+            typeof fdSt.isFile !== 'function' ||
+            !fdSt.isFile() ||
+            typeof fdSt.uid !== 'number' ||
+            !allowedUids.has(fdSt.uid) ||
+            typeof fdSt.mode !== 'number' ||
+            (fdSt.mode & 0o077) !== 0 ||
+            (typeof fileSt.ino === 'number' &&
+              typeof fdSt.ino === 'number' &&
+              fileSt.ino !== fdSt.ino) ||
+            (typeof fileSt.dev === 'number' &&
+              typeof fdSt.dev === 'number' &&
+              fileSt.dev !== fdSt.dev)
+          ) {
+            return null;
+          }
+          return io.readFileSync(fd);
+        } finally {
+          try {
+            io.closeSync(fd);
+          } catch (_) {}
+        }
+      }
+      return io.readFileSync(normalizedPath);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function readHomeSourceRaw() {
+    let domChecked = false;
+    if (getHomeLocalStorageItem) {
+      try {
+        const val = getHomeLocalStorageItem('baaz.sports.v1');
+        domChecked = true;
+        if (typeof val === 'string' && val.trim().length > 0) {
+          return { found: true, rawJson: val };
+        }
+      } catch (_) {
+        return { found: false, rawJson: null };
+      }
+    }
+
+    if (homeStateBridgePath && typeof io.existsSync === 'function' && io.existsSync(homeStateBridgePath)) {
+      const buf = readTrustedBridgeBuffer(homeStateBridgePath);
+      if (!buf) return { found: false, rawJson: null };
+      const extracted = extractBaazSportsFromBuffer(buf, { allowedOrigins });
+      if (extracted.found) return { found: true, rawJson: extracted.rawJson };
+      return { found: false, rawJson: null };
+    }
+
+    if (typeof io.readdirSync === 'function' && typeof io.existsSync === 'function') {
+      const allowedKeyInfo = buildAllowedHomeKeyBuffers(allowedOrigins);
+      const dirEvaluations = [];
+
+      for (let dirIdx = 0; dirIdx < localStorageDirs.length; dirIdx++) {
+        const dir = localStorageDirs[dirIdx];
+        try {
+          if (!io.existsSync(dir)) continue;
+          let manifestInfo = null;
+          const currentPath = path.join(dir, 'CURRENT');
+          if (io.existsSync(currentPath)) {
+            const manifestName = String(io.readFileSync(currentPath, 'utf8')).trim();
+            if (!manifestName) return { found: false, rawJson: null };
+            const manifestPath = path.join(dir, manifestName);
+            if (!io.existsSync(manifestPath)) return { found: false, rawJson: null };
+            manifestInfo = parseLevelDbManifest(io.readFileSync(manifestPath));
+            if (!manifestInfo) return { found: false, rawJson: null };
+          }
+
+          const entries = io.readdirSync(dir);
+          const dirFiles = [];
+
+          for (const name of entries) {
+            if (
+              typeof name !== 'string' ||
+              (!name.endsWith('.log') &&
+                !name.endsWith('.ldb') &&
+                !name.endsWith('.sst') &&
+                !name.endsWith('.json'))
+            ) {
+              continue;
+            }
+            const numMatch = name.match(/^(\d+)\.(log|ldb|sst)$/);
+            const fileNum = numMatch ? parseInt(numMatch[1], 10) : 0;
+            const ext = numMatch ? numMatch[2] : 'json';
+            let level = ext === 'log' ? -1 : 0;
+            if (manifestInfo) {
+              if (ext === 'ldb' || ext === 'sst') {
+                if (!manifestInfo.liveFiles.has(fileNum)) continue;
+                level = manifestInfo.liveFiles.get(fileNum);
+              } else if (ext === 'log') {
+                if (
+                  manifestInfo.logNumber > 0 &&
+                  fileNum < manifestInfo.logNumber &&
+                  fileNum !== manifestInfo.prevLogNumber
+                ) {
+                  continue;
+                }
+              }
+            }
+            const fullPath = path.join(dir, name);
+            dirFiles.push({ fullPath, name, fileNum, level, isWal: ext === 'log' });
+          }
+
+          if (dirFiles.length === 0) continue;
+          dirFiles.sort((a, b) => a.fileNum - b.fileNum || a.name.localeCompare(b.name));
+
+          let dirBestMatch = null;
+          let dirHasHomeOrigin = false;
+          for (let idx = 0; idx < dirFiles.length; idx++) {
+            const f = dirFiles[idx];
+            const rawBuf = io.readFileSync(f.fullPath);
+            const buf = Buffer.isBuffer(rawBuf) ? rawBuf : Buffer.from(String(rawBuf), 'utf8');
+            if (
+              (f.name.endsWith('.ldb') || f.name.endsWith('.sst')) &&
+              buf.length >= 48 &&
+              buf.subarray(buf.length - 8).equals(LEVELDB_TABLE_MAGIC) &&
+              readLevelDbTableRecords(buf) === null
+            ) {
+              return { found: false, rawJson: null };
+            }
+            const extracted = extractBaazSportsFromBuffer(buf, { allowedOrigins });
+            if (extracted.corrupt) {
+              return { found: false, rawJson: null };
+            }
+            if (extracted.found) {
+              dirHasHomeOrigin = true;
+              const seq = typeof extracted.seq === 'bigint' ? extracted.seq : 0n;
+              const candidate = {
+                rawJson: extracted.rawJson,
+                seq,
+                isWal: f.isWal,
+                level: f.level,
+                fileNum: f.fileNum,
+                orderIdx: idx
+              };
+              if (!dirBestMatch) {
+                dirBestMatch = candidate;
+              } else if (
+                candidate.seq !== dirBestMatch.seq &&
+                candidate.seq > 0n &&
+                dirBestMatch.seq > 0n
+              ) {
+                if (candidate.seq > dirBestMatch.seq) dirBestMatch = candidate;
+              } else if (candidate.isWal !== dirBestMatch.isWal) {
+                if (candidate.isWal) dirBestMatch = candidate;
+              } else if (candidate.level !== dirBestMatch.level) {
+                if (candidate.level < dirBestMatch.level) dirBestMatch = candidate;
+              } else if (
+                candidate.seq > dirBestMatch.seq ||
+                candidate.fileNum > dirBestMatch.fileNum ||
+                candidate.orderIdx >= dirBestMatch.orderIdx
+              ) {
+                dirBestMatch = candidate;
+              }
+            } else if (hasHomeOriginInBuffer(buf, allowedKeyInfo)) {
+              dirHasHomeOrigin = true;
+            }
+          }
+
+          if (dirHasHomeOrigin || dirBestMatch !== null) {
+            dirEvaluations.push({
+              dirIdx,
+              dirBestMatch
+            });
+          }
+        } catch (_) {
+          // Fail closed on any partial or unreadable LevelDB directory rather than acting on stale records
+          return { found: false, rawJson: null };
+        }
+      }
+
+      if (dirEvaluations.length === 1) {
+        const authoritativeDir = dirEvaluations[0];
+        if (authoritativeDir.dirBestMatch) {
+          return { found: true, rawJson: authoritativeDir.dirBestMatch.rawJson };
+        }
+        return { found: false, rawJson: null };
+      }
+      if (dirEvaluations.length > 1) {
+        const firstRaw = dirEvaluations[0].dirBestMatch ? dirEvaluations[0].dirBestMatch.rawJson : null;
+        const firstNorm = JSON.stringify(normalizeSeasonalSportsState(firstRaw, catalogSports));
+        for (let i = 1; i < dirEvaluations.length; i++) {
+          const otherRaw = dirEvaluations[i].dirBestMatch ? dirEvaluations[i].dirBestMatch.rawJson : null;
+          const otherNorm = JSON.stringify(normalizeSeasonalSportsState(otherRaw, catalogSports));
+          if (otherNorm !== firstNorm) {
+            // Multiple directories contain conflicting Home records; refuse cleanup when source authority is ambiguous
+            return { found: false, rawJson: null };
+          }
+        }
+        if (dirEvaluations[0].dirBestMatch) {
+          return { found: true, rawJson: dirEvaluations[0].dirBestMatch.rawJson };
+        }
+        return { found: false, rawJson: null };
+      }
+    }
+
+    if (domChecked) {
+      return { found: true, rawJson: null };
+    }
+
+    return { found: false, rawJson: null };
+  }
+
+  function readPersistedStoreFile() {
+    if (!seasonalStatePath || typeof io.existsSync !== 'function' || !io.existsSync(seasonalStatePath)) {
+      return null;
+    }
+    try {
+      const raw = JSON.parse(io.readFileSync(seasonalStatePath, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+      if (raw.state && typeof raw.state === 'object') {
+        const removedApps = {};
+        if (raw.removedApps && typeof raw.removedApps === 'object' && !Array.isArray(raw.removedApps)) {
+          for (const [appId, tok] of Object.entries(raw.removedApps)) {
+            if (typeof appId === 'string' && typeof tok === 'string' && tok.length > 0) {
+              removedApps[appId] = tok;
+            }
+          }
+        }
+        return {
+          baseHomeHash: typeof raw.baseHomeHash === 'string' ? raw.baseHomeHash : null,
+          removedAppIds: Array.isArray(raw.removedAppIds)
+            ? raw.removedAppIds.filter((id) => typeof id === 'string')
+            : null,
+          removedApps,
+          state: normalizeSeasonalSportsState(raw.state, catalogSports)
+        };
+      }
+      if (isSportsStateJsonObject(raw)) {
+        return {
+          baseHomeHash: null,
+          removedAppIds: null,
+          removedApps: {},
+          state: normalizeSeasonalSportsState(raw, catalogSports)
+        };
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  function applyPersistedRemovalsToHomeState(homeState, rawJson, persisted, currentHomeHash) {
+    if (!persisted) return homeState;
+    if (persisted.removedApps && typeof persisted.removedApps === 'object') {
+      for (const [removedId, recordedToken] of Object.entries(persisted.removedApps)) {
+        if (!homeState.seasonalInstalls[removedId]) continue;
+        const liveToken = extractAppInstallToken(rawJson, removedId) || 'val:true';
+        if (recordedToken === '*' || recordedToken === liveToken) {
+          delete homeState.seasonalInstalls[removedId];
+          delete homeState.autoRemove[removedId];
+          if (homeState.installTokens) delete homeState.installTokens[removedId];
+        }
+      }
+    }
+    if (persisted.baseHomeHash === currentHomeHash && Array.isArray(persisted.removedAppIds)) {
+      for (const removedId of persisted.removedAppIds) {
+        delete homeState.seasonalInstalls[removedId];
+        delete homeState.autoRemove[removedId];
+        if (homeState.installTokens) delete homeState.installTokens[removedId];
+      }
+    }
+    return homeState;
+  }
+
+  function read() {
+    const homeSource = readHomeSourceRaw();
+    if (!homeSource.found || !homeSource.rawJson) {
+      lastReadHomeHash = homeSource.found ? 'EMPTY' : null;
+      lastReadHomeRawJson = null;
+      lastReadHomeState = null;
+      return normalizeSeasonalSportsState(null, catalogSports);
+    }
+    const persisted = readPersistedStoreFile();
+    const currentHomeHash = hashString(homeSource.rawJson);
+    lastReadHomeHash = currentHomeHash;
+    lastReadHomeRawJson = homeSource.rawJson;
+    const homeState = applyPersistedRemovalsToHomeState(
+      normalizeSeasonalSportsState(homeSource.rawJson, catalogSports),
+      homeSource.rawJson,
+      persisted,
+      currentHomeHash
+    );
+    lastReadHomeState = normalizeSeasonalSportsState(homeState, catalogSports);
+    return homeState;
+  }
+
+  function write(nextState) {
+    let normalized = normalizeSeasonalSportsState(nextState, catalogSports);
+    const persistedBefore = readPersistedStoreFile();
+    const nextRemovedApps = {
+      ...(persistedBefore && persistedBefore.removedApps ? persistedBefore.removedApps : {})
+    };
+    const homeSourceBefore = readHomeSourceRaw();
+    let removedAppIds = [];
+
+    if (homeSourceBefore.found) {
+      const liveHomeHash = homeSourceBefore.rawJson
+        ? hashString(homeSourceBefore.rawJson)
+        : 'EMPTY';
+      const liveHomeState = normalizeSeasonalSportsState(homeSourceBefore.rawJson, catalogSports);
+      for (const appId of Object.keys(nextRemovedApps)) {
+        if (!liveHomeState.seasonalInstalls[appId]) {
+          delete nextRemovedApps[appId];
+        } else {
+          const liveTok = extractAppInstallToken(homeSourceBefore.rawJson, appId) || 'val:true';
+          if (nextRemovedApps[appId] !== '*' && nextRemovedApps[appId] !== liveTok) {
+            delete nextRemovedApps[appId];
+          }
+        }
+      }
+
+      const baselineState = lastReadHomeState || liveHomeState;
+      const baselineRawJson = lastReadHomeRawJson || homeSourceBefore.rawJson;
+      const removedInThisWrite = new Map();
+      for (const appId of Object.keys(baselineState.seasonalInstalls)) {
+        if (!normalized.seasonalInstalls[appId]) {
+          const removedTok =
+            extractAppInstallToken(baselineRawJson, appId) ||
+            extractAppInstallToken(homeSourceBefore.rawJson, appId) ||
+            'val:true';
+          removedInThisWrite.set(appId, removedTok);
+        }
+      }
+      for (const [appId, removedTok] of removedInThisWrite.entries()) {
+        if (liveHomeState.seasonalInstalls[appId]) {
+          const liveTok = extractAppInstallToken(homeSourceBefore.rawJson, appId) || 'val:true';
+          if (liveTok === removedTok) {
+            nextRemovedApps[appId] = removedTok;
+          }
+        }
+      }
+
+      if (lastReadHomeHash !== null && liveHomeHash !== lastReadHomeHash) {
+        // Home was modified concurrently since the state was read; apply only confirmed removal deltas
+        // while preserving newly added installs, replacement tokens, and followed/kept/dismissed edits
+        const mergedSeasonalInstalls = {};
+        const mergedAutoRemove = {};
+        const mergedInstallTokens = {};
+        for (const appId of Object.keys(liveHomeState.seasonalInstalls)) {
+          const liveTok = extractAppInstallToken(homeSourceBefore.rawJson, appId) || 'val:true';
+          const suppressedTok = nextRemovedApps[appId];
+          if (suppressedTok && (suppressedTok === '*' || suppressedTok === liveTok)) {
+            continue;
+          }
+          mergedSeasonalInstalls[appId] = true;
+          if (liveHomeState.autoRemove[appId] === true) {
+            mergedAutoRemove[appId] = true;
+          }
+          if (liveHomeState.installTokens && liveHomeState.installTokens[appId]) {
+            mergedInstallTokens[appId] = liveHomeState.installTokens[appId];
+          }
+        }
+        for (const appId of Object.keys(normalized.seasonalInstalls)) {
+          if (!mergedSeasonalInstalls[appId] && !nextRemovedApps[appId]) {
+            mergedSeasonalInstalls[appId] = true;
+            if (normalized.autoRemove[appId] === true) {
+              mergedAutoRemove[appId] = true;
+            }
+            if (normalized.installTokens && normalized.installTokens[appId]) {
+              mergedInstallTokens[appId] = normalized.installTokens[appId];
+            }
+          }
+        }
+        normalized = normalizeSeasonalSportsState(
+          {
+            followed: liveHomeState.followed,
+            dismissed: { ...normalized.dismissed, ...liveHomeState.dismissed },
+            kept: { ...normalized.kept, ...liveHomeState.kept },
+            seasonalInstalls: mergedSeasonalInstalls,
+            autoRemove: mergedAutoRemove,
+            installTokens: mergedInstallTokens
+          },
+          catalogSports
+        );
+      }
+      removedAppIds = Object.keys(nextRemovedApps);
+    }
+
+    if (setHomeLocalStorageItem) {
+      try {
+        setHomeLocalStorageItem('baaz.sports.v1', JSON.stringify(normalized));
+      } catch (_) {}
+    }
+
+    const homeSourceAfter = readHomeSourceRaw();
+    const currentHomeHash = homeSourceAfter.found
+      ? homeSourceAfter.rawJson
+        ? hashString(homeSourceAfter.rawJson)
+        : 'EMPTY'
+      : null;
+    if (homeSourceAfter.found) {
+      const afterHomeState = normalizeSeasonalSportsState(homeSourceAfter.rawJson, catalogSports);
+      for (const appId of Object.keys(nextRemovedApps)) {
+        if (!afterHomeState.seasonalInstalls[appId]) {
+          delete nextRemovedApps[appId];
+        }
+      }
+      removedAppIds = Object.keys(nextRemovedApps);
+    }
+    lastReadHomeHash = currentHomeHash;
+    lastReadHomeRawJson = homeSourceAfter.found ? homeSourceAfter.rawJson : null;
+    lastReadHomeState = normalizeSeasonalSportsState(normalized, catalogSports);
+
+    try {
+      writeFileAtomic(
+        seasonalStatePath,
+        Buffer.from(
+          JSON.stringify({
+            schema: 1,
+            baseHomeHash: currentHomeHash,
+            removedAppIds,
+            removedApps: nextRemovedApps,
+            state: normalized
+          }) + '\n',
+          'utf8'
+        ),
+        0o600
+      );
+    } catch (_) {}
+    return normalized;
+  }
+
+  return {
+    read,
+    write
+  };
+}
+
+async function runSeasonalAppCleanup(deps = {}) {
+  const {
+    tvPower = 'active',
+    callLunaSend,
+    callLunaSendLarge,
+    readSeasonalState,
+    writeSeasonalState = () => {},
+    nowMs = () => Date.now(),
+    sleep = () => Promise.resolve(),
+    pollIntervalMs = 300,
+    maxRemovePolls = 20,
+    hasUserActivitySince = () => false,
+    sampleActivity = null,
+    excludeAppIds = [],
+    catalogSports = SPORTS_SEASON_CATALOG
+  } = deps;
+
+  if (
+    tvPower !== 'active' ||
+    typeof readSeasonalState !== 'function' ||
+    typeof callLunaSend !== 'function' ||
+    typeof callLunaSendLarge !== 'function'
+  ) {
+    return {
+      evaluated: false,
+      foregroundObservationFailed: false,
+      suggestions: [],
+      exits: [],
+      autoRemoveCandidates: [],
+      removalsAttempted: [],
+      removalsCompleted: [],
+      removalsFailed: [],
+      removalsSkippedForeground: []
+    };
+  }
+
+  const startedAtMs = nowMs();
+  const excludedSet = new Set(
+    (Array.isArray(excludeAppIds) ? excludeAppIds : []).filter((id) => typeof id === 'string' && id)
+  );
+  const rawState = readSeasonalState();
+  const state = normalizeSeasonalSportsState(rawState, catalogSports);
+  if (state.followed.length === 0) {
+    return {
+      evaluated: true,
+      foregroundObservationFailed: false,
+      suggestions: [],
+      exits: [],
+      autoRemoveCandidates: [],
+      removalsAttempted: [],
+      removalsCompleted: [],
+      removalsFailed: [],
+      removalsSkippedForeground: []
+    };
+  }
+
+  const listReply = await callLunaSendLarge(
+    'luna://com.webos.applicationManager/listApps',
+    {},
+    5000,
+    1048576
+  );
+  const apps =
+    listReply && listReply.returnValue !== false && Array.isArray(listReply.apps)
+      ? listReply.apps
+      : [];
+  const evalResult = evaluateSeasonalSports(apps, state, new Date(nowMs()), catalogSports);
+
+  const removalsAttempted = [];
+  const removalsCompleted = [];
+  const removalsFailed = [];
+  const removalsSkippedForeground = [];
+  const removedTokensByApp = new Map();
+  let foregroundObservationFailed = false;
+
+  for (const appId of evalResult.autoRemoveIds) {
+    if (excludedSet.has(appId)) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    if (typeof sampleActivity === 'function') {
+      try {
+        await sampleActivity();
+      } catch (_) {}
+    }
+    if (hasUserActivitySince(startedAtMs)) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    const fgReply = await callLunaSend(
+      'luna://com.webos.applicationManager/getForegroundAppInfo',
+      {},
+      2500
+    );
+    if (!isValidForegroundReply(fgReply)) {
+      foregroundObservationFailed = true;
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    const liveFg = fgReply.appId.trim();
+    if (liveFg === appId || (liveFg && !isForegroundIdle(liveFg))) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+
+    const verifyReply = await callLunaSendLarge(
+      'luna://com.webos.applicationManager/listApps',
+      {},
+      4000,
+      1048576
+    );
+    const verifyApps =
+      verifyReply && verifyReply.returnValue !== false && Array.isArray(verifyReply.apps)
+        ? verifyReply.apps
+        : null;
+    const targetApp = verifyApps
+      ? verifyApps.find(
+          (a) =>
+            a &&
+            a.id === appId &&
+            a.removable === true &&
+            a.systemApp === false &&
+            !NEVER_UPDATE_APPS.has(appId)
+        )
+      : null;
+    if (!targetApp) {
+      removalsFailed.push(appId);
+      continue;
+    }
+
+    if (deps.requireInstallStatus === true) {
+      const liveSt = await callLunaSendLarge(
+        'luna://com.webos.appInstallService/status',
+        { subscribe: false },
+        3500,
+        262144
+      );
+      const liveStOk = Boolean(
+        liveSt &&
+          liveSt.returnValue !== false &&
+          liveSt.status &&
+          Array.isArray(liveSt.status.apps)
+      );
+      if (!liveStOk) {
+        removalsSkippedForeground.push(appId);
+        continue;
+      }
+      const activeJob = liveSt.status.apps.find(
+        (j) => j && (j.id === appId || j.appId === appId)
+      );
+      if (activeJob) {
+        const stLower =
+          typeof activeJob.state === 'string' ? activeJob.state.trim().toLowerCase() : '';
+        const isTermSuccess =
+          stLower === 'installed' || stLower === 'complete' || stLower === 'completed';
+        const isTermFailure =
+          stLower === 'install failed' ||
+          stLower === 'download failed' ||
+          stLower === 'canceled' ||
+          stLower === 'cancelled' ||
+          stLower === 'failed' ||
+          stLower === 'error' ||
+          (typeof activeJob.errorCode === 'number' && activeJob.errorCode !== 0);
+        if (!isTermSuccess && !isTermFailure) {
+          removalsSkippedForeground.push(appId);
+          continue;
+        }
+      }
+    }
+
+    // Revalidate user activity, live foreground, and fresh seasonal preferences immediately before calling remove
+    if (typeof sampleActivity === 'function') {
+      try {
+        await sampleActivity();
+      } catch (_) {}
+    }
+    if (hasUserActivitySince(startedAtMs)) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    const postVerifyFgReply = await callLunaSend(
+      'luna://com.webos.applicationManager/getForegroundAppInfo',
+      {},
+      2500
+    );
+    if (!isValidForegroundReply(postVerifyFgReply)) {
+      foregroundObservationFailed = true;
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    const postVerifyFg = postVerifyFgReply.appId.trim();
+    if (
+      postVerifyFg === appId ||
+      (postVerifyFg && !isForegroundIdle(postVerifyFg)) ||
+      hasUserActivitySince(startedAtMs)
+    ) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+    const freshBeforeRemove = normalizeSeasonalSportsState(readSeasonalState(), catalogSports);
+    const freshEval = evaluateSeasonalSports(
+      verifyApps,
+      freshBeforeRemove,
+      new Date(nowMs()),
+      catalogSports
+    );
+    if (!freshEval.autoRemoveIds.includes(appId)) {
+      removalsSkippedForeground.push(appId);
+      continue;
+    }
+
+    const preRemoveToken =
+      freshBeforeRemove.installTokens && freshBeforeRemove.installTokens[appId]
+        ? freshBeforeRemove.installTokens[appId]
+        : null;
+    removalsAttempted.push(appId);
+    const rmReply = await callLunaSend(
+      'luna://com.webos.appInstallService/remove',
+      { id: appId },
+      4000
+    );
+    if (!rmReply || rmReply.returnValue !== true) {
+      removalsFailed.push(appId);
+      continue;
+    }
+
+    let confirmedAbsent = false;
+    for (let poll = 0; poll < maxRemovePolls; poll++) {
+      await sleep(pollIntervalMs);
+      const afterReply = await callLunaSendLarge(
+        'luna://com.webos.applicationManager/listApps',
+        {},
+        4000,
+        1048576
+      );
+      if (
+        afterReply &&
+        afterReply.returnValue !== false &&
+        Array.isArray(afterReply.apps) &&
+        !afterReply.apps.some((a) => !a || typeof a.id !== 'string')
+      ) {
+        if (!afterReply.apps.some((a) => a.id === appId)) {
+          confirmedAbsent = true;
+          break;
+        }
+      }
+    }
+
+    if (confirmedAbsent) {
+      removalsCompleted.push(appId);
+      removedTokensByApp.set(appId, preRemoveToken);
+      try {
+        const latestState = normalizeSeasonalSportsState(readSeasonalState(), catalogSports);
+        for (const [removedId, expectedToken] of removedTokensByApp.entries()) {
+          const currentToken =
+            latestState.installTokens && latestState.installTokens[removedId]
+              ? latestState.installTokens[removedId]
+              : null;
+          if (currentToken === expectedToken) {
+            delete latestState.seasonalInstalls[removedId];
+            delete latestState.autoRemove[removedId];
+            if (latestState.installTokens) delete latestState.installTokens[removedId];
+          }
+        }
+        writeSeasonalState(latestState);
+      } catch (_) {}
+    } else {
+      removalsFailed.push(appId);
+    }
+  }
+
+  return {
+    evaluated: true,
+    foregroundObservationFailed,
+    suggestions: evalResult.suggestions,
+    exits: evalResult.exits,
+    autoRemoveCandidates: evalResult.autoRemoveIds,
+    removalsAttempted,
+    removalsCompleted,
+    removalsFailed,
+    removalsSkippedForeground
+  };
+}
+
 function isAutoVolumeEnabled(val) {
   return val === 'on' || val === true || val === 'true' || val === 1;
 }
@@ -782,6 +2793,7 @@ async function runUpdateWorkflow(deps) {
 
   let updateReply = null;
   let installReply = null;
+  let installStatusOk = false;
   const updateMap = new Map();
   const installMap = new Map();
   const updatesAttempted = [];
@@ -1062,7 +3074,7 @@ async function runUpdateWorkflow(deps) {
       4000,
       262144
     );
-    const installStatusOk = Boolean(
+    installStatusOk = Boolean(
       installReply &&
         installReply.returnValue !== false &&
         installReply.status &&
@@ -1247,11 +3259,13 @@ async function runUpdateWorkflow(deps) {
   const postWakeOwnedOk =
     typeof deps.isWakeOwned === 'function' ? Boolean(deps.isWakeOwned()) : wakeOwnedOk;
 
+  let beforeStandbyOk = true;
   if (
     returnToStandby &&
     tvPower === 'active' &&
     postWakeOwnedOk &&
     listAppsOk &&
+    installStatusOk &&
     initialFgOk &&
     postFgOk &&
     !foregroundObservationFailed &&
@@ -1261,12 +3275,50 @@ async function runUpdateWorkflow(deps) {
     updatesTimedOut.length === 0 &&
     updatesInProgress.length === 0
   ) {
-    const standbyRes = await callLunaSend(
-      'luna://com.webos.service.tvpower/power/turnOff',
-      { reason: 'remoteKey' },
-      3000
-    );
-    returnedToStandby = Boolean(standbyRes && standbyRes.returnValue === true);
+    if (typeof deps.beforeStandbyTurnOff === 'function') {
+      try {
+        const hookRes = await deps.beforeStandbyTurnOff();
+        if (
+          hookRes === false ||
+          (hookRes && typeof hookRes === 'object' && hookRes.ok === false)
+        ) {
+          beforeStandbyOk = false;
+        }
+      } catch (_) {
+        beforeStandbyOk = false;
+      }
+      await checkActivity(foregroundAppId !== null ? foregroundAppId : undefined);
+      const postHookFgReply = await callLunaSend(
+        'luna://com.webos.applicationManager/getForegroundAppInfo',
+        {},
+        2500
+      );
+      if (!isValidForegroundReply(postHookFgReply)) {
+        foregroundObservationFailed = true;
+        beforeStandbyOk = false;
+      } else {
+        const postHookFgAppId = postHookFgReply.appId.trim();
+        if (postHookFgAppId !== (foregroundAppId || '') || !isForegroundIdle(postHookFgAppId)) {
+          userActivityDetected = true;
+          beforeStandbyOk = false;
+        }
+      }
+      const postHookWakeOwnedOk =
+        typeof deps.isWakeOwned === 'function' ? Boolean(deps.isWakeOwned()) : postWakeOwnedOk;
+      if (!postHookWakeOwnedOk) {
+        beforeStandbyOk = false;
+      }
+    }
+    const finalWakeOwnedOk =
+      typeof deps.isWakeOwned === 'function' ? Boolean(deps.isWakeOwned()) : postWakeOwnedOk;
+    if (finalWakeOwnedOk && !userActivityDetected && !foregroundObservationFailed && beforeStandbyOk) {
+      const standbyRes = await callLunaSend(
+        'luna://com.webos.service.tvpower/power/turnOff',
+        { reason: 'remoteKey' },
+        3000
+      );
+      returnedToStandby = Boolean(standbyRes && standbyRes.returnValue === true);
+    }
   }
 
   const updateCacheOk = Boolean(
@@ -1289,8 +3341,10 @@ async function runUpdateWorkflow(deps) {
       initialFgOk &&
       !foregroundObservationFailed &&
       listAppsOk &&
+      installStatusOk &&
       updateCacheOk &&
       windowClosedOk &&
+      beforeStandbyOk &&
       updatesInProgress.length === 0 &&
       pendingApps.length === 0 &&
       updatesCompleted.length === updatesAttempted.length
@@ -1318,6 +3372,7 @@ async function runUpdateWorkflow(deps) {
       version: homeAppVersion
     },
     listAppsOk,
+    installStatusOk,
     installedCount: installedMap.size,
     updateCacheOk,
     updatesAttempted,
@@ -2460,6 +4515,27 @@ function createResidentMaintenanceController(deps = {}) {
       : () => ({ schema: 1, lastUpdateDay: null, lastUpdateAt: null, lastReason: null });
   const writeUpdaterState =
     typeof deps.writeUpdaterState === 'function' ? deps.writeUpdaterState : () => {};
+  const seasonalStateStore =
+    deps.seasonalStateStore ||
+    createSeasonalSportsStateStore({
+      fs: io,
+      writeAtomic: deps.writeAtomic,
+      seasonalStatePath: deps.seasonalStatePath,
+      homeStateBridgePath: deps.homeStateBridgePath,
+      localStorageDirs: deps.localStorageDirs,
+      localStorage: deps.localStorage,
+      getHomeLocalStorageItem: deps.getHomeLocalStorageItem,
+      setHomeLocalStorageItem: deps.setHomeLocalStorageItem,
+      catalogSports: deps.catalogSports
+    });
+  const readSeasonalState =
+    typeof deps.readSeasonalState === 'function'
+      ? deps.readSeasonalState
+      : () => seasonalStateStore.read();
+  const writeSeasonalState =
+    typeof deps.writeSeasonalState === 'function'
+      ? deps.writeSeasonalState
+      : (next) => seasonalStateStore.write(next);
   const updaterTriggerPath = deps.updaterTriggerPath || '/tmp/r2d2-trigger-updater.json';
   const allowlistApps = Array.isArray(deps.allowlistApps) ? deps.allowlistApps : [];
   const idleThresholdMs =
@@ -2487,6 +4563,7 @@ function createResidentMaintenanceController(deps = {}) {
     const isUpdateMode = mode === 'update' || mode === 'update-standby';
     const currentPower = getTvPower();
     const priorState = readUpdaterState() || {};
+    let seasonalCleanupReport = null;
     try {
       log('tv_maintenance_start', { reqId, mode });
       ensurePrivacyRetirements();
@@ -2506,12 +4583,101 @@ function createResidentMaintenanceController(deps = {}) {
         knownInProgressApps: Array.isArray(priorState.inProgressApps)
           ? priorState.inProgressApps
           : [],
+        isWakeOwned: deps.isWakeOwned,
         wakeOwnedByMaintenance:
           typeof deps.isWakeOwned === 'function' ? Boolean(deps.isWakeOwned()) : true,
         installTimeoutMs: deps.installTimeoutMs,
         maxInstallTimeoutMs: deps.maxInstallTimeoutMs,
-        pollIntervalMs: deps.pollIntervalMs
+        pollIntervalMs: deps.pollIntervalMs,
+        beforeStandbyTurnOff: async () => {
+          if (seasonalCleanupReport !== null) {
+            return (
+              seasonalCleanupReport.removalsFailed.length === 0 &&
+              seasonalCleanupReport.removalsSkippedForeground.length === 0 &&
+              !seasonalCleanupReport.foregroundObservationFailed
+            );
+          }
+          try {
+            seasonalCleanupReport = await runSeasonalAppCleanup({
+              tvPower: currentPower,
+              callLunaSend,
+              callLunaSendLarge,
+              readSeasonalState,
+              writeSeasonalState,
+              nowMs,
+              sleep,
+              pollIntervalMs: deps.pollIntervalMs,
+              hasUserActivitySince: (sinceMs) => activityTracker.hasActivitySince(sinceMs),
+              sampleActivity: async () => activityTracker.sampleAsync(callLunaSend),
+              requireInstallStatus: true,
+              catalogSports: deps.catalogSports
+            });
+            return (
+              seasonalCleanupReport.removalsFailed.length === 0 &&
+              seasonalCleanupReport.removalsSkippedForeground.length === 0 &&
+              !seasonalCleanupReport.foregroundObservationFailed
+            );
+          } catch (_) {
+            return false;
+          }
+        }
       });
+
+      applyLgNetworkBlock(false);
+      if (
+        seasonalCleanupReport === null &&
+        isUpdateMode &&
+        currentPower === 'active' &&
+        !wf.returnedToStandby &&
+        !wf.userActivityDetected &&
+        !wf.foregroundObservationFailed &&
+        wf.installStatusOk &&
+        wf.updatesInProgress.length === 0 &&
+        wf.updatesTimedOut.length === 0
+      ) {
+        try {
+          seasonalCleanupReport = await runSeasonalAppCleanup({
+            tvPower: currentPower,
+            callLunaSend,
+            callLunaSendLarge,
+            readSeasonalState,
+            writeSeasonalState,
+            nowMs,
+            sleep,
+            pollIntervalMs: deps.pollIntervalMs,
+            hasUserActivitySince: (sinceMs) => activityTracker.hasActivitySince(sinceMs),
+            sampleActivity: async () => activityTracker.sampleAsync(callLunaSend),
+            requireInstallStatus: true,
+            excludeAppIds: [
+              ...wf.updatesInProgress,
+              ...wf.updatesTimedOut,
+              ...(Array.isArray(priorState.inProgressApps) ? priorState.inProgressApps : [])
+            ],
+            catalogSports: deps.catalogSports
+          });
+        } catch (_) {}
+      }
+      if (seasonalCleanupReport && seasonalCleanupReport.foregroundObservationFailed) {
+        wf.foregroundObservationFailed = true;
+        wf.maintenanceComplete = false;
+      }
+      if (
+        seasonalCleanupReport &&
+        (seasonalCleanupReport.removalsFailed.length > 0 ||
+          seasonalCleanupReport.removalsSkippedForeground.length > 0)
+      ) {
+        wf.maintenanceComplete = false;
+        for (const skippedId of seasonalCleanupReport.removalsSkippedForeground) {
+          if (!wf.pendingApps.includes(skippedId)) {
+            wf.pendingApps.push(skippedId);
+          }
+        }
+        for (const failedId of seasonalCleanupReport.removalsFailed) {
+          if (!wf.pendingApps.includes(failedId)) {
+            wf.pendingApps.push(failedId);
+          }
+        }
+      }
 
       if (isUpdateMode && currentPower === 'active') {
         const now = new Date(nowMs());
@@ -2525,8 +4691,6 @@ function createResidentMaintenanceController(deps = {}) {
         });
         writeUpdaterState(nextState);
       }
-
-      applyLgNetworkBlock(false);
       let voiceLevelingReport = null;
       if (isLgServerBlocked()) {
         try {
@@ -2554,6 +4718,7 @@ function createResidentMaintenanceController(deps = {}) {
         privacyRetirements: diag.privacyStatus || 'ok',
         lgServerBlocked: isLgServerBlocked(),
         voiceLeveling: voiceLevelingReport,
+        seasonalCleanup: seasonalCleanupReport,
         privacyManifestsRemoved:
           typeof diag.privacyManifestsRemovedCount === 'number'
             ? diag.privacyManifestsRemovedCount
@@ -2766,9 +4931,18 @@ module.exports = {
   PREFERRED_VOICE_SOUND_MODES,
   FALLBACK_VOICE_SOUND_MODES,
   VOICE_LEVELING_SOUND_MODES,
+  SPORTS_SEASON_CATALOG,
   isAutoVolumeEnabled,
   isPreferredVoiceSoundMode,
   isVoiceLevelingSoundMode,
+  isSportInSeason,
+  sportCycleKey,
+  combinedSeasonalGroupWindow,
+  normalizeSeasonalSportsState,
+  evaluateSeasonalSports,
+  extractBaazSportsFromBuffer,
+  createSeasonalSportsStateStore,
+  runSeasonalAppCleanup,
   sha256Hex,
   stripManagedHostsBlock,
   renderBlockedHosts,

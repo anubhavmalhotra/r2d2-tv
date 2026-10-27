@@ -17,6 +17,7 @@ Gaining system access to a TV is outside this project. Whatever method you use, 
 | Voice transport | Mutual TLS 1.3, certificate pins, and a fresh per-utterance HMAC challenge |
 | Model worker | Pinned local models, filesystem/network restrictions, memory checks, and no shell tools |
 | Commands | Closed tool schema, allowlisted destinations/apps, bounded concurrency, and state verification |
+| TV audio & maintenance | 24/7 OS-level sinkhole and null routes for LG telemetry/ACR domains; local DSP auto voice leveling (`autoVolume` and `clearVoice`) hard-gated on the active LG network block with AI/cloud sound modes excluded |
 | LAN services | Configured peer checks and capability-bearing requests; keep them on the intended local network |
 
 A normal browser session discards its profile on verified cleanup. Default voice audit handling validates and discards records rather than writing a usage log. Mutable audio buffers are wiped on completion or cancellation. These are application controls, not a claim that operating systems, DNS resolvers, remote sites, or third-party apps retain nothing.

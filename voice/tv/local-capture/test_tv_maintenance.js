@@ -1262,6 +1262,1049 @@ let groups = 0;
     groups++;
   }
 
+  // 13. Seasonal Sports App Suggestions & Season-End Cleanup: evaluateSeasonalSports, multi-sport carrier safety, verified background removal of seasonalInstalls, foreground/activity deferral, and controller integration
+  {
+    const utc = (y, m) => new Date(Date.UTC(y, m - 1, 15));
+    const amazonApp = {
+      id: 'amazon',
+      title: 'Prime Video',
+      type: 'web',
+      visible: true,
+      removable: true,
+      systemApp: false
+    };
+    const appleApp = {
+      id: 'com.apple.appletv',
+      title: 'Apple TV',
+      type: 'web',
+      visible: true,
+      removable: true,
+      systemApp: false
+    };
+
+    // 13a. In-season missing carrier produces suggestion; off-season seasonalInstall produces exit + autoRemoveIds
+    const oct2026 = utc(2026, 10);
+    const evInSeason = maint.evaluateSeasonalSports([], { followed: ['nfl'] }, oct2026);
+    assert.strictEqual(evInSeason.suggestions.length, 1);
+    assert.strictEqual(evInSeason.suggestions[0].appId, 'amazon');
+    assert.deepStrictEqual(evInSeason.suggestions[0].sports, ['nfl']);
+    assert.deepStrictEqual(evInSeason.autoRemoveIds, []);
+
+    const mar2027 = utc(2027, 3);
+    // Seasonal install WITHOUT affirmative autoRemove consent produces exit prompt for Home, but NOT unattended autoRemoveIds
+    const evOffSeasonNoConsent = maint.evaluateSeasonalSports(
+      [amazonApp],
+      { followed: ['nfl'], seasonalInstalls: { amazon: true } },
+      mar2027
+    );
+    assert.strictEqual(evOffSeasonNoConsent.exits.length, 1);
+    assert.strictEqual(evOffSeasonNoConsent.exits[0].seasonalInstall, true);
+    assert.strictEqual(evOffSeasonNoConsent.exits[0].autoRemove, false);
+    assert.deepStrictEqual(evOffSeasonNoConsent.autoRemoveIds, []);
+
+    const evOffSeasonSeasonal = maint.evaluateSeasonalSports(
+      [amazonApp],
+      { followed: ['nfl'], seasonalInstalls: { amazon: true }, autoRemove: { amazon: true } },
+      mar2027
+    );
+    assert.strictEqual(evOffSeasonSeasonal.exits.length, 1);
+    assert.strictEqual(evOffSeasonSeasonal.exits[0].appId, 'amazon');
+    assert.strictEqual(evOffSeasonSeasonal.exits[0].seasonalInstall, true);
+    assert.strictEqual(evOffSeasonSeasonal.exits[0].autoRemove, true);
+    assert.deepStrictEqual(evOffSeasonSeasonal.autoRemoveIds, ['amazon']);
+
+    // Pre-existing install (not in seasonalInstalls) produces exit prompt but is NOT in autoRemoveIds
+    const evOffSeasonManual = maint.evaluateSeasonalSports(
+      [amazonApp],
+      { followed: ['nfl'], seasonalInstalls: {} },
+      mar2027
+    );
+    assert.strictEqual(evOffSeasonManual.exits.length, 1);
+    assert.strictEqual(evOffSeasonManual.exits[0].seasonalInstall, false);
+    assert.deepStrictEqual(evOffSeasonManual.autoRemoveIds, []);
+
+    // Shared carrier (Apple TV carries MLB Mar-Nov and MLS Feb-Dec): no exit/auto-remove in December while MLS is active
+    const evDecShared = maint.evaluateSeasonalSports(
+      [appleApp],
+      {
+        followed: ['mlb', 'mls'],
+        seasonalInstalls: { 'com.apple.appletv': true },
+        autoRemove: { 'com.apple.appletv': true }
+      },
+      utc(2026, 12)
+    );
+    assert.strictEqual(evDecShared.exits.length, 0);
+    assert.deepStrictEqual(evDecShared.autoRemoveIds, []);
+
+    const evJanShared = maint.evaluateSeasonalSports(
+      [appleApp],
+      {
+        followed: ['mlb', 'mls'],
+        seasonalInstalls: { 'com.apple.appletv': true },
+        autoRemove: { 'com.apple.appletv': true }
+      },
+      utc(2027, 1)
+    );
+    assert.strictEqual(evJanShared.exits.length, 1);
+    assert.strictEqual(evJanShared.exits[0].endMonthName, 'December');
+    assert.deepStrictEqual(evJanShared.autoRemoveIds, ['com.apple.appletv']);
+
+    const evDecF1Shared = maint.evaluateSeasonalSports(
+      [appleApp],
+      {
+        followed: ['mlb', 'f1'],
+        seasonalInstalls: { 'com.apple.appletv': true },
+        autoRemove: { 'com.apple.appletv': true }
+      },
+      utc(2026, 12)
+    );
+    assert.strictEqual(evDecF1Shared.exits.length, 0);
+    assert.deepStrictEqual(evDecF1Shared.autoRemoveIds, []);
+
+    const evMarPrimeShared = maint.evaluateSeasonalSports(
+      [amazonApp],
+      {
+        followed: ['nfl', 'nba'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true }
+      },
+      mar2027
+    );
+    assert.strictEqual(evMarPrimeShared.exits.length, 0);
+    assert.deepStrictEqual(evMarPrimeShared.autoRemoveIds, []);
+
+    const evYearRound = maint.evaluateSeasonalSports(
+      [],
+      { followed: ['cricket', 'soccer'] },
+      oct2026
+    );
+    assert.strictEqual(evYearRound.suggestions.length, 1);
+    assert.strictEqual(evYearRound.suggestions[0].yearRound, true);
+    assert.strictEqual(evYearRound.suggestions[0].endMonthName, null);
+
+    // 13b. runSeasonalAppCleanup removes off-season seasonal install when idle on Home and updates state
+    {
+      let seasonalState = {
+        followed: ['nfl'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true }
+      };
+      let installed = [amazonApp];
+      let removeCalled = false;
+      let listPollsAfterRemove = 0;
+
+      const res = await maint.runSeasonalAppCleanup({
+        tvPower: 'active',
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        readSeasonalState: () => seasonalState,
+        writeSeasonalState: (next) => {
+          seasonalState = next;
+        },
+        callLunaSend: async (uri, payload) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri === 'luna://com.webos.appInstallService/remove' && payload.id === 'amazon') {
+            removeCalled = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            if (removeCalled && ++listPollsAfterRemove >= 2) {
+              installed = [];
+            }
+            return { returnValue: true, apps: installed };
+          }
+          return { returnValue: true };
+        }
+      });
+
+      assert.strictEqual(res.evaluated, true);
+      assert.deepStrictEqual(res.autoRemoveCandidates, ['amazon']);
+      assert.deepStrictEqual(res.removalsAttempted, ['amazon']);
+      assert.deepStrictEqual(res.removalsCompleted, ['amazon']);
+      assert.deepStrictEqual(res.removalsFailed, []);
+      assert.strictEqual(seasonalState.seasonalInstalls.amazon, undefined);
+      assert.strictEqual(seasonalState.autoRemove.amazon, undefined);
+    }
+
+    // 13c. runSeasonalAppCleanup skips removal when viewer is watching an active app
+    {
+      const resFg = await maint.runSeasonalAppCleanup({
+        tvPower: 'active',
+        nowMs: () => mar2027.getTime(),
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'netflix' };
+          }
+          throw new Error('Must not call remove while viewer is active');
+        },
+        callLunaSendLarge: async () => ({ returnValue: true, apps: [amazonApp] })
+      });
+      assert.deepStrictEqual(resFg.removalsAttempted, []);
+      assert.deepStrictEqual(resFg.removalsSkippedForeground, ['amazon']);
+    }
+
+    // 13d. runSeasonalAppCleanup defers removal when getForegroundAppInfo fails, even if foregroundAppId was passed
+    {
+      const resFgFail = await maint.runSeasonalAppCleanup({
+        tvPower: 'active',
+        nowMs: () => mar2027.getTime(),
+        foregroundAppId: 'local.owner.applibrary',
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: false };
+          }
+          throw new Error('Must not call remove when foreground query fails');
+        },
+        callLunaSendLarge: async () => ({ returnValue: true, apps: [amazonApp] })
+      });
+      assert.deepStrictEqual(resFgFail.removalsAttempted, []);
+      assert.deepStrictEqual(resFgFail.removalsSkippedForeground, ['amazon']);
+    }
+
+    // 13e. runSeasonalAppCleanup rechecks activity and foreground after the pre-removal listApps query before calling remove
+    {
+      let listCalls = 0;
+      let activityOccurred = false;
+      const resPostVerify = await maint.runSeasonalAppCleanup({
+        tvPower: 'active',
+        nowMs: () => mar2027.getTime(),
+        hasUserActivitySince: () => activityOccurred,
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          throw new Error('Must not call remove after user activity during pre-removal listApps');
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            listCalls++;
+            if (listCalls === 2) {
+              // Simulate remote activity arriving during the slow pre-removal listApps call
+              activityOccurred = true;
+            }
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          return { returnValue: true };
+        }
+      });
+      assert.strictEqual(listCalls, 2);
+      assert.deepStrictEqual(resPostVerify.removalsAttempted, []);
+      assert.deepStrictEqual(resPostVerify.removalsSkippedForeground, ['amazon']);
+    }
+
+    // 13f. createSeasonalSportsStateStore and createResidentMaintenanceController bridge Home's LevelDB baaz.sports.v1 state by default
+    {
+      const levelDbDir = '/var/luna/preferences/webos_webappmgr/Local Storage/leveldb';
+      const stateFile = '/var/lib/local.owner.r2d2mic/seasonal-sports-state.json';
+      const files = new Map();
+      // Simulate Chromium LevelDB .log file with an older UTF-8 record followed by a newer UTF-16LE record
+      const oldRecord = Buffer.from(
+        '_http://home.test\x00\x01baaz.sports.v1\x00\x01' +
+          JSON.stringify({
+            followed: ['nfl'],
+            seasonalInstalls: { amazon: true },
+            autoRemove: { amazon: true },
+            kept: { 'nfl:off:2027': true }
+          }),
+        'utf8'
+      );
+      const newRecord = Buffer.concat([
+        Buffer.from('_http://home.test\x00', 'utf8'),
+        Buffer.from('baaz.sports.v1', 'utf16le'),
+        Buffer.from('\x00\x00', 'utf8'),
+        Buffer.from(
+          JSON.stringify({
+            followed: ['nfl'],
+            seasonalInstalls: { amazon: true },
+            autoRemove: { amazon: true },
+            kept: {}
+          }),
+          'utf16le'
+        )
+      ]);
+      files.set(levelDbDir + '/000003.log', Buffer.concat([oldRecord, newRecord]));
+
+      const mockFs = {
+        existsSync: (p) => files.has(p) || p === levelDbDir,
+        readdirSync: (d) => (d === levelDbDir ? ['000003.log'] : []),
+        statSync: () => ({ mtimeMs: 1000 }),
+        readFileSync: (p, enc) => {
+          const buf = files.get(p);
+          if (!buf) throw new Error('ENOENT: ' + p);
+          return enc ? buf.toString(enc) : buf;
+        },
+        mkdirSync: () => {},
+        writeFileSync: (p, data) => {
+          files.set(p, Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8'));
+        },
+        chmodSync: () => {},
+        renameSync: (from, to) => {
+          files.set(to, files.get(from));
+          files.delete(from);
+        }
+      };
+
+      let installed = [
+        { id: 'local.owner.applibrary', version: '1.0.0', visible: true, removable: false, systemApp: true },
+        amazonApp
+      ];
+      let removeCalled = false;
+
+      const ctrl = maint.createResidentMaintenanceController({
+        fs: mockFs,
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        getTvPower: () => 'active',
+        callLunaSend: async (uri, payload) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri === 'luna://com.webos.appInstallService/remove' && payload.id === 'amazon') {
+            removeCalled = true;
+            installed = installed.filter((a) => a.id !== 'amazon');
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: installed };
+          }
+          if (uri.endsWith('/statusAll') || uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+
+      const rep = await ctrl.executeTvMaintenance('vk', 'req-seasonal-bridge', 'update', '2027-03-15');
+      assert(rep && rep.seasonalCleanup);
+      assert.strictEqual(removeCalled, true);
+      assert.deepStrictEqual(rep.seasonalCleanup.removalsCompleted, ['amazon']);
+      assert(files.has(stateFile));
+      const persisted = JSON.parse(files.get(stateFile).toString('utf8'));
+      assert.strictEqual(persisted.state.seasonalInstalls.amazon, undefined);
+    }
+
+    // 13g. Foreign origin rejection, concurrent Home edit preservation during removal, and unresolved updatesInProgress exclusion
+    {
+      const foreignBuf = Buffer.from(
+        '_http://unrelated.test\x00\x01baaz.sports.v1\x01' +
+          JSON.stringify({ followed: ['nfl'], seasonalInstalls: { amazon: true } }),
+        'utf8'
+      );
+      assert.strictEqual(maint.extractBaazSportsFromBuffer(foreignBuf).found, false);
+
+      // Unauthenticated /tmp bridge files are rejected; root-owned 0600 bridge files in non-world-writable dirs are accepted
+      const untrustedStore = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: () => true,
+          lstatSync: () => ({
+            isSymbolicLink: () => false,
+            isDirectory: () => true,
+            isFile: () => true,
+            uid: 0,
+            mode: 0o600
+          }),
+          readFileSync: () => Buffer.from(JSON.stringify({ followed: ['nfl'], seasonalInstalls: { amazon: true }, autoRemove: { amazon: true } }), 'utf8')
+        },
+        homeStateBridgePath: '/tmp/r2d2-home-sports-state.json',
+        localStorageDirs: []
+      });
+      assert.deepStrictEqual(untrustedStore.read().followed, []);
+
+      // Concurrent Home edit while removal is polling preserves Keep on the second app
+      const bridgeFiles = new Map();
+      const homeBridge = '/var/lib/local.owner.r2d2mic/home-bridge.json';
+      const persistedBridge = '/var/lib/local.owner.r2d2mic/persisted-state.json';
+      let homeObj = {
+        followed: ['nfl', 'nhl'],
+        dismissed: {},
+        kept: {},
+        seasonalInstalls: { amazon: true, hulu: true },
+        autoRemove: { amazon: true, hulu: true }
+      };
+      bridgeFiles.set(homeBridge, Buffer.from(JSON.stringify(homeObj), 'utf8'));
+      const store = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: (p) => bridgeFiles.has(p) || p === '/var/lib/local.owner.r2d2mic',
+          lstatSync: (p) => ({
+            isSymbolicLink: () => false,
+            isDirectory: () => p === '/var/lib/local.owner.r2d2mic',
+            isFile: () => p !== '/var/lib/local.owner.r2d2mic',
+            uid: 0,
+            mode: p === '/var/lib/local.owner.r2d2mic' ? 0o700 : 0o600
+          }),
+          readFileSync: (p, e) => (e ? bridgeFiles.get(p).toString(e) : bridgeFiles.get(p))
+        },
+        homeStateBridgePath: homeBridge,
+        seasonalStatePath: persistedBridge,
+        localStorageDirs: [],
+        writeAtomic: (p, b) => bridgeFiles.set(p, b)
+      });
+      let installedBoth = [
+        amazonApp,
+        { id: 'hulu', title: 'Hulu', type: 'web', visible: true, removable: true, systemApp: false }
+      ];
+      let becameActive = false;
+      const resConcurrent = await maint.runSeasonalAppCleanup({
+        nowMs: () => utc(2027, 7).getTime(),
+        readSeasonalState: store.read,
+        writeSeasonalState: store.write,
+        hasUserActivitySince: () => becameActive,
+        callLunaSend: async (uri, payload) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/remove')) {
+            installedBoth = installedBoth.filter((a) => a.id !== payload.id);
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async () => ({ returnValue: true, apps: installedBoth }),
+        sleep: async () => {
+          becameActive = true;
+          homeObj.kept['nhl:off:2027'] = true;
+          delete homeObj.seasonalInstalls.hulu;
+          delete homeObj.autoRemove.hulu;
+          bridgeFiles.set(homeBridge, Buffer.from(JSON.stringify(homeObj), 'utf8'));
+        }
+      });
+      assert.deepStrictEqual(resConcurrent.removalsCompleted, ['amazon']);
+      assert.deepStrictEqual(resConcurrent.removalsSkippedForeground, ['hulu']);
+      assert.deepStrictEqual(store.read().kept, { 'nhl:off:2027': true });
+      assert.deepStrictEqual(store.read().seasonalInstalls, {});
+
+      // Unrelated preference change in Home after removal does not resurrect stale seasonalInstalls
+      homeObj = {
+        followed: ['nfl', 'nhl', 'mlb'],
+        dismissed: {},
+        kept: { 'nhl:off:2027': true },
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true }
+      };
+      bridgeFiles.set(homeBridge, Buffer.from(JSON.stringify(homeObj), 'utf8'));
+      const afterUnrelatedEdit = store.read();
+      assert.deepStrictEqual(afterUnrelatedEdit.followed, ['nfl', 'nhl', 'mlb']);
+      assert.deepStrictEqual(afterUnrelatedEdit.seasonalInstalls, {});
+      assert.deepStrictEqual(afterUnrelatedEdit.autoRemove, {});
+
+      // A genuine new seasonal install with a fresh installToken is recognized
+      homeObj = {
+        followed: ['nfl', 'nhl', 'mlb'],
+        dismissed: {},
+        kept: { 'nhl:off:2027': true },
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true },
+        installTokens: { amazon: 'tok-fresh-2028' }
+      };
+      bridgeFiles.set(homeBridge, Buffer.from(JSON.stringify(homeObj), 'utf8'));
+      const afterFreshInstall = store.read();
+      assert.deepStrictEqual(afterFreshInstall.seasonalInstalls, { amazon: true });
+      assert.deepStrictEqual(afterFreshInstall.autoRemove, { amazon: true });
+
+      // Unresolved update job in executeTvMaintenance prevents seasonal removal from firing in the same run
+      let clockInProg = mar2027.getTime();
+      const mutations = [];
+      const ctrlInProg = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => clockInProg,
+        sleep: async (ms) => {
+          clockInProg += ms;
+        },
+        installTimeoutMs: 10,
+        maxInstallTimeoutMs: 10,
+        pollIntervalMs: 5,
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri, payload) => {
+          if (
+            uri.endsWith('/install') ||
+            uri.endsWith('/cancel') ||
+            uri.endsWith('/remove')
+          ) {
+            mutations.push({ uri, payload });
+          }
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/cancel')) {
+            return { returnValue: false };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [{ ...amazonApp, version: '1.0.0' }] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return {
+              returnValue: true,
+              status: { apps: [{ id: 'amazon', updateYN: 'Y', version: '2.0.0' }] }
+            };
+          }
+          if (uri.endsWith('/status')) {
+            return {
+              returnValue: true,
+              status: { apps: [{ id: 'amazon', state: 'downloading', progress: 10 }] }
+            };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repInProg = await ctrlInProg.executeTvMaintenance('vk', 'req-inprog', 'update', '2027-03-15');
+      assert.deepStrictEqual(repInProg.updatesInProgress, ['amazon']);
+      assert.strictEqual(repInProg.seasonalCleanup, null);
+      assert.strictEqual(mutations.some((m) => m.uri.endsWith('/remove')), false);
+    }
+
+    // 13h. Authoritative LevelDB selection across multiple directories and fail-closed behavior after Home storage is cleared/compacted
+    {
+      function encodeVarint(n) {
+        const out = [];
+        do {
+          let b = n & 0x7f;
+          n >>>= 7;
+          out.push(n ? b | 0x80 : b);
+        } while (n);
+        return Buffer.from(out);
+      }
+      function walRecord(seq, op, key, valObj) {
+        const k = Buffer.from('_file://\x00\x01' + key, 'utf8');
+        const v = valObj !== undefined ? Buffer.from('\x01' + JSON.stringify(valObj), 'utf8') : Buffer.alloc(0);
+        const hdr = Buffer.alloc(12);
+        hdr.writeBigUInt64LE(BigInt(seq), 0);
+        hdr.writeUInt32LE(1, 8);
+        const batch = Buffer.concat([
+          hdr,
+          Buffer.from([op]),
+          encodeVarint(k.length),
+          k,
+          ...(op === 1 ? [encodeVarint(v.length), v] : [])
+        ]);
+        const recHdr = Buffer.alloc(7);
+        recHdr.writeUInt16LE(batch.length, 4);
+        recHdr[6] = 1;
+        return Buffer.concat([recHdr, batch]);
+      }
+
+      const dbFiles = new Map([
+        [
+          '/old/000003.log',
+          walRecord(900, 1, 'baaz.sports.v1', {
+            followed: ['nfl'],
+            seasonalInstalls: { amazon: true },
+            autoRemove: { amazon: true }
+          })
+        ],
+        [
+          '/old/000004.log',
+          Buffer.from('_https://other.test\x00\x01unrelated\x00\x011', 'utf8')
+        ],
+        [
+          '/new/000003.log',
+          walRecord(10, 1, 'baaz.sports.v1', {
+            followed: ['nfl'],
+            kept: { 'nfl:off:2027': true },
+            seasonalInstalls: {}
+          })
+        ]
+      ]);
+      const multiStore = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: (p) => dbFiles.has(p) || p === '/old' || p === '/new',
+          readdirSync: (d) => (d === '/old' ? ['000003.log', '000004.log'] : ['000003.log']),
+          statSync: (p) => ({
+            mtimeMs: p === '/old/000004.log' ? 5000 : p.startsWith('/new') ? 2000 : 1000
+          }),
+          readFileSync: (p, enc) => {
+            if (!dbFiles.has(p)) throw new Error('ENOENT');
+            return enc ? dbFiles.get(p).toString(enc) : dbFiles.get(p);
+          }
+        },
+        localStorageDirs: ['/old', '/new'],
+        homeStateBridgePath: '/absent-bridge',
+        seasonalStatePath: '/saved-state',
+        writeAtomic: (p, b) => dbFiles.set(p, b)
+      });
+      // When both /old and /new contain conflicting Home records, source authority is ambiguous -> fail closed
+      const ambiguousRead = multiStore.read();
+      assert.deepStrictEqual(ambiguousRead.followed, []);
+      assert.deepStrictEqual(ambiguousRead.seasonalInstalls, {});
+      assert.deepStrictEqual(ambiguousRead.autoRemove, {});
+
+      // When /old only contains unrelated origins and /new contains Home records, /new is unambiguously selected
+      dbFiles.delete('/old/000003.log');
+      const multiOnlyNew = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: (p) => dbFiles.has(p) || p === '/old' || p === '/new',
+          readdirSync: (d) => (d === '/old' ? ['000004.log'] : ['000003.log']),
+          statSync: () => ({ mtimeMs: 5000 }),
+          readFileSync: (p, enc) => {
+            if (!dbFiles.has(p)) throw new Error('ENOENT');
+            return enc ? dbFiles.get(p).toString(enc) : dbFiles.get(p);
+          }
+        },
+        localStorageDirs: ['/old', '/new'],
+        homeStateBridgePath: '/absent-bridge',
+        seasonalStatePath: '/saved-state',
+        writeAtomic: (p, b) => dbFiles.set(p, b)
+      });
+      const multiRead = multiOnlyNew.read();
+      assert.deepStrictEqual(multiRead.kept, { 'nfl:off:2027': true });
+      assert.deepStrictEqual(multiRead.seasonalInstalls, {});
+
+      // Truncated newer WAL record after an older consent record fails closed instead of retaining older consent
+      const oldOptInRec = walRecord(10, 1, 'baaz.sports.v1', {
+        followed: ['nfl'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true }
+      });
+      const newKeepRec = walRecord(11, 1, 'baaz.sports.v1', {
+        followed: ['nfl'],
+        kept: { 'nfl:off:2027': true },
+        seasonalInstalls: {},
+        autoRemove: {}
+      });
+      const truncatedWalBuf = Buffer.concat([
+        oldOptInRec,
+        newKeepRec.subarray(0, newKeepRec.length - 8)
+      ]);
+      const truncatedExtracted = maint.extractBaazSportsFromBuffer(truncatedWalBuf);
+      assert.strictEqual(truncatedExtracted.found, false);
+      assert.strictEqual(truncatedExtracted.corrupt, true);
+
+      // Revalidating cleanup eligibility after appInstallService/status prevents removal if Keep is chosen during status await
+      let statusAwaitState = {
+        followed: ['nfl'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true }
+      };
+      let removeAfterStatusKeep = false;
+      const resStatusRace = await maint.runSeasonalAppCleanup({
+        tvPower: 'active',
+        requireInstallStatus: true,
+        nowMs: () => mar2027.getTime(),
+        readSeasonalState: () => statusAwaitState,
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/remove')) {
+            removeAfterStatusKeep = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          if (uri.endsWith('/status')) {
+            // User chooses Keep while appInstallService/status is in flight
+            statusAwaitState = {
+              followed: ['nfl'],
+              kept: { 'nfl:off:2027': true },
+              seasonalInstalls: {},
+              autoRemove: {}
+            };
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+      assert.strictEqual(removeAfterStatusKeep, false);
+      assert.deepStrictEqual(resStatusRace.removalsAttempted, []);
+      assert.deepStrictEqual(resStatusRace.removalsSkippedForeground, ['amazon']);
+
+      // Seed persisted state, then simulate Home storage cleared and tombstone compacted away
+      dbFiles.set(
+        '/new/000003.log',
+        walRecord(11, 1, 'baaz.sports.v1', {
+          followed: ['nba', 'mlb'],
+          seasonalInstalls: { 'com.apple.appletv': true },
+          autoRemove: { 'com.apple.appletv': true }
+        })
+      );
+      multiOnlyNew.write(multiOnlyNew.read());
+      dbFiles.set('/new/000003.log', walRecord(12, 1, 'baaz.calm.v1', true));
+      const afterClearAndCompact = multiOnlyNew.read();
+      assert.deepStrictEqual(afterClearAndCompact, {
+        followed: [],
+        dismissed: {},
+        kept: {},
+        seasonalInstalls: {},
+        autoRemove: {}
+      });
+
+      // Unconfirmed seasonal removal in update-standby mode defers power/turnOff and marks maintenanceComplete=false
+      let turnOffCalled = false;
+      const ctrlStandbyDefer = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        pollIntervalMs: 1,
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/remove')) {
+            return { returnValue: false };
+          }
+          if (uri.endsWith('/turnOff')) {
+            turnOffCalled = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          if (uri.endsWith('/statusAll') || uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repStandbyDefer = await ctrlStandbyDefer.executeTvMaintenance(
+        'vk',
+        'req-standby-defer',
+        'update-standby',
+        '2027-03-15'
+      );
+      assert.strictEqual(turnOffCalled, false);
+      assert.strictEqual(repStandbyDefer.returnedToStandby, false);
+      assert.strictEqual(repStandbyDefer.maintenanceComplete, false);
+      assert.deepStrictEqual(repStandbyDefer.seasonalCleanup.removalsFailed, ['amazon']);
+
+      // Failed appInstallService/status prevents seasonal removal from firing and sets maintenanceComplete=false
+      let removeOnFailedStatus = false;
+      const ctrlStatusFail = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/remove')) {
+            removeOnFailedStatus = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          if (uri.endsWith('/status')) {
+            return { returnValue: false };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repStatusFail = await ctrlStatusFail.executeTvMaintenance(
+        'vk',
+        'req-status-fail',
+        'update',
+        '2027-03-15'
+      );
+      assert.strictEqual(removeOnFailedStatus, false);
+      assert.strictEqual(repStatusFail.seasonalCleanup, null);
+      assert.strictEqual(repStatusFail.maintenanceComplete, false);
+
+      // Failed foreground observation during pre-standby cleanup prevents power/turnOff and marks maintenanceComplete=false
+      let listCallsForFgTest = 0;
+      let turnOffOnFgFail = false;
+      const ctrlStandbyFgFail = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            // Succeed during runUpdateWorkflow; fail once runSeasonalAppCleanup starts (after its listApps call)
+            if (listCallsForFgTest >= 2) {
+              return { returnValue: false };
+            }
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/turnOff')) {
+            turnOffOnFgFail = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            listCallsForFgTest++;
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          if (uri.endsWith('/statusAll') || uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repStandbyFgFail = await ctrlStandbyFgFail.executeTvMaintenance(
+        'vk',
+        'req-standby-fg-fail',
+        'update-standby',
+        '2027-03-15'
+      );
+      assert.strictEqual(turnOffOnFgFail, false);
+      assert.strictEqual(repStandbyFgFail.returnedToStandby, false);
+      assert.strictEqual(repStandbyFgFail.maintenanceComplete, false);
+      assert.strictEqual(repStandbyFgFail.seasonalCleanup.foregroundObservationFailed, true);
+
+      // Wake ownership revoked during beforeStandbyTurnOff cleanup prevents power/turnOff
+      let wakeOwnedLive = true;
+      let turnOffOnRevokedWake = false;
+      const ctrlWakeRevoked = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        isWakeOwned: () => wakeOwnedLive,
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          if (uri.endsWith('/remove')) {
+            wakeOwnedLive = false;
+            return { returnValue: true };
+          }
+          if (uri.endsWith('/turnOff')) {
+            turnOffOnRevokedWake = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: wakeOwnedLive ? [amazonApp] : [] };
+          }
+          if (uri.endsWith('/statusAll') || uri.endsWith('/status')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repWakeRevoked = await ctrlWakeRevoked.executeTvMaintenance(
+        'vk',
+        'req-wake-revoked',
+        'update-standby',
+        '2027-03-15'
+      );
+      assert.strictEqual(turnOffOnRevokedWake, false);
+      assert.strictEqual(repWakeRevoked.returnedToStandby, false);
+      assert.strictEqual(repWakeRevoked.maintenanceComplete, false);
+
+      // Deferred seasonal cleanup (e.g. cleanup-time install-status failure) marks maintenanceComplete=false and preserves retry state
+      let statusCallIdx = 0;
+      let savedUpdaterState = { schema: 1, lastUpdateDay: '2027-03-14' };
+      const ctrlCleanupDeferred = maint.createResidentMaintenanceController({
+        fs: { existsSync: () => false },
+        nowMs: () => mar2027.getTime(),
+        sleep: async () => {},
+        readUpdaterState: () => savedUpdaterState,
+        writeUpdaterState: (next) => {
+          savedUpdaterState = next;
+        },
+        readSeasonalState: () => ({
+          followed: ['nfl'],
+          seasonalInstalls: { amazon: true },
+          autoRemove: { amazon: true }
+        }),
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/getForegroundAppInfo')) {
+            return { returnValue: true, appId: 'local.owner.applibrary' };
+          }
+          return { returnValue: true };
+        },
+        callLunaSendLarge: async (uri) => {
+          if (uri.endsWith('/listApps')) {
+            return { returnValue: true, apps: [amazonApp] };
+          }
+          if (uri.endsWith('/statusAll')) {
+            return { returnValue: true, status: { apps: [] } };
+          }
+          if (uri.endsWith('/status')) {
+            statusCallIdx++;
+            if (statusCallIdx === 1) {
+              return { returnValue: true, status: { apps: [] } };
+            }
+            return { returnValue: false };
+          }
+          return { returnValue: true };
+        }
+      });
+      const repCleanupDeferred = await ctrlCleanupDeferred.executeTvMaintenance(
+        'vk',
+        'req-cleanup-deferred',
+        'update',
+        '2027-03-15'
+      );
+      assert.strictEqual(repCleanupDeferred.maintenanceComplete, false);
+      assert.deepStrictEqual(repCleanupDeferred.pendingApps, ['amazon']);
+      assert.strictEqual(savedUpdaterState.pendingRetryDay, '2027-03-15');
+
+      // Replacement install token published while removal confirmation is in flight is preserved and not marked removed
+      let repHome = {
+        followed: ['nfl'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true },
+        installTokens: { amazon: 'old' }
+      };
+      const repFiles = new Map();
+      const repStore = maint.createSeasonalSportsStateStore({
+        localStorageDirs: [],
+        seasonalStatePath: '/fixture/rep-state.json',
+        getHomeLocalStorageItem: () => JSON.stringify(repHome),
+        fs: {
+          existsSync: (p) => repFiles.has(p),
+          readFileSync: (p, e) => (e ? repFiles.get(p).toString(e) : repFiles.get(p))
+        },
+        writeAtomic: (p, b) => repFiles.set(p, b)
+      });
+      let repRemoved = false;
+      await maint.runSeasonalAppCleanup({
+        nowMs: () => mar2027.getTime(),
+        readSeasonalState: repStore.read,
+        writeSeasonalState: repStore.write,
+        callLunaSend: async (uri) => {
+          if (uri.endsWith('/remove')) {
+            repRemoved = true;
+            return { returnValue: true };
+          }
+          return { returnValue: true, appId: 'local.owner.applibrary' };
+        },
+        callLunaSendLarge: async () => {
+          if (repRemoved) {
+            repHome = {
+              followed: ['nfl'],
+              seasonalInstalls: { amazon: true },
+              autoRemove: { amazon: true },
+              installTokens: { amazon: 'replacement' }
+            };
+            return { returnValue: true, apps: [] };
+          }
+          return { returnValue: true, apps: [amazonApp] };
+        }
+      });
+      assert.deepStrictEqual(repStore.read().seasonalInstalls, { amazon: true });
+      assert.deepStrictEqual(repStore.read().installTokens, { amazon: 'replacement' });
+
+      // Partial database read (EIO on a newer LevelDB file) fails closed instead of using an older opt-in record
+      const eioStore = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: (p) => p === '/eiodb' || p === '/eiodb/000001.log' || p === '/eiodb/000002.log',
+          readdirSync: () => ['000001.log', '000002.log'],
+          statSync: (p) => ({ mtimeMs: p.endsWith('000002.log') ? 2000 : 1000 }),
+          readFileSync: (p) => {
+            if (p.endsWith('000002.log')) {
+              const err = new Error('EIO');
+              err.code = 'EIO';
+              throw err;
+            }
+            return walRecord(1, 1, 'baaz.sports.v1', {
+              followed: ['nfl'],
+              seasonalInstalls: { amazon: true },
+              autoRemove: { amazon: true }
+            });
+          }
+        },
+        localStorageDirs: ['/eiodb']
+      });
+      assert.deepStrictEqual(eioStore.read().followed, []);
+      assert.deepStrictEqual(eioStore.read().seasonalInstalls, {});
+
+      // Concurrent new installation in Home between read() and write() is preserved, not marked as removed
+      const concFiles = new Map();
+      let concHome = JSON.stringify({
+        followed: ['nfl'],
+        seasonalInstalls: { amazon: true },
+        autoRemove: { amazon: true },
+        installTokens: { amazon: 'old' }
+      });
+      const concStore = maint.createSeasonalSportsStateStore({
+        fs: {
+          existsSync: (p) => concFiles.has(p),
+          readFileSync: (p, e) => (e ? concFiles.get(p).toString(e) : concFiles.get(p))
+        },
+        localStorageDirs: [],
+        getHomeLocalStorageItem: () => concHome,
+        seasonalStatePath: '/conc-state',
+        writeAtomic: (p, b) => concFiles.set(p, b)
+      });
+      const nextSnap = concStore.read();
+      delete nextSnap.seasonalInstalls.amazon;
+      delete nextSnap.autoRemove.amazon;
+      delete nextSnap.installTokens.amazon;
+      concHome = JSON.stringify({
+        followed: ['nfl', 'mls'],
+        seasonalInstalls: { amazon: true, 'com.apple.appletv': true },
+        autoRemove: { amazon: true, 'com.apple.appletv': true },
+        installTokens: { amazon: 'old', 'com.apple.appletv': 'new' }
+      });
+      concStore.write(nextSnap);
+      const savedConc = JSON.parse(concFiles.get('/conc-state').toString('utf8'));
+      assert.deepStrictEqual(savedConc.removedApps, { amazon: 'tok:old' });
+      const concAfter = concStore.read();
+      assert.deepStrictEqual(concAfter.followed, ['nfl', 'mls']);
+      assert.deepStrictEqual(concAfter.seasonalInstalls, { 'com.apple.appletv': true });
+      assert.deepStrictEqual(concAfter.autoRemove, { 'com.apple.appletv': true });
+    }
+
+    groups++;
+  }
+
   process.stdout.write(JSON.stringify({ groups, nativeCalls: 0, modelCalls: 0 }) + '\n');
 })().catch((err) => {
   console.error(err);

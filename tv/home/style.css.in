@@ -88,6 +88,13 @@ h2 { font-size: 27px; line-height: 1.2; margin: 0; font-weight: 600; letter-spac
 .max .brand-image { width: 106px; height: 83px; max-height: 83px; }
 .chromium-browser .tile { background: linear-gradient(120deg, #1b3443, #20314b); flex-direction: column; gap: 9px; }
 .browser-status { font-size: 16px; letter-spacing: .2px; font-weight: 500; color: #b4c5d5; }
+.seasonal-button .tile { flex-direction: column; gap: 7px; border-style: dashed; border-width: 1.5px; }
+.seasonal-suggest .tile { border-color: #83ecff73; }
+.seasonal-exit .tile { border-color: #e3bd9280; }
+.seasonal-mark { display: flex; align-items: center; justify-content: center; line-height: 1; }
+.seasonal-mark .brand-image { height: 52px; max-height: 52px; }
+.seasonal-pill { font-size: 13px; letter-spacing: 1.2px; font-weight: 700; padding: 3px 10px; border-radius: 10px; background: #080d1399; color: #83ecff; max-width: 90%; white-space: nowrap; overflow: hidden; text-overflow: clip; }
+.seasonal-exit .seasonal-pill { color: #e3bd92; }
 .icon-browser { width: 80px; height: 60px; display: block; }
 .icon-grid { display: grid; grid-template-columns: repeat(3, 8px); grid-template-rows: repeat(3, 8px); gap: 4px; }
 .icon-grid i { display: block; background: #b5c1cd; border-radius: 2px; }
@@ -130,6 +137,9 @@ kbd { font: inherit; font-size: 15px; border: 1px solid #566575; border-radius: 
 .manage-copy { flex: 1; display: flex; flex-direction: column; gap: 4px; }
 .manage-copy strong { font-size: 24px; font-weight: 600; }
 .manage-copy > span, .protected-label { font-size: 18px; color: #9cabbc; }
+.sport-icon { color: #f5f3ed; font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+.sport-actions { display: flex; align-items: center; gap: 14px; flex: 0 0 auto; }
+.sport-actions .secondary-button[aria-pressed="true"] { background: #224457; border: 1px solid #83ecff66; color: #e8faff; }
 .delete-button { min-width: 126px; background: #3c2a31; color: #efc7ca; }
 .danger-button { background: #b33f4b; color: #fff4f2; }
 .panel-feedback { font-size: 22px; color: #f0b8b4; padding: 14px 18px; margin: -10px 0 27px; background: #b34c4c18; border: 1px solid #e7867c40; border-radius: 10px; }

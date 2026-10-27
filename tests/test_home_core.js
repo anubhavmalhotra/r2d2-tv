@@ -2,7 +2,9 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), vm = require('node:vm');
 const corePath = process.env.R2D2_HOME_CORE_SOURCE || require.resolve('../tv/home/core.js.in');
-const {Service, normalize, voiceValue, weatherValue} = require(corePath);
+const catalogPath = process.env.R2D2_HOME_CATALOG_SOURCE || require.resolve('../tv/home/catalog.js.in');
+const {Service, normalize, voiceValue, weatherValue, isSportInSeason, sportCycleKey, normalizeSportsState, evaluateSports} = require(corePath);
+const fullCatalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8').split('window.OwnerCatalog = ')[1].trim().replace(/;$/, ''));
 const LIST = 'luna://com.webos.applicationManager/listApps';
 const LAUNCH = 'luna://com.webos.applicationManager/launch';
 const REMOVE = 'luna://com.webos.appInstallService/remove';
@@ -291,6 +293,126 @@ async function run(){
     assert.deepEqual([f.calls[1].init.signal.aborted,f.calls[0].init.signal.aborted,f.feed.pending.length],[true,false,1]);
     f.calls[0].respond(ascii(view({seq:6})));await settle();
     assert.deepEqual(f.updates,[{seq:6,failures:0,replay:true}]);
+    groups++;
+  }
+  {
+    // Seasonal sports catalog, cycle keys, suggestions with reason, and season-end exits.
+    assert.equal(Array.isArray(fullCatalog.sports),true);
+    assert.equal(fullCatalog.sports.length,9);
+    const favIds=new Set(fullCatalog.favorites.map(f=>f.id));
+    for(const sport of fullCatalog.sports){
+      assert.equal(typeof sport.id,'string');
+      assert.equal(favIds.has(sport.appId),true,sport.id+' carrier must be in favorites');
+      assert.equal(typeof sport.reason,'string');
+      assert.equal(typeof sport.exit,'string');
+      assert.ok(sport.reason.length>10&&sport.exit.length>10,sport.id);
+    }
+    const nfl=fullCatalog.sports.find(s=>s.id==='nfl');
+    const mlb=fullCatalog.sports.find(s=>s.id==='mlb');
+    const tennis=fullCatalog.sports.find(s=>s.id==='tennis');
+    const utc=(y,m)=>new Date(Date.UTC(y,m-1,15));
+    assert.equal(isSportInSeason(nfl,utc(2026,9)),true);
+    assert.equal(isSportInSeason(nfl,utc(2027,1)),true);
+    assert.equal(isSportInSeason(nfl,utc(2027,2)),true);
+    assert.equal(isSportInSeason(nfl,utc(2027,3)),false);
+    assert.equal(isSportInSeason(nfl,utc(2026,8)),false);
+    assert.equal(isSportInSeason(mlb,utc(2026,3)),true);
+    assert.equal(isSportInSeason(mlb,utc(2026,11)),true);
+    assert.equal(isSportInSeason(mlb,utc(2026,12)),false);
+    assert.equal(isSportInSeason(tennis,utc(2026,6)),true);
+    assert.equal(isSportInSeason(tennis,utc(2026,9)),true);
+    assert.equal(isSportInSeason(tennis,utc(2026,10)),false);
+    assert.equal(sportCycleKey(nfl,utc(2026,10)),'nfl:in:2026');
+    assert.equal(sportCycleKey(nfl,utc(2027,1)),'nfl:in:2026');
+    assert.equal(sportCycleKey(nfl,utc(2027,3)),'nfl:off:2027');
+    assert.equal(sportCycleKey(mlb,utc(2026,7)),'mlb:in:2026');
+    assert.equal(sportCycleKey(mlb,utc(2026,12)),'mlb:off:2026');
+
+    const normState=normalizeSportsState({followed:['nfl','unknown','nfl','mlb'],dismissed:{'nfl:in:2026':true,bad:false},kept:{'mlb:off:2026':true},seasonalInstalls:{amazon:true,notAnApp:true},autoRemove:{amazon:true,netflix:true},installTokens:{amazon:'tok-1',netflix:'tok-2'}},fullCatalog);
+    assert.deepEqual({...normState,dismissed:{...normState.dismissed},kept:{...normState.kept},seasonalInstalls:{...normState.seasonalInstalls},autoRemove:{...normState.autoRemove},installTokens:{...normState.installTokens}},{followed:['nfl','mlb'],dismissed:{'nfl:in:2026':true},kept:{'mlb:off:2026':true},seasonalInstalls:{amazon:true},autoRemove:{amazon:true},installTokens:{amazon:'tok-1'}});
+
+    // 1. Missing carrier app for in-season followed sport produces suggestion with reason and exit.
+    const oct2026=utc(2026,10);
+    const evalSuggest=evaluateSports([app('netflix')],fullCatalog,{followed:['nfl']},oct2026);
+    assert.equal(evalSuggest.suggestions.length,1);
+    assert.equal(evalSuggest.exits.length,0);
+    assert.equal(evalSuggest.suggestions[0].appId,'amazon');
+    assert.deepEqual(evalSuggest.suggestions[0].sports,['nfl']);
+    assert.match(evalSuggest.suggestions[0].reason,/Thursday Night Football/);
+    assert.match(evalSuggest.suggestions[0].exit,/February/);
+    assert.equal(evalSuggest.sports.find(s=>s.id==='nfl').status,'suggested');
+
+    // 2. Multi-sport carrier deduplication (Cricket + Soccer on Sling TV in October covers all 12 months year-round).
+    const evalMulti=evaluateSports([app('netflix')],fullCatalog,{followed:['cricket','soccer']},oct2026);
+    assert.equal(evalMulti.suggestions.length,1);
+    assert.deepEqual(evalMulti.suggestions[0].sports,['soccer','cricket']);
+    assert.match(evalMulti.suggestions[0].sportTitle,/Soccer & Cricket/);
+    assert.equal(evalMulti.suggestions[0].yearRound,true);
+    assert.equal(evalMulti.suggestions[0].season,'Year-round');
+    assert.equal(evalMulti.suggestions[0].endMonthName,null);
+    assert.match(evalMulti.suggestions[0].exit,/Year-round coverage:.*span the full year/);
+    assert.equal(evalMulti.sports.find(s=>s.id==='soccer').yearRound,true);
+    assert.equal(evalMulti.sports.find(s=>s.id==='soccer').effectiveEndMonthName,null);
+
+    // 2b. Shared carrier with < 12 months combined coverage (MLB Mar-Nov + MLS Feb-Dec on Apple TV) derives December as the combined exit month.
+    const evalAppleSuggest=evaluateSports([app('netflix')],fullCatalog,{followed:['mlb','mls']},utc(2026,7));
+    assert.equal(evalAppleSuggest.suggestions.length,1);
+    assert.equal(evalAppleSuggest.suggestions[0].yearRound,false);
+    assert.equal(evalAppleSuggest.suggestions[0].season,'Feb–Dec');
+    assert.equal(evalAppleSuggest.suggestions[0].endMonthName,'December');
+    assert.match(evalAppleSuggest.suggestions[0].exit,/ends in December/);
+    assert.equal(evalAppleSuggest.sports.find(s=>s.id==='mlb').effectiveEndMonthName,'December');
+
+    // 3. Dismissing a suggestion suppresses it for that cycle, but not next season's cycle.
+    const evalDismissed=evaluateSports([app('netflix')],fullCatalog,{followed:['nfl'],dismissed:{'nfl:in:2026':true}},oct2026);
+    assert.equal(evalDismissed.suggestions.length,0);
+    assert.equal(evalDismissed.sports.find(s=>s.id==='nfl').status,'dismissed');
+    const evalNextYear=evaluateSports([app('netflix')],fullCatalog,{followed:['nfl'],dismissed:{'nfl:in:2026':true}},utc(2027,10));
+    assert.equal(evalNextYear.suggestions.length,1);
+
+    // 4. Installed carrier app during season reports installed-active and triggers exit when season ends.
+    const amazonApp=app('amazon',{title:'Prime Video',removable:true,systemApp:false});
+    const evalInSeasonInstalled=evaluateSports([amazonApp],fullCatalog,{followed:['nfl'],seasonalInstalls:{amazon:true}},oct2026);
+    assert.equal(evalInSeasonInstalled.suggestions.length,0);
+    assert.equal(evalInSeasonInstalled.exits.length,0);
+    assert.equal(evalInSeasonInstalled.sports.find(s=>s.id==='nfl').status,'installed-active');
+
+    const mar2027=utc(2027,3);
+    const evalExit=evaluateSports([amazonApp],fullCatalog,{followed:['nfl'],seasonalInstalls:{amazon:true}},mar2027);
+    assert.equal(evalExit.suggestions.length,0);
+    assert.equal(evalExit.exits.length,1);
+    assert.equal(evalExit.exits[0].appId,'amazon');
+    assert.deepEqual(evalExit.exits[0].sports,['nfl']);
+    assert.equal(evalExit.exits[0].seasonalInstall,true);
+    assert.equal(evalExit.exits[0].autoRemove,false);
+    const evalExitAuto=evaluateSports([amazonApp],fullCatalog,{followed:['nfl'],seasonalInstalls:{amazon:true},autoRemove:{amazon:true}},mar2027);
+    assert.equal(evalExitAuto.exits[0].autoRemove,true);
+    assert.match(evalExit.exits[0].reason,/NFL season ended in February/);
+    assert.equal(evalExit.sports.find(s=>s.id==='nfl').status,'exit-ready');
+
+    // 5. Keeping the app during off-season suppresses the exit prompt.
+    const evalKept=evaluateSports([amazonApp],fullCatalog,{followed:['nfl'],kept:{'nfl:off:2027':true}},mar2027);
+    assert.equal(evalKept.exits.length,0);
+    assert.equal(evalKept.sports.find(s=>s.id==='nfl').status,'kept');
+
+    // 6. Shared carrier (Apple TV carries MLB Mar-Nov, F1 Mar-Dec, and MLS Feb-Dec; Prime Video carries NFL Sep-Feb and NBA Oct-Jun):
+    const appleApp=app('com.apple.appletv',{title:'Apple TV',removable:true,systemApp:false});
+    const dec2026=utc(2026,12);
+    const jan2027=utc(2027,1);
+    const evalSharedDec=evaluateSports([appleApp],fullCatalog,{followed:['mlb','f1','mls']},dec2026);
+    assert.equal(evalSharedDec.exits.length,0,'F1 and MLS are still in season in December');
+    assert.equal(evalSharedDec.sports.find(s=>s.id==='mlb').status,'kept');
+    assert.equal(evalSharedDec.sports.find(s=>s.id==='f1').status,'installed-active');
+    assert.equal(evalSharedDec.sports.find(s=>s.id==='mls').status,'installed-active');
+    const evalSharedJan=evaluateSports([appleApp],fullCatalog,{followed:['mlb','mls']},jan2027);
+    assert.equal(evalSharedJan.exits.length,1,'Both MLB and MLS are out of season in January');
+    assert.deepEqual(evalSharedJan.exits[0].sports,['mlb','mls']);
+    assert.equal(evalSharedJan.exits[0].endMonthName,'December');
+    assert.match(evalSharedJan.exits[0].reason,/MLB & MLS seasons have ended/);
+    const evalPrimeSharedMar=evaluateSports([amazonApp],fullCatalog,{followed:['nfl','nba']},mar2027);
+    assert.equal(evalPrimeSharedMar.exits.length,0,'NBA is still in season on Prime Video in March');
+    assert.equal(evalPrimeSharedMar.sports.find(s=>s.id==='nfl').status,'kept');
+    assert.equal(evalPrimeSharedMar.sports.find(s=>s.id==='nba').status,'installed-active');
     groups++;
   }
   console.log(JSON.stringify({groups,liveTvTested:false}));
