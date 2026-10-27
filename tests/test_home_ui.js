@@ -684,6 +684,117 @@ async function run() {
     assert.deepEqual(await cut.page.evaluate(() => Array.from(document.querySelectorAll('*')).filter(el => getComputedStyle(el).textOverflow === 'ellipsis').map(el => el.id || el.className)),[]);
     await cut.context.close(); groups++;
 
+    // Sports & seasons: in-season missing carrier suggestion with reason/exit, verified App Store install tracking, dismissal, and season-end cleanup exit.
+    const sportsFx = await fixture(browser, {inventory:['netflix','com.apple.appletv','com.webos.app.discovery','com.webos.app.tinybrowser']});
+    await sportsFx.page.locator('#preferences-open').click();
+    await sportsFx.page.locator('#sports-open').click();
+    assert.equal(await sportsFx.page.locator('#panel-title').textContent(),'Sports & seasons');
+    assert.equal(await sportsFx.page.locator('#panel-content [data-sport-id]').count(),9);
+    await sportsFx.page.locator('[data-follow-sport="nfl"]').click();
+    assert.equal(await sportsFx.page.locator('[data-follow-sport="nfl"]').getAttribute('aria-pressed'),'true');
+    assert.equal(await sportsFx.page.locator('#dock [data-suggestion-id="amazon"][data-suggestion-kind="suggest"]').count(),1);
+    await key(sportsFx.page,461); await key(sportsFx.page,461);
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').focus();
+    assert.equal(await sportsFx.page.locator('#hero-brand').textContent(),'PRIME VIDEO');
+    assert.equal(await sportsFx.page.locator('#hero-kicker').textContent(),'SUGGESTED FOR NFL');
+    assert.match(await sportsFx.page.locator('#hero-description').textContent(),/Thursday Night Football/);
+    assert.deepEqual(await sportsFx.page.locator('#hero-tags > span').allTextContents(),['Season Sep–Feb','Exit in February','Press OK for options']);
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').click();
+    assert.equal(await sportsFx.page.locator('#panel-title').textContent(),'Get Prime Video for NFL?');
+    await sportsFx.page.locator('#suggest-install').click();
+    await sportsFx.page.waitForFunction(() => window.fixtureLaunches.length === 1);
+    // Opening the store records only a pending intent; seasonalInstalls stays empty until installation is confirmed.
+    assert.deepEqual(await sportsFx.page.evaluate(() => [
+      window.fixtureLaunches[0],
+      JSON.parse(localStorage.getItem('baaz.sports.v1')).seasonalInstalls,
+      JSON.parse(localStorage.getItem('baaz.sports.pending.v1'))
+    ]),[{id:'com.webos.app.discovery'},{},{amazon:true}]);
+    // Returning from the store while download is still unfinished retains the pending flag without marking seasonalInstalls prematurely.
+    await sportsFx.page.evaluate(() => { window.dispatchEvent(new PageTransitionEvent('pageshow')); });
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').waitFor();
+    assert.deepEqual(await sportsFx.page.evaluate(() => [
+      JSON.parse(localStorage.getItem('baaz.sports.v1')).seasonalInstalls,
+      JSON.parse(localStorage.getItem('baaz.sports.pending.v1'))
+    ]),[{},{amazon:true}]);
+    // Completing the Prime Video install later promotes the retained pending intent to seasonalInstalls on resume via visibilitychange.
+    await sportsFx.page.evaluate(() => {
+      window.fixtureSetHidden(true);
+      window.fixtureInstalled.push({id:'amazon',title:'Prime Video',type:'web',visible:true,removable:true,systemApp:false});
+      window.fixtureSetHidden(false);
+    });
+    await sportsFx.page.waitForFunction(() => JSON.parse(localStorage.getItem('baaz.sports.v1')).seasonalInstalls.amazon === true);
+    assert.deepEqual(await sportsFx.page.evaluate(() => JSON.parse(localStorage.getItem('baaz.sports.v1')).autoRemove),{});
+    assert.equal(await sportsFx.page.evaluate(() => typeof JSON.parse(localStorage.getItem('baaz.sports.v1')).installTokens.amazon),'string');
+    assert.equal(await sportsFx.page.evaluate(() => localStorage.getItem('baaz.sports.pending.v1')),null);
+    // If Prime Video is later uninstalled, reconcileSeasonalInventory clears seasonalInstalls and restores the suggestion.
+    await sportsFx.page.evaluate(() => {
+      window.fixtureInstalled = window.fixtureInstalled.filter(app => app.id !== 'amazon');
+      window.dispatchEvent(new PageTransitionEvent('pageshow'));
+    });
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').waitFor();
+    assert.deepEqual(await sportsFx.page.evaluate(() => JSON.parse(localStorage.getItem('baaz.sports.v1')).seasonalInstalls),{});
+    // Dismissing a suggestion clears any unfinished pending store intent and suppresses the suggestion for the season.
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').click();
+    await sportsFx.page.locator('#suggest-install').click();
+    await sportsFx.page.waitForFunction(() => window.fixtureLaunches.length === 2);
+    assert.deepEqual(await sportsFx.page.evaluate(() => JSON.parse(localStorage.getItem('baaz.sports.pending.v1'))),{amazon:true});
+    await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').click();
+    await sportsFx.page.locator('#suggest-dismiss').click();
+    assert.equal(await sportsFx.page.evaluate(() => localStorage.getItem('baaz.sports.pending.v1')),null);
+    assert.equal(await sportsFx.page.locator('#dock [data-suggestion-id="amazon"]').count(),0);
+    // Following an out-of-season sport (Tennis Jun-Sep) when its carrier (Sling TV) is absent leaves pendingStoreInstalls and seasonalInstalls empty,
+    // and resuming Home on visibilitychange re-evaluates followed sports.
+    await sportsFx.page.locator('#preferences-open').click();
+    await sportsFx.page.locator('#sports-open').click();
+    await sportsFx.page.locator('[data-follow-sport="tennis"]').click();
+    await key(sportsFx.page,461); await key(sportsFx.page,461);
+    const refreshesBeforeResume = await sportsFx.page.evaluate(() => window.fixtureRequests.filter(c => c.uri.endsWith('/listApps')).length);
+    await sportsFx.page.evaluate(() => {
+      window.fixtureSetHidden(true);
+      window.fixtureSetHidden(false);
+    });
+    await sportsFx.page.waitForFunction(prev => window.fixtureRequests.filter(c => c.uri.endsWith('/listApps')).length > prev, refreshesBeforeResume);
+    assert.notEqual(await sportsFx.page.locator('#weather-label').textContent(), 'Weather unavailable');
+    // MLB is off-season in January and Apple TV is installed + removable -> season-end exit tile and one-click cleanup.
+    await sportsFx.page.locator('#preferences-open').click();
+    await sportsFx.page.locator('#sports-open').click();
+    await sportsFx.page.locator('[data-follow-sport="mlb"]').click();
+    await key(sportsFx.page,461); await key(sportsFx.page,461);
+    assert.equal(await sportsFx.page.locator('#dock [data-suggestion-id="com.apple.appletv"][data-suggestion-kind="exit"]').count(),1);
+    await sportsFx.page.locator('#dock [data-suggestion-id="com.apple.appletv"]').focus();
+    assert.equal(await sportsFx.page.locator('#hero-kicker').textContent(),'MLB SEASON ENDED');
+    assert.match(await sportsFx.page.locator('#hero-description').textContent(),/MLB season ended in November/);
+    await sportsFx.page.locator('#dock [data-suggestion-id="com.apple.appletv"]').click();
+    assert.equal(await sportsFx.page.locator('#panel-title').textContent(),'MLB season ended · Remove Apple TV?');
+    assert.equal(await sportsFx.page.evaluate(() => document.activeElement.id),'exit-keep');
+    await sportsFx.page.locator('#delete-confirm').click();
+    await sportsFx.page.waitForFunction(() => document.querySelector('#toast').textContent === 'Apple TV deleted.');
+    assert.deepEqual(await sportsFx.page.evaluate(() => window.fixtureRemovals),[{id:'com.apple.appletv'}]);
+    assert.equal(await sportsFx.page.locator('#dock [data-suggestion-id="com.apple.appletv"], #dock [data-app-id="com.apple.appletv"]').count(),0);
+    await sportsFx.context.close();
+
+    // Seasonal exit deletion interrupted by pagehide/pageshow recovers its dialog controls instead of staying stuck on Deleting...
+    const heldExit = await fixture(browser, {inventory:['netflix','com.apple.appletv','com.webos.app.discovery','com.webos.app.tinybrowser'], deleteMode:'hold'});
+    await heldExit.page.locator('#preferences-open').click();
+    await heldExit.page.locator('#sports-open').click();
+    await heldExit.page.locator('[data-follow-sport="mlb"]').click();
+    await key(heldExit.page,461); await key(heldExit.page,461);
+    await heldExit.page.locator('#dock [data-suggestion-id="com.apple.appletv"]').click();
+    await heldExit.page.locator('#delete-confirm').click();
+    await heldExit.page.waitForFunction(() => window.fixtureRemovals.length === 1);
+    assert.equal(await heldExit.page.locator('#delete-confirm').textContent(),'Deleting...');
+    assert.equal(await heldExit.page.locator('#delete-confirm').isDisabled(),true);
+    assert.equal(await heldExit.page.locator('#exit-keep').isDisabled(),true);
+    await heldExit.page.evaluate(() => {
+      window.dispatchEvent(new PageTransitionEvent('pagehide'));
+      window.dispatchEvent(new PageTransitionEvent('pageshow'));
+    });
+    await heldExit.page.locator('#delete-confirm:not(:disabled)').waitFor();
+    assert.equal(await heldExit.page.locator('#delete-confirm').textContent(),'Delete Apple TV');
+    assert.equal(await heldExit.page.locator('#exit-keep').isDisabled(),false);
+    assert.match(await heldExit.page.locator('#toast').textContent(),/App deletion was interrupted/);
+    await heldExit.context.close(); groups++;
+
     if (process.argv[2]) {
       const shots = await fixture(browser), dir = path.resolve(process.argv[2]);
       for (const [name,index] of [['listening',1],['thinking',3],['confirm',5],['done',6],['cannot',9]]) {

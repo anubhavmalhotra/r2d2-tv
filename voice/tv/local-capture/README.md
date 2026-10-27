@@ -17,6 +17,7 @@ A held press is released at its 9.2-second hold limit (`controller.js` `HOLD_MS`
 | `supervised_provider.js`, `legacy_provider.js` | Held native image, child protocol, PCM draining, and final receipts |
 | `power_reader.js` | Bounded default-identity power query; unknown/stale power refuses capture |
 | `voice_feedback.js` | Physical-press phase pings, surface-aware toasts and Spark receipts; feedback only |
+| `tv_maintenance.js` | Always-on local DSP auto voice leveling, 24/7 LG telemetry block, and nightly/idle app maintenance |
 | `quiescence.js` | Current-boot competing-owner checks |
 | Native C/C++ sources | Exact-build provider hooks and syscall supervision |
 
@@ -143,6 +144,51 @@ The owner refuses every new capture while a previous one might still be live
   `/usr/bin/luna-send` (`com.webos.notification/createToast`): the owner's
   LS2 role allows only `bluetooth2` and `tvpower`. No transcript or free text
   is sent, logged or shown.
+
+## Auto voice leveling and TV maintenance
+
+`tv_maintenance.js` runs alongside the resident capture owner and enforces
+always-on dialogue leveling, a 24/7 LG telemetry block, and scheduled/idle TV
+app updates:
+
+- **Hardware DSP voice leveling (`createAutoVoiceLevelingEnforcer`)**: Keeps
+  webOS Automatic Volume Leveler (`autoVolume: "on"`, with boolean `true`
+  fallback) and local hardware DSP Clear Voice dialogue enhancement
+  (`PREFERRED_VOICE_SOUND_MODES`: `clearVoice`, `clearVoicePro`,
+  `clearVoiceIII`, `clearVoiceIV`) active across every TV app via
+  `luna://com.webos.settingsservice/setSystemSettings` (`category: "sound"`).
+  It inspects current settings before mutating and issues zero Luna calls on
+  steady-state polls when already enforced.
+- **Boot, wake, app-switch, and post-splash rechecks**: Enforces voice leveling
+  immediately on TV boot, on wake from standby, on every foreground app change,
+  on a `7 s` delayed post-switch recheck (`DEFAULT_POST_SWITCH_RECHECK_DELAY_MS`
+  to catch streaming apps that reset audio pipeline settings after their splash
+  screen), every `60 s` while the TV is active
+  (`DEFAULT_VOICE_LEVELING_RECHECK_MS`), and after maintenance runs.
+- **Zero-telemetry LG guard**: AI and cloud-linked sound modes (`aiSound`,
+  `aiSoundPro`) are excluded (`FALLBACK_VOICE_SOUND_MODES = []`). In addition,
+  `createAutoVoiceLevelingEnforcer` is hard-gated on
+  `isLgServerBlocked() === true` and a closed App Store maintenance window
+  (`!lgNetworkGuard.isWindowOpen()`). Unless the 24/7 LG telemetry block
+  (`/etc/hosts` sinkhole plus kernel unreachable routes covering LG SDP, ACR,
+  ad, recommendation, `lgtvcommon.com`, `rdx.lgtvsdp.com`, and
+  `common.lgappstv.com` endpoints) is verified active, the enforcer refuses to
+  read or write `com.webos.settingsservice` and reports
+  `status: "deferred-until-lg-blocked"`.
+- **Persistence and observability**: Writes state atomically (`0600`) to
+  `/var/lib/local.owner.r2d2mic/voice-leveling-state.json` and reports
+  `voiceLeveling` in maintenance receipts, resident status headers
+  (`X-R2D2-Voice-Leveling` and `|vl=on` in `X-R2D2-Hidraw`), and Spark's
+  `voice/agent/nightly_maintenance.py` (`tvVoiceLeveling`).
+- **Seasonal sports app suggestions and off-season cleanup (`evaluateSeasonalSports`, `runSeasonalAppCleanup`)**:
+  Pairs with Home's `Sports & seasons` preferences (`baaz.sports.v1`) across a
+  curated 9-sport catalog (`nfl`, `nba`, `mlb`, `nhl`, `f1`, `soccer`, `mls`,
+  `cricket`, `tennis`). When a followed sport is in season and its carrier app is
+  missing, Home surfaces a dock suggestion with the reason and season exit month;
+  when all followed sports carried by an app are out of season, Home prompts to
+  remove or keep it, and `runSeasonalAppCleanup` removes tracked seasonal
+  installs during idle/nightly maintenance once confirmed absent from
+  `listApps`.
 
 ## Checks
 

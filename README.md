@@ -23,7 +23,7 @@ Reference deployment on one TV/firmware: Home, the browser, and remote voice com
 ## How it fits together
 
 - **Compute host** (`spark/` in paths): an aarch64 Linux machine. It renders a sandboxed Chromium session in a private display and audio session and streams it to the TV over the LAN. It also runs the local speech recognition and intent models and a closed command registry.
-- **TV** (`tv/`, `voice/tv/`): the Home application and the browser viewer, which sends remote input back to the host. A root capture owner takes the remote's voice key and sends bounded audio to the host over mutual TLS.
+- **TV** (`tv/`, `voice/tv/`): the Home application (with optional seasonal sports app suggestions that explain why an app is suggested and offer season-end cleanup) and the browser viewer, which sends remote input back to the host. A root capture owner takes the remote's voice key and sends bounded audio to the host over mutual TLS, while `tv_maintenance.js` enforces always-on local DSP auto voice leveling (`autoVolume` and `clearVoice` dialogue clarity), maintains a 24/7 OS-level LG telemetry block, and runs scheduled/idle app updates and off-season app cleanup.
 - **Content protection** (`protection/`): pinned filter rules loaded into each disposable browser profile.
 
 Model inference stays on the host. Requested websites, searches, streaming apps, and optional weather still contact their providers; see [SECURITY.md](SECURITY.md).

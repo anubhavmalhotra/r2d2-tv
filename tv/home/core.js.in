@@ -275,6 +275,220 @@
     apps.forEach(function (a) { if (a.visible) byId[a.id] = a; });
     return ids.filter(function (id) { if (typeof id !== "string" || !byId[id] || seen[id]) return false; seen[id] = true; return true; }).slice(0, 12);
   }
-  root.OwnerCore = {Service: Service, VoiceFeed: VoiceFeed, normalize: normalize, selectFavorites: selectFavorites, voiceValue: voiceValue, weatherValue: weatherValue, uris: {list: LIST, launch: LAUNCH}};
+
+  var MONTH_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  var MONTH_LONG = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+  function isMonthInSportSeason(sport, month) {
+    if (!sport || !Number.isInteger(sport.startMonth) || !Number.isInteger(sport.endMonth) || sport.startMonth < 1 || sport.startMonth > 12 || sport.endMonth < 1 || sport.endMonth > 12) return false;
+    return sport.startMonth <= sport.endMonth ? month >= sport.startMonth && month <= sport.endMonth : month >= sport.startMonth || month <= sport.endMonth;
+  }
+
+  function isSportInSeason(sport, date) {
+    if (!sport || !Number.isInteger(sport.startMonth) || !Number.isInteger(sport.endMonth) || sport.startMonth < 1 || sport.startMonth > 12 || sport.endMonth < 1 || sport.endMonth > 12) return false;
+    var d = date instanceof Date ? date : new Date(date !== undefined ? date : Date.now());
+    if (!Number.isFinite(d.getTime())) return false;
+    return isMonthInSportSeason(sport, d.getUTCMonth() + 1);
+  }
+
+  function combinedGroupSeason(group, date) {
+    var list = Array.isArray(group) ? group : [];
+    if (!list.length) return {yearRound: false, season: "", endMonthName: null};
+    if (list.length === 1) {
+      var single = list[0];
+      var singleAllMonths = single.startMonth === 1 && single.endMonth === 12;
+      return {yearRound: singleAllMonths, season: singleAllMonths ? "Year-round" : single.season, endMonthName: singleAllMonths ? null : single.endMonthName};
+    }
+    var activeMonths = Object.create(null), coveredCount = 0;
+    for (var m = 1; m <= 12; m++) {
+      if (list.some(function (s) { return isMonthInSportSeason(s, m); })) {
+        activeMonths[m] = true;
+        coveredCount++;
+      }
+    }
+    if (coveredCount === 12) {
+      return {yearRound: true, season: "Year-round", endMonthName: null};
+    }
+    var d = date instanceof Date ? date : new Date(date !== undefined ? date : Date.now());
+    var curMonth = Number.isFinite(d.getTime()) ? d.getUTCMonth() + 1 : list[0].startMonth;
+    var anchor = activeMonths[curMonth] ? curMonth : list[0].startMonth;
+    var startM = anchor, endM = anchor;
+    for (var i = 0; i < 12; i++) {
+      var prevM = ((startM + 10) % 12) + 1;
+      if (!activeMonths[prevM]) break;
+      startM = prevM;
+    }
+    for (var j = 0; j < 12; j++) {
+      var nextM = (endM % 12) + 1;
+      if (!activeMonths[nextM]) break;
+      endM = nextM;
+    }
+    return {
+      yearRound: false,
+      season: MONTH_SHORT[startM - 1] + "\u2013" + MONTH_SHORT[endM - 1],
+      endMonthName: MONTH_LONG[endM - 1]
+    };
+  }
+
+  function sportCycleKey(sport, date, inSeason) {
+    if (!sport || typeof sport.id !== "string") return "";
+    var d = date instanceof Date ? date : new Date(date !== undefined ? date : Date.now());
+    if (!Number.isFinite(d.getTime())) return "";
+    var year = d.getUTCFullYear(), month = d.getUTCMonth() + 1;
+    var active = typeof inSeason === "boolean" ? inSeason : isSportInSeason(sport, d);
+    if (sport.startMonth <= sport.endMonth) {
+      return sport.id + (active ? ":in:" + year : ":off:" + (month < sport.startMonth ? year - 1 : year));
+    }
+    return sport.id + (active ? ":in:" + (month >= sport.startMonth ? year : year - 1) : ":off:" + year);
+  }
+
+  function normalizeSportsState(raw, catalog) {
+    var parsed = raw;
+    if (typeof raw === "string") { try { parsed = JSON.parse(raw); } catch (_) { parsed = null; } }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) parsed = {};
+    var validSports = Object.create(null), validApps = Object.create(null);
+    if (catalog && Array.isArray(catalog.sports)) catalog.sports.forEach(function (s) { if (s && typeof s.id === "string") validSports[s.id] = true; });
+    if (catalog && Array.isArray(catalog.library)) catalog.library.forEach(function (id) { if (typeof id === "string") validApps[id] = true; });
+    var followed = [], seenFollowed = Object.create(null);
+    if (Array.isArray(parsed.followed)) {
+      parsed.followed.forEach(function (id) {
+        if (typeof id === "string" && validSports[id] && !seenFollowed[id]) { seenFollowed[id] = true; followed.push(id); }
+      });
+    }
+    var dismissed = Object.create(null), kept = Object.create(null), seasonalInstalls = Object.create(null), autoRemove = Object.create(null), installTokens = Object.create(null);
+    if (parsed.dismissed && typeof parsed.dismissed === "object" && !Array.isArray(parsed.dismissed)) {
+      Object.keys(parsed.dismissed).forEach(function (k) {
+        var parts = k.split(":");
+        if (parts.length === 3 && validSports[parts[0]] && parts[1] === "in" && /^\d{4}$/.test(parts[2]) && parsed.dismissed[k] === true) dismissed[k] = true;
+      });
+    }
+    if (parsed.kept && typeof parsed.kept === "object" && !Array.isArray(parsed.kept)) {
+      Object.keys(parsed.kept).forEach(function (k) {
+        var parts = k.split(":");
+        if (parts.length === 3 && validSports[parts[0]] && parts[1] === "off" && /^\d{4}$/.test(parts[2]) && parsed.kept[k] === true) kept[k] = true;
+      });
+    }
+    if (parsed.seasonalInstalls && typeof parsed.seasonalInstalls === "object" && !Array.isArray(parsed.seasonalInstalls)) {
+      Object.keys(parsed.seasonalInstalls).forEach(function (id) {
+        if (validApps[id] && parsed.seasonalInstalls[id] === true) seasonalInstalls[id] = true;
+      });
+    }
+    if (parsed.autoRemove && typeof parsed.autoRemove === "object" && !Array.isArray(parsed.autoRemove)) {
+      Object.keys(parsed.autoRemove).forEach(function (id) {
+        if (validApps[id] && seasonalInstalls[id] && parsed.autoRemove[id] === true) autoRemove[id] = true;
+      });
+    }
+    if (parsed.installTokens && typeof parsed.installTokens === "object" && !Array.isArray(parsed.installTokens)) {
+      Object.keys(parsed.installTokens).forEach(function (id) {
+        var tok = parsed.installTokens[id];
+        if (validApps[id] && seasonalInstalls[id] && (typeof tok === "string" || typeof tok === "number") && String(tok).trim().length > 0 && String(tok).length <= 64) {
+          installTokens[id] = String(tok).trim();
+        }
+      });
+    }
+    return {followed: followed, dismissed: dismissed, kept: kept, seasonalInstalls: seasonalInstalls, autoRemove: autoRemove, installTokens: installTokens};
+  }
+
+  function evaluateSports(apps, catalog, rawState, date) {
+    var state = normalizeSportsState(rawState, catalog);
+    var d = date instanceof Date ? date : new Date(date !== undefined ? date : Date.now());
+    var catalogSports = catalog && Array.isArray(catalog.sports) ? catalog.sports : [];
+    var librarySet = Object.create(null), byAppId = Object.create(null), brandById = Object.create(null);
+    if (catalog && Array.isArray(catalog.library)) catalog.library.forEach(function (id) { librarySet[id] = true; });
+    if (catalog && Array.isArray(catalog.favorites)) catalog.favorites.forEach(function (b) { if (b && b.id) brandById[b.id] = b; });
+    (Array.isArray(apps) ? apps : []).forEach(function (a) { if (a && a.visible && typeof a.id === "string") byAppId[a.id] = a; });
+
+    var byAppFollowed = Object.create(null), appOrder = [];
+    var evaluatedSports = catalogSports.map(function (sport) {
+      var inSeason = isSportInSeason(sport, d);
+      var cycleKey = sportCycleKey(sport, d, inSeason);
+      var followed = state.followed.indexOf(sport.id) !== -1;
+      var installed = byAppId[sport.appId] || null;
+      var removable = !!(installed && installed.removable === true && installed.systemApp === false && librarySet[sport.appId] && sport.appId !== catalog.appId && sport.appId !== BROWSER_APP);
+      var brand = brandById[sport.appId] || {id: sport.appId, title: sport.appId, mark: sport.appId, tone: "utility"};
+      var entry = {
+        id: sport.id, title: sport.title, name: sport.name || sport.title, mark: sport.mark || sport.title,
+        appId: sport.appId, appTitle: brand.title, appMark: brand.mark, appTone: brand.tone,
+        startMonth: sport.startMonth, endMonth: sport.endMonth, season: sport.season, endMonthName: sport.endMonthName,
+        headline: sport.headline, reason: sport.reason, exit: sport.exit,
+        inSeason: inSeason, cycleKey: cycleKey, followed: followed,
+        carrierInstalled: !!installed, carrierRemovable: removable, status: "unfollowed"
+      };
+      if (followed) {
+        if (!byAppFollowed[sport.appId]) { byAppFollowed[sport.appId] = []; appOrder.push(sport.appId); }
+        byAppFollowed[sport.appId].push(entry);
+      }
+      return entry;
+    });
+
+    var suggestions = [], exits = [];
+    appOrder.forEach(function (appId) {
+      var group = byAppFollowed[appId];
+      var combined = combinedGroupSeason(group, d);
+      var groupTitle = group.map(function (s) { return s.title; }).join(" & ");
+      group.forEach(function (s) {
+        s.yearRound = combined.yearRound;
+        s.effectiveSeason = combined.season;
+        s.effectiveEndMonthName = combined.endMonthName;
+      });
+      var inSeasonGroup = group.filter(function (s) { return s.inSeason; });
+      var offSeasonGroup = group.filter(function (s) { return !s.inSeason; });
+      var installed = byAppId[appId] || null;
+      var brand = brandById[appId] || {id: appId, title: appId, mark: appId, tone: "utility"};
+      if (!installed && inSeasonGroup.length > 0) {
+        var activeSuggest = inSeasonGroup.filter(function (s) { return !state.dismissed[s.cycleKey]; });
+        if (activeSuggest.length > 0) {
+          var firstS = activeSuggest[0];
+          var sTitle = activeSuggest.map(function (s) { return s.title; }).join(" & ");
+          var sReason = activeSuggest.length === 1 ? firstS.reason : "You follow " + sTitle + " (" + combined.season + "). " + brand.title + " carries live coverage for both.";
+          var sExit = combined.yearRound
+            ? "Year-round coverage: " + groupTitle + " span the full year on " + brand.title + ". Unfollow a sport anytime in Sports & seasons to enable off-season cleanup."
+            : "Exit plan: R2D2 will offer to remove " + brand.title + " when " + (group.length > 1 ? "your " + groupTitle + " coverage" : "the " + sTitle + " season") + " ends in " + combined.endMonthName + ".";
+          suggestions.push({
+            kind: "suggest", appId: appId, appTitle: brand.title, mark: brand.mark, tone: brand.tone,
+            sports: activeSuggest.map(function (s) { return s.id; }), sportTitle: sTitle,
+            season: combined.season, endMonthName: combined.endMonthName, yearRound: combined.yearRound,
+            headline: firstS.headline, reason: sReason, exit: sExit,
+            cycleKeys: activeSuggest.map(function (s) { return s.cycleKey; })
+          });
+        }
+      } else if (installed && inSeasonGroup.length === 0 && offSeasonGroup.length > 0 && offSeasonGroup[0].carrierRemovable) {
+        var activeExit = offSeasonGroup.filter(function (s) { return !state.kept[s.cycleKey]; });
+        if (activeExit.length > 0) {
+          var firstE = activeExit[0];
+          var eTitle = activeExit.map(function (s) { return s.title; }).join(" & ");
+          var eReason = activeExit.length === 1 ? firstE.exit : eTitle + " seasons have ended. Remove " + brand.title + " until next season?";
+          exits.push({
+            kind: "exit", appId: appId, appTitle: brand.title, mark: brand.mark, tone: brand.tone,
+            sports: activeExit.map(function (s) { return s.id; }), sportTitle: eTitle,
+            season: combined.season, endMonthName: combined.endMonthName, yearRound: false,
+            headline: "Season ended.\nClean up?", reason: eReason, exit: eReason,
+            cycleKeys: activeExit.map(function (s) { return s.cycleKey; }),
+            seasonalInstall: !!state.seasonalInstalls[appId],
+            autoRemove: !!(state.seasonalInstalls[appId] && state.autoRemove[appId])
+          });
+        }
+      }
+    });
+
+    evaluatedSports.forEach(function (entry) {
+      if (!entry.followed) { entry.status = "unfollowed"; return; }
+      var group = byAppFollowed[entry.appId] || [];
+      var anyInSeason = group.some(function (s) { return s.inSeason; });
+      if (entry.inSeason) {
+        if (entry.carrierInstalled) entry.status = "installed-active";
+        else if (state.dismissed[entry.cycleKey]) entry.status = "dismissed";
+        else entry.status = "suggested";
+      } else {
+        if (!entry.carrierInstalled) entry.status = "off-season";
+        else if (!entry.carrierRemovable || anyInSeason || state.kept[entry.cycleKey]) entry.status = "kept";
+        else entry.status = "exit-ready";
+      }
+    });
+
+    return {state: state, sports: evaluatedSports, suggestions: suggestions, exits: exits, items: suggestions.concat(exits)};
+  }
+
+  root.OwnerCore = {Service: Service, VoiceFeed: VoiceFeed, normalize: normalize, selectFavorites: selectFavorites, isSportInSeason: isSportInSeason, sportCycleKey: sportCycleKey, normalizeSportsState: normalizeSportsState, evaluateSports: evaluateSports, voiceValue: voiceValue, weatherValue: weatherValue, uris: {list: LIST, launch: LAUNCH}};
   if (typeof module !== "undefined" && module.exports) module.exports = root.OwnerCore;
 }(typeof window !== "undefined" ? window : globalThis));

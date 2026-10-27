@@ -5,7 +5,7 @@ The TV side connects the remote's voice key to bounded local capture and encrypt
 | Path | Purpose |
 | --- | --- |
 | `patch_firmware.py` | Exact-source early keyfilter patch |
-| `local-capture/` | Capture owner, key lifecycle, native provider, and supervision |
+| `local-capture/` | Capture owner, key lifecycle, native provider, supervision, auto voice leveling, and TV maintenance |
 | `transport/` | Mutual TLS PCM client and provider adapter |
 | `decoder/` | Standalone mSBC report decoder |
 | `resident_mic.js`, `resident_hid.js`, `owner_key.js` | Alternative direct-HID implementation |
@@ -21,4 +21,5 @@ The [offline CI workflow](../../.github/workflows/offline.yml) runs the TV JavaS
 python3 -B -m unittest discover -s voice/tv/local-capture -p 'test_*.py'
 node voice/tv/local-capture/test_controller.js
 node voice/tv/local-capture/test_release_drain.js
+node voice/tv/local-capture/test_tv_maintenance.js
 ```

@@ -5,6 +5,7 @@
   var chromiumSelected = false, browserState = "checking", browserChecking = false, browserGeneration = 0, inventoryReady = false;
   var apps = [], selectedId = null, panel = null, busy = false, refreshSequence = 0, toastTimer, lastFocus = null;
   var deleteCandidate = null, removalPending = false, removalInterrupted = false, removalGeneration = 0, manageFocusId = null, pulseButton, pulseTimer;
+  var sportsState = window.OwnerCore.normalizeSportsState(null, catalog), pendingStoreInstalls = Object.create(null), selectedSuggestionId = null, activeSeasonal = null, sportReturnPanel = null, sportFocusId = null, lastSeasonalMonth = null, installTokenSeq = 0;
   var $ = function (id) { return document.getElementById(id); };
   var dockIds = ["netflix", "com.apple.appletv", "com.tubitv.ott.tubi", null, "youtube.leanback.v4", "amazon", "com.disney.disneyplus-prod"];
   function appById(id) { return apps.find(function (app) { return app.id === id; }); }
@@ -13,6 +14,66 @@
   function resize() { document.documentElement.style.setProperty("--scale", String(Math.min(window.innerWidth / 1920, window.innerHeight / 1080))); }
   resize(); window.addEventListener("resize", resize);
   try { document.body.classList.toggle("calm", localStorage.getItem("baaz.calm.v1") === "true"); } catch (_) {}
+  try { sportsState = window.OwnerCore.normalizeSportsState(localStorage.getItem("baaz.sports.v1"), catalog); } catch (_) {}
+  try {
+    var rawPending = JSON.parse(localStorage.getItem("baaz.sports.pending.v1") || "null");
+    if (rawPending && typeof rawPending === "object" && !Array.isArray(rawPending)) {
+      Object.keys(rawPending).forEach(function (id) {
+        if (catalog.library.indexOf(id) !== -1 && (rawPending[id] === true || rawPending[id] === "auto")) pendingStoreInstalls[id] = rawPending[id];
+      });
+    }
+  } catch (_) {}
+  function saveSportsState() {
+    sportsState = window.OwnerCore.normalizeSportsState(sportsState, catalog);
+    try { localStorage.setItem("baaz.sports.v1", JSON.stringify(sportsState)); } catch (_) {}
+  }
+  function savePendingStoreInstalls() {
+    var keys = Object.keys(pendingStoreInstalls);
+    try {
+      if (keys.length) localStorage.setItem("baaz.sports.pending.v1", JSON.stringify(pendingStoreInstalls));
+      else localStorage.removeItem("baaz.sports.pending.v1");
+    } catch (_) {}
+  }
+  function reconcileSeasonalInventory() {
+    var stateChanged = false, pendingChanged = false, pendingKeys = Object.keys(pendingStoreInstalls), now = new Date();
+    if (pendingKeys.length) {
+      pendingKeys.forEach(function (appId) {
+        var pendingMode = pendingStoreInstalls[appId];
+        var installedApp = appById(appId);
+        var activeForApp = catalog.sports && catalog.sports.some(function (s) {
+          if (s.appId !== appId || sportsState.followed.indexOf(s.id) === -1 || !window.OwnerCore.isSportInSeason(s, now)) return false;
+          var ck = window.OwnerCore.sportCycleKey(s, now, true);
+          return !sportsState.dismissed[ck];
+        });
+        if (!activeForApp) {
+          delete pendingStoreInstalls[appId];
+          pendingChanged = true;
+        } else if (installedApp) {
+          if (removable(installedApp)) {
+            sportsState.seasonalInstalls[appId] = true;
+            sportsState.installTokens[appId] = String(now.getTime()) + "-" + String(++installTokenSeq);
+            if (pendingMode === "auto") sportsState.autoRemove[appId] = true;
+            else delete sportsState.autoRemove[appId];
+            stateChanged = true;
+          }
+          delete pendingStoreInstalls[appId];
+          pendingChanged = true;
+        }
+      });
+      if (pendingChanged) savePendingStoreInstalls();
+    }
+    Object.keys(sportsState.seasonalInstalls).forEach(function (appId) {
+      if (!appById(appId)) {
+        delete sportsState.seasonalInstalls[appId];
+        delete sportsState.autoRemove[appId];
+        delete sportsState.installTokens[appId];
+        stateChanged = true;
+      }
+    });
+    if (stateChanged) saveSportsState();
+  }
+  function currentSports() { return window.OwnerCore.evaluateSports(apps, catalog, sportsState, new Date()); }
+  function seasonalById(appId) { return currentSports().items.find(function (item) { return item.appId === appId; }); }
 
   function notice(message) { clearTimeout(toastTimer); $("toast").textContent = message; $("toast").hidden = false; toastTimer = setTimeout(function () { $("toast").hidden = true; }, 3800); }
   function focusables() {
@@ -103,9 +164,9 @@
       browserChecking = false; browserState = state; renderBrowser();
     });
   }
-  function selectChromium() { chromiumSelected = true; selectedId = null; renderBrowser(); checkBrowser(); }
+  function selectChromium() { chromiumSelected = true; selectedId = null; selectedSuggestionId = null; renderBrowser(); checkBrowser(); }
   function openBrowser() {
-    chromiumSelected = true; selectedId = null;
+    chromiumSelected = true; selectedId = null; selectedSuggestionId = null;
     if (busy) return;
     if (!service.browserAvailable()) { browserState = "unavailable"; renderBrowser(); notice("The Spark browser connection is unavailable."); return; }
     busy = true; browserChecking = false; ++browserGeneration; browserState = "starting"; renderBrowser(); notice("Opening R2D2 Browser...");
@@ -125,13 +186,57 @@
   function selectHero(id) {
     var app = appById(id), brand = brandById(id);
     if (!app || !brand) return;
-    chromiumSelected = false; selectedId = id;
+    chromiumSelected = false; selectedId = id; selectedSuggestionId = null;
     $("hero-brand").textContent = brand.title.toUpperCase();
     $("hero-kicker").textContent = "PICK YOUR NEXT ESCAPE";
     $("hero-title").textContent = brand.headline;
     $("hero-description").textContent = brand.description; fitLine($("hero-description"));
     $("hero-tags").replaceChildren(); voiceHint(id);
     [brand.tag || "Movies & series"].forEach(function (label) { var el = document.createElement("span"); el.textContent = label; $("hero-tags").appendChild(el); });
+  }
+  function selectSeasonalHero(appId) {
+    var item = seasonalById(appId);
+    if (!item) return;
+    chromiumSelected = false; selectedId = null; selectedSuggestionId = appId;
+    $("hero-brand").textContent = item.appTitle.toUpperCase();
+    $("hero-kicker").textContent = item.kind === "suggest" ? "SUGGESTED FOR " + item.sportTitle.toUpperCase() : item.sportTitle.toUpperCase() + " SEASON ENDED";
+    $("hero-title").textContent = item.headline;
+    $("hero-description").textContent = item.reason; fitLine($("hero-description"));
+    $("hero-tags").replaceChildren();
+    var tags = item.kind === "suggest"
+      ? (item.yearRound ? ["Year-round coverage", "Carried on " + item.appTitle, "Press OK for options"] : ["Season " + item.season, "Exit in " + item.endMonthName, "Press OK for options"])
+      : ["Season " + item.season + " ended", "Press OK to remove or keep"];
+    tags.forEach(function (label) { var el = document.createElement("span"); el.textContent = label; $("hero-tags").appendChild(el); });
+  }
+  function openSeasonalItem(appId, returnTo) {
+    if (removalPending || busy) return;
+    var item = seasonalById(appId);
+    if (!item) return;
+    activeSeasonal = item; sportReturnPanel = returnTo || null;
+    if (item.kind === "suggest") {
+      openPanel("sport-suggest");
+    } else {
+      deleteCandidate = {id: item.appId, title: item.appTitle, seasonalExit: true, cycleKeys: item.cycleKeys};
+      openPanel("sport-exit");
+    }
+  }
+  function seasonalButton(item) {
+    var brand = brandById(item.appId), button = document.createElement("button"), tile = document.createElement("span"), mark = document.createElement("span"), pill = document.createElement("span"), label = document.createElement("span");
+    button.className = "dock-button seasonal-button " + (brand ? brand.tone : "utility") + " seasonal-" + item.kind;
+    button.dataset.navrow = "dock"; button.dataset.suggestionId = item.appId; button.dataset.suggestionKind = item.kind;
+    button.disabled = removalPending;
+    button.setAttribute("aria-label", (item.kind === "suggest" ? "Suggested for " + item.sportTitle + ": Get " : item.sportTitle + " season ended: Clean up ") + item.appTitle);
+    tile.className = "tile"; mark.className = "seasonal-mark"; pill.className = "seasonal-pill";
+    if (logoFor(brand)) mark.appendChild(brandImage(brand));
+    else mark.textContent = brand ? brand.mark : item.appTitle;
+    pill.textContent = (item.kind === "suggest" ? "FOR " : "END · ") + item.sportTitle.toUpperCase();
+    tile.appendChild(mark); tile.appendChild(pill);
+    label.className = "dock-label"; label.textContent = item.appTitle + (item.kind === "suggest" ? " · Suggested" : " · Season ended");
+    button.appendChild(tile); button.appendChild(label);
+    button.addEventListener("focus", function () { selectSeasonalHero(item.appId); });
+    button.addEventListener("mouseenter", function () { selectSeasonalHero(item.appId); });
+    button.addEventListener("click", function () { openSeasonalItem(item.appId, null); });
+    return button;
   }
   function launch(id) {
     if (busy) return;
@@ -155,24 +260,35 @@
   function renderHome() {
     $("dock").replaceChildren();
     var shownApps = Object.create(null);
+    if (inventoryReady) {
+      var nowDate = new Date();
+      lastSeasonalMonth = nowDate.getUTCFullYear() * 12 + nowDate.getUTCMonth();
+    }
+    var evaluated = inventoryReady ? currentSports() : {items: [], exits: []};
+    var seasonalItems = evaluated.items, exitsById = Object.create(null);
+    evaluated.exits.forEach(function (item) { exitsById[item.appId] = item; });
     function append(id) {
       if (id === null) { $("dock").appendChild(chromiumTile()); return; }
       var app = appById(id);
       if (app && app.visible && !shownApps[id]) {
         shownApps[id] = true;
-        $("dock").appendChild(appButton(app,true));
+        if (!exitsById[id]) $("dock").appendChild(appButton(app,true));
       }
     }
-    // One collection: favorites first, then every remaining installed app once.
+    // One collection: favorites first, then every remaining installed app once, then active sports suggestions/exits.
     dockIds.forEach(append);
     catalog.library.forEach(append);
+    seasonalItems.forEach(function (item) { $("dock").appendChild(seasonalButton(item)); });
     var all = document.createElement("button"), tile = document.createElement("span"), label = document.createElement("span");
     all.className = "dock-button utility"; all.dataset.navrow = "dock"; all.id = "all-apps"; all.setAttribute("aria-label","All apps"); tile.className = "tile"; tile.appendChild(gridIcon()); label.className = "dock-label"; label.textContent = "All apps"; all.appendChild(tile); all.appendChild(label); all.addEventListener("click", function () { openPanel("apps"); }); $("dock").appendChild(all);
     Array.prototype.forEach.call($("dock").querySelectorAll(".dock-label"), fitLine);
-    var selected = appById(selectedId) || apps.find(function (app) { return app.visible && brandById(app.id); });
+    var selectedSeasonal = selectedSuggestionId && seasonalItems.find(function (item) { return item.appId === selectedSuggestionId; });
+    var selected = appById(selectedId) || (!selectedSeasonal && apps.find(function (app) { return app.visible && brandById(app.id); }));
     if (chromiumSelected) renderBrowser();
+    else if (selectedSeasonal) selectSeasonalHero(selectedSeasonal.appId);
     else if (selected) selectHero(selected.id);
-    else { selectedId = null; $("hero-brand").textContent = "R2D2"; $("hero-kicker").textContent = "PICK YOUR NEXT ESCAPE"; $("hero-title").textContent = "Your apps.\nYour space."; $("hero-description").textContent = "Everything you love, a little closer."; fitLine($("hero-description")); $("hero-tags").replaceChildren(); }
+    else if (seasonalItems.length) selectSeasonalHero(seasonalItems[0].appId);
+    else { selectedId = null; selectedSuggestionId = null; $("hero-brand").textContent = "R2D2"; $("hero-kicker").textContent = "PICK YOUR NEXT ESCAPE"; $("hero-title").textContent = "Your apps.\nYour space."; $("hero-description").textContent = "Everything you love, a little closer."; fitLine($("hero-description")); $("hero-tags").replaceChildren(); }
   }
   function visibleApps() { return apps.filter(function (app) { return app.visible; }); }
   function renderPanelApps(query) {
@@ -195,12 +311,14 @@
   function showPanelError(message) { $("panel-feedback").textContent = message; $("panel-feedback").hidden = false; }
   function renderManage() {
     $("panel-content").replaceChildren();
+    var exitsById = Object.create(null);
+    if (sportsState.followed.length) currentSports().exits.forEach(function (item) { exitsById[item.appId] = item; });
     visibleApps().forEach(function (app) {
-      var row = document.createElement("div"), icon = document.createElement("span"), copy = document.createElement("span"), title = document.createElement("strong"), detail = document.createElement("span"), brand = brandById(app.id);
+      var row = document.createElement("div"), icon = document.createElement("span"), copy = document.createElement("span"), title = document.createElement("strong"), detail = document.createElement("span"), brand = brandById(app.id), exitItem = exitsById[app.id];
       row.className = "manage-row"; row.dataset.manageId = app.id; icon.className = "manage-icon " + (brand ? brand.tone : "utility");
       if (logoFor(brand)) icon.appendChild(brandImage(brand));
       else if (brand) { icon.classList.add("manage-mark"); icon.textContent = brand.mark; }
-      copy.className = "manage-copy"; title.textContent = titleFor(app); detail.textContent = removable(app) ? "Installed app" : "Protected app"; copy.appendChild(title); copy.appendChild(detail); row.appendChild(icon); row.appendChild(copy);
+      copy.className = "manage-copy"; title.textContent = titleFor(app); detail.textContent = exitItem ? exitItem.sportTitle + " season ended · Ready to clean up" : removable(app) ? "Installed app" : "Protected app"; copy.appendChild(title); copy.appendChild(detail); row.appendChild(icon); row.appendChild(copy);
       if (removable(app)) {
         var button = localButton("Delete",function () {
           if (removalPending || busy) return;
@@ -217,6 +335,118 @@
     var detail = document.createElement("span"); detail.textContent = "Part of R2D2"; copy.appendChild(detail); browser.appendChild(copy);
     var protectedLabel = document.createElement("span"); protectedLabel.className = "protected-label"; protectedLabel.textContent = "Protected"; browser.appendChild(protectedLabel); $("panel-content").appendChild(browser);
   }
+  function toggleFollowSport(sportId) {
+    if (removalPending || busy) return;
+    var idx = sportsState.followed.indexOf(sportId), following = idx === -1;
+    if (following) {
+      sportsState.followed.push(sportId);
+      Object.keys(sportsState.dismissed).forEach(function (k) { if (k.indexOf(sportId + ":") === 0) delete sportsState.dismissed[k]; });
+      Object.keys(sportsState.kept).forEach(function (k) { if (k.indexOf(sportId + ":") === 0) delete sportsState.kept[k]; });
+    } else {
+      sportsState.followed.splice(idx, 1);
+      var unfollowedSport = catalog.sports && catalog.sports.find(function (s) { return s.id === sportId; });
+      if (unfollowedSport && unfollowedSport.appId) {
+        var stillFollowedForApp = catalog.sports.some(function (s) { return s.appId === unfollowedSport.appId && sportsState.followed.indexOf(s.id) !== -1; });
+        if (!stillFollowedForApp) {
+          delete sportsState.seasonalInstalls[unfollowedSport.appId];
+          delete sportsState.autoRemove[unfollowedSport.appId];
+          delete sportsState.installTokens[unfollowedSport.appId];
+          if (pendingStoreInstalls[unfollowedSport.appId]) {
+            delete pendingStoreInstalls[unfollowedSport.appId];
+            savePendingStoreInstalls();
+          }
+        }
+      }
+      selectedSuggestionId = null;
+    }
+    sportFocusId = sportId; saveSportsState(); renderHome();
+    if (panel === "sports") {
+      renderSports();
+      var target = Array.prototype.find.call($("panel-content").querySelectorAll("[data-follow-sport]"), function (b) { return b.dataset.followSport === sportId; });
+      focus(target || $("panel-close"));
+    }
+  }
+  function renderSports() {
+    $("panel-content").replaceChildren();
+    var evaluated = currentSports();
+    evaluated.sports.forEach(function (sport) {
+      var row = document.createElement("div"), icon = document.createElement("span"), copy = document.createElement("span"), title = document.createElement("strong"), detail = document.createElement("span"), actions = document.createElement("div");
+      row.className = "manage-row sport-row"; row.dataset.sportId = sport.id;
+      icon.className = "manage-icon sport-icon " + sport.appTone; icon.textContent = sport.mark;
+      copy.className = "manage-copy";
+      title.textContent = sport.name + " · " + sport.season + (sport.inSeason ? " · In season" : " · Off-season");
+      var exitMonth = sport.effectiveEndMonthName || sport.endMonthName;
+      if (sport.status === "suggested") detail.textContent = sport.reason + (sport.yearRound ? " Year-round coverage across your followed sports." : " Exit in " + exitMonth + ".");
+      else if (sport.status === "installed-active") detail.textContent = "Ready on " + sport.appTitle + (sport.yearRound ? " · Covered year-round across your followed sports." : " · R2D2 will offer cleanup when coverage ends in " + exitMonth + ".");
+      else if (sport.status === "exit-ready") detail.textContent = sport.exit;
+      else if (sport.status === "dismissed") detail.textContent = "Suggestion dismissed for this season · Carried on " + sport.appTitle + ".";
+      else if (sport.status === "kept") detail.textContent = "Keeping " + sport.appTitle + " during the off-season.";
+      else if (sport.status === "off-season") detail.textContent = "Off-season now · Carried on " + sport.appTitle + " (" + sport.season + ").";
+      else detail.textContent = "Carried on " + sport.appTitle + " · Follow for in-season suggestions and season-end cleanup.";
+      copy.appendChild(title); copy.appendChild(detail);
+      actions.className = "sport-actions";
+      if (inventoryReady && (sport.status === "suggested" || sport.status === "exit-ready")) {
+        var act = localButton(sport.status === "suggested" ? "Why & Get" : "Clean up", function () {
+          sportFocusId = sport.id; openSeasonalItem(sport.appId, "sports");
+        });
+        act.disabled = removalPending;
+        act.dataset.sportAction = sport.status === "suggested" ? "suggest" : "exit";
+        act.dataset.sportApp = sport.appId;
+        if (sport.status === "exit-ready") act.classList.add("delete-button");
+        actions.appendChild(act);
+      }
+      var followBtn = localButton(sport.followed ? "Following · On" : "Follow", function () { toggleFollowSport(sport.id); }, sport.followed);
+      followBtn.disabled = removalPending;
+      followBtn.dataset.followSport = sport.id;
+      followBtn.setAttribute("aria-label", (sport.followed ? "Following " : "Follow ") + sport.name);
+      actions.appendChild(followBtn);
+      row.appendChild(icon); row.appendChild(copy); row.appendChild(actions);
+      $("panel-content").appendChild(row);
+    });
+  }
+  function installSeasonalSuggestion() {
+    if (!activeSeasonal || activeSeasonal.kind !== "suggest" || busy || removalPending) return;
+    var item = activeSeasonal;
+    closePanel();
+    openStore(function () {
+      pendingStoreInstalls[item.appId] = true;
+      savePendingStoreInstalls();
+    });
+  }
+  function dismissSeasonalSuggestion() {
+    if (!activeSeasonal || activeSeasonal.kind !== "suggest" || busy || removalPending) return;
+    var item = activeSeasonal, returnTo = sportReturnPanel;
+    item.cycleKeys.forEach(function (k) { sportsState.dismissed[k] = true; });
+    if (pendingStoreInstalls[item.appId]) {
+      delete pendingStoreInstalls[item.appId];
+      savePendingStoreInstalls();
+    }
+    if (selectedSuggestionId === item.appId) selectedSuggestionId = null;
+    activeSeasonal = null; sportReturnPanel = null; saveSportsState(); renderHome();
+    if (returnTo === "sports") openPanel("sports"); else closePanel();
+    notice("Dismissed " + item.appTitle + " for this " + item.sportTitle + " season.");
+  }
+  function keepSeasonalApp() {
+    if (!activeSeasonal || activeSeasonal.kind !== "exit" || busy || removalPending) return;
+    var item = activeSeasonal, returnTo = sportReturnPanel;
+    item.cycleKeys.forEach(function (k) { sportsState.kept[k] = true; });
+    delete sportsState.seasonalInstalls[item.appId];
+    delete sportsState.autoRemove[item.appId];
+    delete sportsState.installTokens[item.appId];
+    if (selectedSuggestionId === item.appId) selectedSuggestionId = null;
+    deleteCandidate = null; activeSeasonal = null; sportReturnPanel = null; saveSportsState(); renderHome();
+    if (returnTo === "sports") openPanel("sports"); else closePanel();
+    notice("Keeping " + item.appTitle + ".");
+  }
+  function cancelSeasonalDelete() {
+    var returnTo = sportReturnPanel;
+    deleteCandidate = null; activeSeasonal = null; sportReturnPanel = null;
+    if (returnTo === "sports") {
+      openPanel("sports");
+      var prev = Array.prototype.find.call($("panel-content").querySelectorAll("[data-follow-sport]"), function (b) { return b.dataset.followSport === sportFocusId; });
+      focus(prev && !prev.disabled ? prev : $("panel-content").querySelector("button:not(:disabled)") || $("panel-close"));
+    } else closePanel();
+  }
   function cancelDelete() {
     deleteCandidate = null; openPanel("manage");
     var previous = Array.prototype.find.call($("panel-content").querySelectorAll("[data-delete-id]"),function (button) { return button.dataset.deleteId === manageFocusId; });
@@ -227,11 +457,20 @@
     var candidate = deleteCandidate, app = appById(candidate.id);
     if (!removable(app) || typeof service.removeApp !== "function") { showPanelError("This app cannot be deleted from R2D2."); return; }
     var generation = ++removalGeneration; removalPending = true; busy = true;
+    if ($("exit-keep")) $("exit-keep").disabled = true;
     $("delete-confirm").disabled = true; $("delete-confirm").textContent = "Deleting..."; $("delete-cancel").textContent = "Back to apps"; $("panel-close").setAttribute("aria-label","Back to app list"); $("panel-feedback").hidden = true;
     Promise.resolve().then(function () { if (generation !== removalGeneration) throw new Error("Deletion was interrupted. Refresh your apps to check its result."); return service.removeApp(candidate.id); }).then(function () {
       if (generation !== removalGeneration) return;
-      removalPending = false; busy = false; deleteCandidate = null;
+      removalPending = false; busy = false; deleteCandidate = null; activeSeasonal = null;
+      if (sportsState.seasonalInstalls[candidate.id]) {
+        delete sportsState.seasonalInstalls[candidate.id];
+        delete sportsState.autoRemove[candidate.id];
+        delete sportsState.installTokens[candidate.id];
+        saveSportsState();
+      }
+      if (selectedSuggestionId === candidate.id) selectedSuggestionId = null;
       if (panel === "confirm-delete") openPanel("manage");
+      else if (panel === "sport-exit") { var ret = sportReturnPanel; sportReturnPanel = null; if (ret === "sports") openPanel("sports"); else closePanel(); }
       refresh({removedId:candidate.id,title:candidate.title});
     },function (error) {
       if (generation !== removalGeneration) return;
@@ -241,22 +480,24 @@
       // Refresh both inventories before exposing app actions again; never retry
       // the removal itself or turn a failed check into a successful deletion.
       refresh();
-      if (panel === "confirm-delete" && deleteCandidate && deleteCandidate.id === candidate.id) {
-        $("delete-confirm").disabled = true; $("delete-confirm").textContent = "Delete app"; $("delete-cancel").textContent = "Cancel"; $("delete-refresh").hidden = false; showPanelError(message); focus($("delete-cancel"));
+      if ((panel === "confirm-delete" || panel === "sport-exit") && deleteCandidate && deleteCandidate.id === candidate.id) {
+        if ($("exit-keep")) $("exit-keep").disabled = false;
+        $("delete-confirm").disabled = true; $("delete-confirm").textContent = candidate.seasonalExit ? "Delete " + candidate.title : "Delete app"; $("delete-cancel").textContent = "Cancel"; $("delete-refresh").hidden = false; showPanelError(message); focus($("delete-cancel"));
       } else notice(message);
     });
   }
-  function openStore() {
+  function openStore(onOpened) {
     if (busy || removalPending) { notice("Please wait for the current app action to finish."); return; }
     if (typeof service.openStore !== "function") { notice("The App Store is unavailable on this TV."); return; }
     busy = true;
-    Promise.resolve().then(function () { return service.openStore(); }).then(function () { busy = false; },function (error) { busy = false; notice(error && error.message ? error.message : "The App Store could not open. Please try again."); });
+    Promise.resolve().then(function () { return service.openStore(); }).then(function () { busy = false; if (typeof onOpened === "function") onOpened(); },function (error) { busy = false; notice(error && error.message ? error.message : "The App Store could not open. Please try again."); });
   }
   function openPanel(next) {
     if (!panel) lastFocus = document.activeElement;
-    panel = next; $("overlay").hidden = false; $("panel").setAttribute("role",next === "confirm-delete" ? "alertdialog" : "dialog"); $("panel-feedback").hidden = true; $("panel-close").setAttribute("aria-label",next === "confirm-delete" ? "Cancel deletion" : "Close"); $("panel-content").replaceChildren(); $("panel-content").scrollTop = 0; $("panel-empty").hidden = true; $("search-wrap").hidden = next !== "search";
-    $("panel-title").textContent = {apps:"All apps",search:"Find your app",inputs:"Inputs & AirPlay",preferences:"Home preferences",profile:"Remote & help","voice-help":"Voice commands",manage:"Manage apps","confirm-delete":"Delete " + (deleteCandidate ? deleteCandidate.title : "app") + "?"}[next];
-    $("panel-description").textContent = {apps:"Everything you watch, all together.",search:"A little less looking. A little more watching.",inputs:"Connect a screen, or choose an HDMI input.",preferences:"A few things to make yourself at home.",profile:"Everything you need, close at hand.","voice-help":"Hold the mic button on your remote, say one short command, then let go.",manage:removalPending ? "An app is being deleted. You can return to Home while it finishes." : "Delete apps you no longer use. R2D2 and system features stay protected.","confirm-delete":"The app and its saved data may be removed from this TV. You may need to sign in again if you reinstall it."}[next];
+    var isAlert = next === "confirm-delete" || next === "sport-exit";
+    panel = next; $("overlay").hidden = false; $("panel").setAttribute("role",isAlert ? "alertdialog" : "dialog"); $("panel-feedback").hidden = true; $("panel-close").setAttribute("aria-label",isAlert ? "Cancel deletion" : "Close"); $("panel-content").replaceChildren(); $("panel-content").scrollTop = 0; $("panel-empty").hidden = true; $("search-wrap").hidden = next !== "search";
+    $("panel-title").textContent = {apps:"All apps",search:"Find your app",inputs:"Inputs & AirPlay",preferences:"Home preferences",sports:"Sports & seasons",profile:"Remote & help","voice-help":"Voice commands",manage:"Manage apps","confirm-delete":"Delete " + (deleteCandidate ? deleteCandidate.title : "app") + "?","sport-suggest":activeSeasonal ? "Get " + activeSeasonal.appTitle + " for " + activeSeasonal.sportTitle + "?" : "Suggested app","sport-exit":activeSeasonal ? activeSeasonal.sportTitle + " season ended · Remove " + activeSeasonal.appTitle + "?" : "Season ended"}[next];
+    $("panel-description").textContent = {apps:"Everything you watch, all together.",search:"A little less looking. A little more watching.",inputs:"Connect a screen, or choose an HDMI input.",preferences:"A few things to make yourself at home.",sports:"Follow your sports. R2D2 suggests the app that carries each in-season sport and helps clean it up when the season ends.",profile:"Everything you need, close at hand.","voice-help":"Hold the mic button on your remote, say one short command, then let go.",manage:removalPending ? "An app is being deleted. You can return to Home while it finishes." : "Delete apps you no longer use. R2D2 and system features stay protected.","confirm-delete":"The app and its saved data may be removed from this TV. You may need to sign in again if you reinstall it.","sport-suggest":activeSeasonal ? activeSeasonal.reason : "","sport-exit":activeSeasonal ? activeSeasonal.exit : ""}[next];
     if (next === "apps" || next === "search") { $("search-input").value = ""; renderPanelApps(""); }
     if (next === "inputs") {
       catalog.shortcuts.filter(function (item) { return (item.kind === "input" || item.kind === "feature") && appById(item.id); }).forEach(function (item) {
@@ -265,6 +506,22 @@
       $("panel-empty").textContent = "No inputs are available right now."; $("panel-empty").hidden = $("panel-content").children.length > 0;
     }
     if (next === "manage") renderManage();
+    if (next === "sports") renderSports();
+    if (next === "sport-suggest" && activeSeasonal) {
+      var sugBlock = textBlock([activeSeasonal.exit, "Open the App Store to install " + activeSeasonal.appTitle + ", or dismiss this suggestion for the current season."]), sugActions = document.createElement("div"); sugActions.className = "inline-actions";
+      var sugInstall = localButton("Open in App Store", installSeasonalSuggestion); sugInstall.id = "suggest-install"; sugActions.appendChild(sugInstall);
+      var sugDismiss = localButton("Not this season", dismissSeasonalSuggestion); sugDismiss.id = "suggest-dismiss"; sugActions.appendChild(sugDismiss);
+      var sugSports = localButton("Sports & seasons", function () { openPanel("sports"); }); sugSports.id = "suggest-sports"; sugActions.appendChild(sugSports);
+      sugBlock.appendChild(sugActions);
+    }
+    if (next === "sport-exit" && activeSeasonal) {
+      var exitBlock = textBlock(["The app and its saved data may be removed from this TV. Choose Keep if you still watch other shows on " + activeSeasonal.appTitle + "."]), exitActions = document.createElement("div"); exitActions.className = "inline-actions";
+      var keepBtn = localButton("Keep " + activeSeasonal.appTitle, keepSeasonalApp); keepBtn.id = "exit-keep"; keepBtn.disabled = removalPending; exitActions.appendChild(keepBtn);
+      var exitConfirm = localButton(removalPending ? "Deleting..." : "Delete " + activeSeasonal.appTitle, confirmDelete); exitConfirm.id = "delete-confirm"; exitConfirm.classList.add("danger-button"); exitConfirm.disabled = removalPending; exitActions.appendChild(exitConfirm);
+      var exitCancel = localButton(removalPending ? "Back to apps" : "Cancel", cancelSeasonalDelete); exitCancel.id = "delete-cancel"; exitActions.appendChild(exitCancel);
+      var exitRefresh = localButton("Refresh app list", function () { deleteCandidate = null; activeSeasonal = null; openPanel(sportReturnPanel === "sports" ? "sports" : "manage"); refresh(); }); exitRefresh.id = "delete-refresh"; exitRefresh.hidden = true; exitActions.appendChild(exitRefresh);
+      exitBlock.appendChild(exitActions);
+    }
     if (next === "confirm-delete") {
       var confirmation = textBlock(["Reinstalling later depends on the app’s availability in the App Store."]), actions = document.createElement("div"); actions.className = "inline-actions";
       var cancel = localButton(removalPending ? "Back to apps" : "Cancel",cancelDelete); cancel.id = "delete-cancel"; actions.appendChild(cancel);
@@ -279,7 +536,8 @@
         try { localStorage.setItem("baaz.calm.v1",String(enabled)); } catch (_) { notice("Colors changed for this visit."); }
       },calm);
       var manage = localButton("Manage apps",function () { openPanel("manage"); }); manage.id = "manage-apps"; actions.appendChild(manage);
-      var store = localButton("App Store",openStore); store.id = "app-store"; actions.appendChild(store);
+      var sports = localButton("Sports & seasons",function () { openPanel("sports"); }); sports.id = "sports-open"; actions.appendChild(sports);
+      var store = localButton("App Store",function () { openStore(); }); store.id = "app-store"; actions.appendChild(store);
       actions.appendChild(toggle); actions.appendChild(localButton("Refresh apps",function () { closePanel(); refresh(); })); actions.appendChild(localButton("Restart TV",function () { closePanel(); if (busy) return; if (!service.browserAvailable() || typeof service.restartTv !== "function") { notice("The Spark connection is unavailable."); return; } busy = true; notice("Restarting TV..."); service.restartTv().then(function () { busy = false; }, function () { busy = false; notice("TV could not restart. Please try again."); }); })); block.appendChild(actions);
     }
     if (next === "profile") {
@@ -287,22 +545,40 @@
       if (voiceFeed.available()) { var helpActions = document.createElement("div"), voiceHelp = localButton("Voice commands",function () { openPanel("voice-help"); }); helpActions.className = "inline-actions"; voiceHelp.id = "voice-help-open"; helpActions.appendChild(voiceHelp); help.appendChild(helpActions); }
     }
     if (next === "voice-help") renderVoiceHelp();
-    focus(next === "search" ? $("search-input") : next === "confirm-delete" ? $("delete-cancel") : $("panel-content").querySelector("button:not(:disabled)") || $("panel-close"));
+    focus(next === "search" ? $("search-input") : next === "confirm-delete" ? $("delete-cancel") : next === "sport-exit" ? ($("exit-keep") && !$("exit-keep").disabled ? $("exit-keep") : $("delete-cancel")) : $("panel-content").querySelector("button:not(:disabled)") || $("panel-close"));
     renderVoice();
   }
-  function closePanel() { panel = null; deleteCandidate = null; $("overlay").hidden = true; focus(lastFocus && lastFocus.isConnected ? lastFocus : firstDock()); renderVoice(); }
-  function back() { if (panel === "confirm-delete") cancelDelete(); else if (panel === "manage") { openPanel("preferences"); focus($("manage-apps")); } else if (panel === "voice-help") { openPanel("profile"); focus($("voice-help-open")); } else if (panel) closePanel(); else focus(firstDock()); }
+  function closePanel() { panel = null; deleteCandidate = null; activeSeasonal = null; sportReturnPanel = null; $("overlay").hidden = true; focus(lastFocus && lastFocus.isConnected ? lastFocus : firstDock()); renderVoice(); }
+  function back() { if (panel === "confirm-delete") cancelDelete(); else if (panel === "sport-exit") cancelSeasonalDelete(); else if (panel === "sport-suggest") { var ret = sportReturnPanel; activeSeasonal = null; sportReturnPanel = null; if (ret === "sports") openPanel("sports"); else closePanel(); } else if (panel === "manage") { openPanel("preferences"); focus($("manage-apps")); } else if (panel === "sports") { openPanel("preferences"); focus($("sports-open")); } else if (panel === "voice-help") { openPanel("profile"); focus($("voice-help-open")); } else if (panel) closePanel(); else focus(firstDock()); }
   function refresh(removed) {
     if (removalPending) { notice("Please wait for app deletion to finish before refreshing."); return; }
+    var wasWeatherBusy = weatherBusy;
+    if (weatherBusy) { ++weatherGeneration; weatherBusy = false; }
     var sequence = ++refreshSequence; ++browserGeneration; browserChecking = false; browserState = "checking"; inventoryReady = false; service.cancelAll(); busy = false; apps = []; selectedId = null; renderHome(); $("status").textContent = "Getting your apps..."; $("status").classList.remove("error");
-    if (panel === "manage") { $("panel-content").replaceChildren(); textBlock(["Refreshing your apps..."]); focus($("panel-close")); }
+    if (wasWeatherBusy && !document.hidden) refreshWeather();
+    if (panel === "manage" || panel === "sports") { $("panel-content").replaceChildren(); textBlock(["Refreshing your apps..."]); focus($("panel-close")); }
     service.refresh(catalog).then(function (result) {
       if (sequence !== refreshSequence) return;
-      apps = result; inventoryReady = true; renderHome(); checkBrowser(); $("status").textContent = visibleApps().length ? "" : "No apps returned. Use Home preferences to refresh."; if (panel === "apps" || panel === "search") renderPanelApps($("search-input").value); else if (panel === "manage") { renderManage(); focus($("panel-content").querySelector("button:not(:disabled)") || $("panel-close")); } else if (!panel) focus(firstDock());
+      apps = result; inventoryReady = true; reconcileSeasonalInventory(); renderHome(); checkBrowser(); $("status").textContent = visibleApps().length ? "" : "No apps returned. Use Home preferences to refresh.";
+      if (panel === "apps" || panel === "search") renderPanelApps($("search-input").value);
+      else if (panel === "manage") { renderManage(); focus($("panel-content").querySelector("button:not(:disabled)") || $("panel-close")); }
+      else if (panel === "sports") { renderSports(); focus($("panel-content").querySelector("button:not(:disabled)") || $("panel-close")); }
+      else if (panel === "sport-exit" || panel === "sport-suggest") {
+        var nextSeasonal = activeSeasonal && seasonalById(activeSeasonal.appId);
+        if (!nextSeasonal || nextSeasonal.kind !== activeSeasonal.kind) {
+          var retPanel = sportReturnPanel; activeSeasonal = null; deleteCandidate = null; sportReturnPanel = null;
+          if (retPanel === "sports") openPanel("sports"); else closePanel();
+        } else if ($("panel-feedback").hidden) {
+          activeSeasonal = nextSeasonal;
+          if (panel === "sport-exit") deleteCandidate = {id: nextSeasonal.appId, title: nextSeasonal.appTitle, seasonalExit: true, cycleKeys: nextSeasonal.cycleKeys};
+          openPanel(panel);
+        }
+      }
+      else if (!panel) focus(firstDock());
       if (removed) notice(appById(removed.removedId) ? "The TV still lists " + removed.title + ". Refresh apps again in a moment." : removed.title + " deleted.");
     },function (error) {
       if (sequence !== refreshSequence) return;
-      apps = []; browserState = "unavailable"; renderHome(); renderBrowser(); $("status").textContent = error.message; $("status").classList.add("error"); if (panel === "manage") { $("panel-content").replaceChildren(); textBlock([error.message]); focus($("panel-close")); } if (removed) notice("Delete request accepted, but the app list could not refresh. " + error.message); if (!panel) focus($("preferences-open"));
+      apps = []; browserState = "unavailable"; renderHome(); renderBrowser(); $("status").textContent = error.message; $("status").classList.add("error"); if (panel === "manage" || panel === "sports") { $("panel-content").replaceChildren(); textBlock([error.message]); focus($("panel-close")); } if (removed) notice("Delete request accepted, but the app list could not refresh. " + error.message); if (!panel) focus($("preferences-open"));
     });
   }
   $("search-open").addEventListener("click",function () { openPanel("search"); });
@@ -327,8 +603,18 @@
     clearTimeout(pulseTimer); if (pulseButton) pulseButton.classList.remove("activated");
     pulseButton = button; button.classList.add("activated"); pulseTimer = setTimeout(function () { button.classList.remove("activated"); pulseButton = null; },160);
   });
-  window.addEventListener("pagehide",function () { ++removalGeneration; if (removalPending) { removalInterrupted = true; removalPending = false; busy = false; deleteCandidate = null; } clearTimeout(pulseTimer); if (pulseButton) pulseButton.classList.remove("activated"); pulseButton = null; });
-  window.addEventListener("pageshow",function () { if (removalInterrupted) { removalInterrupted = false; if (panel === "confirm-delete") openPanel("manage"); refresh(); notice("App deletion was interrupted. Check the refreshed app list for its result."); } });
+  window.addEventListener("pagehide",function () { ++removalGeneration; if (removalPending) { removalInterrupted = true; removalPending = false; busy = false; if (panel !== "sport-exit") deleteCandidate = null; } clearTimeout(pulseTimer); if (pulseButton) pulseButton.classList.remove("activated"); pulseButton = null; });
+  window.addEventListener("pageshow",function () {
+    if (removalInterrupted) {
+      removalInterrupted = false;
+      if (panel === "confirm-delete") openPanel("manage");
+      else if (panel === "sport-exit" && activeSeasonal) openPanel("sport-exit");
+      refresh();
+      notice("App deletion was interrupted. Check the refreshed app list for its result.");
+    } else if ((Object.keys(pendingStoreInstalls).length || Object.keys(sportsState.seasonalInstalls).length || sportsState.followed.length) && !removalPending) {
+      refresh();
+    }
+  });
   document.addEventListener("focusin",function (event) { if (panel && !$("overlay").contains(event.target)) focus($("panel-close")); });
   window.addEventListener("pagehide",function () { ++browserGeneration; browserChecking = false; service.cancelAll(); });
   window.addEventListener("pageshow",function () { if (inventoryReady) checkBrowser(); });
@@ -353,7 +639,15 @@
     var generation = ++weatherGeneration; weatherBusy = true;
     service.weather().then(function (value) { if (generation !== weatherGeneration) return; weatherBusy = false; renderWeather(value); });
   }
-  document.addEventListener("visibilitychange",function () { document.body.classList.toggle("page-hidden",document.hidden); if (!document.hidden) refreshWeather(); });
+  document.addEventListener("visibilitychange",function () {
+    document.body.classList.toggle("page-hidden",document.hidden);
+    if (!document.hidden) {
+      if ((Object.keys(pendingStoreInstalls).length || Object.keys(sportsState.seasonalInstalls).length || sportsState.followed.length) && !removalPending) {
+        refresh();
+      }
+      refreshWeather();
+    }
+  });
   window.addEventListener("pagehide",function () { ++weatherGeneration; weatherBusy = false; document.body.classList.add("page-hidden"); });
   window.addEventListener("pageshow",function () { document.body.classList.toggle("page-hidden",document.hidden); if (!document.hidden) refreshWeather(); });
   // Voice is display-only: no focus, no keys, no storage; text is Spark's closed copy via textContent.
@@ -463,9 +757,14 @@
   window.addEventListener("pagehide",stopVoice);
   window.addEventListener("pageshow",startVoice);
   function clock() {
-    var now = new Date(), hour = now.getHours(), small = document.createElement("small");
+    var now = new Date(), hour = now.getHours(), small = document.createElement("small"), nowMonth = now.getUTCFullYear() * 12 + now.getUTCMonth();
     $("date").textContent = now.toLocaleDateString("en-US",{weekday:"short",month:"short",day:"numeric"});
     $("clock").textContent = String(hour%12 || 12) + ":" + String(now.getMinutes()).padStart(2,"0"); small.textContent = hour >= 12 ? "PM" : "AM"; $("clock").appendChild(small); $("clock").dateTime = now.toISOString(); $("date").dateTime = now.toISOString().slice(0,10);
+    if (inventoryReady && !removalPending && sportsState.followed.length && lastSeasonalMonth !== null && nowMonth !== lastSeasonalMonth) {
+      renderHome();
+      if (panel === "sports") renderSports();
+      else if (panel === "manage") renderManage();
+    }
   }
   clock(); setInterval(clock,30000); refresh(); refreshWeather(); setInterval(refreshWeather,600000); startVoice();
 }());
