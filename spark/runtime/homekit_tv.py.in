@@ -1,0 +1,2345 @@
+#!/usr/bin/env python3
+"""Local Apple HomeKit Television (HAP-IP) Bridge for R2D2 TV.
+
+Exposes the LG webOS TV as a native HomeKit Television accessory (Category 31)
+so the Apple Home app and iOS/iPadOS Control Center Remote widget provide:
+- D-Pad / touchpad navigation, Select, Back, Exit, Play/Pause, Rewind, Fast-Forward, Info
+- iPhone hardware volume buttons (VolumeSelector) + Mute + Volume percentage
+- Power toggle (Wake-on-LAN magic packet + Luna tvpower turnOnScreen / turnOff)
+- App / Input Source switcher synced with the TV's foreground app
+
+100% local execution between Spark ({{SPARK_IP}}) and the TV ({{TV_IP}}) with zero cloud dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import hmac
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import select
+import secrets
+import shutil
+import signal
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import threading
+import time
+from typing import Any, Callable
+
+SPARK_IP = "{{SPARK_IP}}"
+TV_IP = "{{TV_IP}}"
+
+DEFAULT_HAP_PORT = 21066
+DEFAULT_REMOTE_PORT = 4183
+DEFAULT_SSAP_PORT = 3001
+DEFAULT_CATEGORY_TELEVISION = 31
+
+# HAP TLV8 tag constants
+TLV_METHOD = 0x00
+TLV_IDENTIFIER = 0x01
+TLV_SALT = 0x02
+TLV_PUBLIC_KEY = 0x03
+TLV_PROOF = 0x04
+TLV_ENCRYPTED_DATA = 0x05
+TLV_STATE = 0x06
+TLV_ERROR = 0x07
+TLV_RETRY_DELAY = 0x08
+TLV_CERTIFICATE = 0x09
+TLV_SIGNATURE = 0x0A
+TLV_PERMISSIONS = 0x0B
+TLV_FRAGMENT_DATA = 0x0C
+TLV_FRAGMENT_LAST = 0x0D
+TLV_FLAGS = 0x13
+TLV_SEPARATOR = 0xFF
+
+TLV_ERROR_UNKNOWN = 0x01
+TLV_ERROR_AUTHENTICATION = 0x02
+TLV_ERROR_BACKOFF = 0x03
+TLV_ERROR_MAX_PEERS = 0x04
+TLV_ERROR_MAX_TRIES = 0x05
+TLV_ERROR_UNAVAILABLE = 0x06
+TLV_ERROR_BUSY = 0x07
+
+# HAP RemoteKey values (Characteristic 000000E1)
+HAP_REMOTE_KEY_REWIND = 0
+HAP_REMOTE_KEY_FAST_FORWARD = 1
+HAP_REMOTE_KEY_NEXT_TRACK = 2
+HAP_REMOTE_KEY_PREV_TRACK = 3
+HAP_REMOTE_KEY_ARROW_UP = 4
+HAP_REMOTE_KEY_ARROW_DOWN = 5
+HAP_REMOTE_KEY_ARROW_LEFT = 6
+HAP_REMOTE_KEY_ARROW_RIGHT = 7
+HAP_REMOTE_KEY_SELECT = 8
+HAP_REMOTE_KEY_BACK = 9
+HAP_REMOTE_KEY_EXIT = 10
+HAP_REMOTE_KEY_PLAY_PAUSE = 11
+HAP_REMOTE_KEY_INFORMATION = 15
+
+HAP_REMOTE_KEY_TO_ACTION_KEY = {
+    HAP_REMOTE_KEY_REWIND: "rewind",
+    HAP_REMOTE_KEY_FAST_FORWARD: "fast_forward",
+    HAP_REMOTE_KEY_NEXT_TRACK: "fast_forward",
+    HAP_REMOTE_KEY_PREV_TRACK: "rewind",
+    HAP_REMOTE_KEY_ARROW_UP: "up",
+    HAP_REMOTE_KEY_ARROW_DOWN: "down",
+    HAP_REMOTE_KEY_ARROW_LEFT: "left",
+    HAP_REMOTE_KEY_ARROW_RIGHT: "right",
+    HAP_REMOTE_KEY_SELECT: "select",
+    HAP_REMOTE_KEY_BACK: "back",
+    HAP_REMOTE_KEY_EXIT: "exit",
+    HAP_REMOTE_KEY_PLAY_PAUSE: "play_pause",
+    HAP_REMOTE_KEY_INFORMATION: "info",
+}
+
+# Input Sources exposed in the Apple Home app & Control Center Remote input picker
+DEFAULT_INPUT_SOURCES = (
+    {"identifier": 1, "name": "R2D2 Home", "app_id": "local.owner.applibrary", "source_type": 2},
+    {"identifier": 2, "name": "Spark Browser", "app_id": "com.webos.app.tinybrowser", "source_type": 10},
+    {"identifier": 3, "name": "Netflix", "app_id": "netflix", "source_type": 10},
+    {"identifier": 4, "name": "YouTube", "app_id": "youtube.leanback.v4", "source_type": 10},
+    {"identifier": 5, "name": "Prime Video", "app_id": "amazon", "source_type": 10},
+    {"identifier": 6, "name": "Disney+", "app_id": "com.disney.disneyplus-prod", "source_type": 10},
+    {"identifier": 7, "name": "Max", "app_id": "com.wbd.stream", "source_type": 10},
+    {"identifier": 8, "name": "Apple TV", "app_id": "com.apple.appletv", "source_type": 10},
+    {"identifier": 9, "name": "Apple Music", "app_id": "com.apple.applemusic", "source_type": 10},
+    {"identifier": 10, "name": "Hulu", "app_id": "hulu", "source_type": 10},
+    {"identifier": 11, "name": "Tubi", "app_id": "com.tubitv.ott.tubi", "source_type": 10},
+    {
+        "identifier": 12,
+        "name": "Sling TV",
+        "app_id": "com.movenetworks.app.sling-tv-sling-production",
+        "source_type": 10,
+    },
+)
+
+# RFC 5054 3072-bit SRP-6a prime N and generator g=5
+SRP_N_HEX = (
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08"
+    "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B"
+    "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9"
+    "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6"
+    "49286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8"
+    "FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C"
+    "180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718"
+    "3995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D"
+    "04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7D"
+    "B3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D226"
+    "1AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C"
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFC"
+    "E0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF"
+)
+SRP_N = int(SRP_N_HEX, 16)
+SRP_G = 5
+SRP_N_BYTES = 384
+
+
+def hap_uuid(short_hex: str) -> str:
+    clean = short_hex.strip().upper().lstrip("0") or "0"
+    return clean
+
+
+def tlv8_encode(pairs: list[tuple[int, bytes]]) -> bytes:
+    out = bytearray()
+    for tag, data in pairs:
+        raw = bytes(data)
+        if len(raw) == 0:
+            out.append(tag & 0xFF)
+            out.append(0)
+            continue
+        offset = 0
+        while offset < len(raw):
+            chunk = raw[offset : offset + 255]
+            out.append(tag & 0xFF)
+            out.append(len(chunk))
+            out.extend(chunk)
+            offset += len(chunk)
+    return bytes(out)
+
+
+def tlv8_decode(buf: bytes) -> dict[int, bytes]:
+    result: dict[int, bytearray] = {}
+    pos = 0
+    last_tag: int | None = None
+    while pos + 2 <= len(buf):
+        tag = buf[pos]
+        length = buf[pos + 1]
+        pos += 2
+        if pos + length > len(buf):
+            break
+        chunk = buf[pos : pos + length]
+        pos += length
+        if tag in result and last_tag == tag:
+            result[tag].extend(chunk)
+        else:
+            result[tag] = bytearray(chunk)
+        last_tag = tag
+    return {k: bytes(v) for k, v in result.items()}
+
+
+def hkdf_sha512(ikm: bytes, salt: bytes, info: bytes, length: int = 32) -> bytes:
+    if not salt:
+        salt = b"\x00" * 64
+    prk = hmac.new(salt, ikm, hashlib.sha512).digest()
+    okm = bytearray()
+    t = b""
+    counter = 1
+    while len(okm) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha512).digest()
+        okm.extend(t)
+        counter += 1
+    return bytes(okm[:length])
+
+
+# --- Pure-Python RFC 8439 ChaCha20-Poly1305 + RFC 7748 X25519 + RFC 8032 Ed25519 fallbacks ---
+
+
+def _rotl32(v: int, c: int) -> int:
+    v &= 0xFFFFFFFF
+    return ((v << c) & 0xFFFFFFFF) | (v >> (32 - c))
+
+
+def _chacha20_block(key: bytes, counter: int, nonce12: bytes) -> bytes:
+    constants = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+    key_words = struct.unpack("<8I", key)
+    nonce_words = struct.unpack("<3I", nonce12)
+    state = list(constants) + list(key_words) + [counter & 0xFFFFFFFF] + list(nonce_words)
+    working = list(state)
+
+    def qr(x: list[int], a: int, b: int, c: int, d: int) -> None:
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = _rotl32(x[d] ^ x[a], 16)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = _rotl32(x[b] ^ x[c], 12)
+        x[a] = (x[a] + x[b]) & 0xFFFFFFFF
+        x[d] = _rotl32(x[d] ^ x[a], 8)
+        x[c] = (x[c] + x[d]) & 0xFFFFFFFF
+        x[b] = _rotl32(x[b] ^ x[c], 7)
+
+    for _ in range(10):
+        qr(working, 0, 4, 8, 12)
+        qr(working, 1, 5, 9, 13)
+        qr(working, 2, 6, 10, 14)
+        qr(working, 3, 7, 11, 15)
+        qr(working, 0, 5, 10, 15)
+        qr(working, 1, 6, 11, 12)
+        qr(working, 2, 7, 8, 13)
+        qr(working, 3, 4, 9, 14)
+
+    out_words = [(working[i] + state[i]) & 0xFFFFFFFF for i in range(16)]
+    return struct.pack("<16I", *out_words)
+
+
+def _chacha20_xor(key: bytes, counter: int, nonce12: bytes, data: bytes) -> bytes:
+    out = bytearray(len(data))
+    offset = 0
+    blk = counter
+    while offset < len(data):
+        stream = _chacha20_block(key, blk, nonce12)
+        chunk = data[offset : offset + 64]
+        for i, b in enumerate(chunk):
+            out[offset + i] = b ^ stream[i]
+        offset += 64
+        blk += 1
+    return bytes(out)
+
+
+def _poly1305_mac(msg: bytes, otk: bytes) -> bytes:
+    r = int.from_bytes(otk[:16], "little") & 0x0FFFFFFC0FFFFFFC0FFFFFFC0FFFFFFF
+    s = int.from_bytes(otk[16:32], "little")
+    p = (1 << 130) - 5
+    acc = 0
+    for offset in range(0, len(msg), 16):
+        chunk = msg[offset : offset + 16]
+        n = int.from_bytes(chunk + b"\x01", "little")
+        acc = ((acc + n) * r) % p
+    acc = (acc + s) & ((1 << 128) - 1)
+    return acc.to_bytes(16, "little")
+
+
+def _pad16(data: bytes) -> bytes:
+    rem = len(data) % 16
+    return b"" if rem == 0 else b"\x00" * (16 - rem)
+
+
+def chacha20_poly1305_encrypt(key: bytes, nonce12: bytes, plaintext: bytes, aad: bytes = b"") -> bytes:
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+        return ChaCha20Poly1305(key).encrypt(nonce12, plaintext, aad)
+    except Exception:
+        otk = _chacha20_block(key, 0, nonce12)[:32]
+        ciphertext = _chacha20_xor(key, 1, nonce12, plaintext)
+        mac_data = (
+            aad
+            + _pad16(aad)
+            + ciphertext
+            + _pad16(ciphertext)
+            + struct.pack("<QQ", len(aad), len(ciphertext))
+        )
+        tag = _poly1305_mac(mac_data, otk)
+        return ciphertext + tag
+
+
+def chacha20_poly1305_decrypt(key: bytes, nonce12: bytes, ciphertext_and_tag: bytes, aad: bytes = b"") -> bytes:
+    if len(ciphertext_and_tag) < 16:
+        raise ValueError("CIPHERTEXT_TOO_SHORT")
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
+        return ChaCha20Poly1305(key).decrypt(nonce12, ciphertext_and_tag, aad)
+    except ImportError:
+        pass
+    ciphertext = ciphertext_and_tag[:-16]
+    tag = ciphertext_and_tag[-16:]
+    otk = _chacha20_block(key, 0, nonce12)[:32]
+    mac_data = (
+        aad
+        + _pad16(aad)
+        + ciphertext
+        + _pad16(ciphertext)
+        + struct.pack("<QQ", len(aad), len(ciphertext))
+    )
+    expected_tag = _poly1305_mac(mac_data, otk)
+    if not hmac.compare_digest(tag, expected_tag):
+        raise ValueError("POLY1305_TAG_MISMATCH")
+    return _chacha20_xor(key, 1, nonce12, ciphertext)
+
+
+_P25519 = (1 << 255) - 19
+_L25519 = (1 << 252) + 27742317777372353535851937790883648493
+_D25519 = (-121665 * pow(121666, _P25519 - 2, _P25519)) % _P25519
+_I25519 = pow(2, (_P25519 - 1) // 4, _P25519)
+_BY = (4 * pow(5, _P25519 - 2, _P25519)) % _P25519
+
+
+def _ed_xrecover(y: int) -> int:
+    xx = (y * y - 1) * pow(_D25519 * y * y + 1, _P25519 - 2, _P25519)
+    x = pow(xx, (_P25519 + 3) // 8, _P25519)
+    if (x * x - xx) % _P25519 != 0:
+        x = (x * _I25519) % _P25519
+    if x % 2 != 0:
+        x = _P25519 - x
+    return x
+
+
+_BX = _ed_xrecover(_BY)
+_B_PT = (_BX % _P25519, _BY % _P25519, 1, (_BX * _BY) % _P25519)
+
+
+def _ed_add(p1: tuple[int, int, int, int], p2: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, z1, t1 = p1
+    x2, y2, z2, t2 = p2
+    a = ((y1 - x1) * (y2 - x2)) % _P25519
+    b = ((y1 + x1) * (y2 + x2)) % _P25519
+    c = (t1 * 2 * _D25519 * t2) % _P25519
+    d = (z1 * 2 * z2) % _P25519
+    e = (b - a) % _P25519
+    f = (d - c) % _P25519
+    g = (d + c) % _P25519
+    h = (b + a) % _P25519
+    return ((e * f) % _P25519, (g * h) % _P25519, (f * g) % _P25519, (e * h) % _P25519)
+
+
+def _ed_scalarmult(pt: tuple[int, int, int, int], e: int) -> tuple[int, int, int, int]:
+    res = (0, 1, 1, 0)
+    cur = pt
+    while e > 0:
+        if e & 1:
+            res = _ed_add(res, cur)
+        cur = _ed_add(cur, cur)
+        e >>= 1
+    return res
+
+
+def _ed_encode_point(pt: tuple[int, int, int, int]) -> bytes:
+    x, y, z, _ = pt
+    zi = pow(z, _P25519 - 2, _P25519)
+    xp = (x * zi) % _P25519
+    yp = (y * zi) % _P25519
+    val = yp | ((xp & 1) << 255)
+    return val.to_bytes(32, "little")
+
+
+def _ed_decode_point(raw: bytes) -> tuple[int, int, int, int]:
+    if len(raw) != 32:
+        raise ValueError("INVALID_POINT_LEN")
+    unpacked = int.from_bytes(raw, "little")
+    sign = (unpacked >> 255) & 1
+    y = unpacked & ((1 << 255) - 1)
+    if y >= _P25519:
+        raise ValueError("INVALID_Y")
+    xx = ((y * y - 1) * pow(_D25519 * y * y + 1, _P25519 - 2, _P25519)) % _P25519
+    if xx == 0:
+        if sign:
+            raise ValueError("INVALID_ZERO_X")
+        x = 0
+    else:
+        x = pow(xx, (_P25519 + 3) // 8, _P25519)
+        if (x * x - xx) % _P25519 != 0:
+            x = (x * _I25519) % _P25519
+        if (x * x - xx) % _P25519 != 0:
+            raise ValueError("POINT_NOT_ON_CURVE")
+        if (x & 1) != sign:
+            x = _P25519 - x
+    return (x, y, 1, (x * y) % _P25519)
+
+
+def ed25519_public_key(seed32: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        return Ed25519PrivateKey.from_private_bytes(seed32).public_key().public_bytes(
+            Encoding.Raw, PublicFormat.Raw
+        )
+    except Exception:
+        h = hashlib.sha512(seed32).digest()
+        a = int.from_bytes(h[:32], "little")
+        a &= (1 << 254) - 8
+        a |= 1 << 254
+        return _ed_encode_point(_ed_scalarmult(_B_PT, a))
+
+
+def ed25519_sign(seed32: bytes, msg: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        return Ed25519PrivateKey.from_private_bytes(seed32).sign(msg)
+    except Exception:
+        h = hashlib.sha512(seed32).digest()
+        a = int.from_bytes(h[:32], "little")
+        a &= (1 << 254) - 8
+        a |= 1 << 254
+        prefix = h[32:]
+        pub = _ed_encode_point(_ed_scalarmult(_B_PT, a))
+        r = int.from_bytes(hashlib.sha512(prefix + msg).digest(), "little") % _L25519
+        r_bytes = _ed_encode_point(_ed_scalarmult(_B_PT, r))
+        k = int.from_bytes(hashlib.sha512(r_bytes + pub + msg).digest(), "little") % _L25519
+        s = (r + k * a) % _L25519
+        return r_bytes + s.to_bytes(32, "little")
+
+
+def ed25519_verify(pub32: bytes, sig64: bytes, msg: bytes) -> bool:
+    if len(pub32) != 32 or len(sig64) != 64:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+        Ed25519PublicKey.from_public_bytes(pub32).verify(sig64, msg)
+        return True
+    except ImportError:
+        pass
+    except Exception:
+        return False
+    try:
+        r_bytes = sig64[:32]
+        s = int.from_bytes(sig64[32:], "little")
+        if s >= _L25519:
+            return False
+        a_pt = _ed_decode_point(pub32)
+        r_pt = _ed_decode_point(r_bytes)
+        k = int.from_bytes(hashlib.sha512(r_bytes + pub32 + msg).digest(), "little") % _L25519
+        lhs = _ed_scalarmult(_B_PT, s)
+        rhs = _ed_add(r_pt, _ed_scalarmult(a_pt, k))
+        return _ed_encode_point(lhs) == _ed_encode_point(rhs)
+    except Exception:
+        return False
+
+
+def x25519_scalarmult(scalar32: bytes, u_bytes32: bytes) -> bytes:
+    scalar = bytearray(scalar32)
+    scalar[0] &= 248
+    scalar[31] &= 127
+    scalar[31] |= 64
+    k = int.from_bytes(scalar, "little")
+    u = int.from_bytes(u_bytes32, "little") & ((1 << 255) - 1)
+    x_1 = u
+    x_2 = 1
+    z_2 = 0
+    x_3 = u
+    z_3 = 1
+    swap = 0
+    for t in range(254, -1, -1):
+        k_t = (k >> t) & 1
+        swap ^= k_t
+        if swap:
+            x_2, x_3 = x_3, x_2
+            z_2, z_3 = z_3, z_2
+        swap = k_t
+        a = (x_2 + z_2) % _P25519
+        aa = (a * a) % _P25519
+        b = (x_2 - z_2) % _P25519
+        bb = (b * b) % _P25519
+        e = (aa - bb) % _P25519
+        c = (x_3 + z_3) % _P25519
+        d = (x_3 - z_3) % _P25519
+        da = (d * a) % _P25519
+        cb = (c * b) % _P25519
+        x_3 = pow(da + cb, 2, _P25519)
+        z_3 = (x_1 * pow(da - cb, 2, _P25519)) % _P25519
+        x_2 = (aa * bb) % _P25519
+        z_2 = (e * (aa + 121665 * e)) % _P25519
+    if swap:
+        x_2, x_3 = x_3, x_2
+        z_2, z_3 = z_3, z_2
+    res = (x_2 * pow(z_2, _P25519 - 2, _P25519)) % _P25519
+    return res.to_bytes(32, "little")
+
+
+def x25519_keypair(priv32: bytes | None = None) -> tuple[bytes, bytes]:
+    priv = priv32 if priv32 is not None else secrets.token_bytes(32)
+    base_point = (9).to_bytes(32, "little")
+    pub = x25519_scalarmult(priv, base_point)
+    return priv, pub
+
+
+# --- SRP-6a Server Session for HomeKit /pair-setup ---
+
+
+def _int_to_bytes(n: int, pad_len: int | None = None) -> bytes:
+    if n == 0:
+        raw = b"\x00"
+    else:
+        byte_len = (n.bit_length() + 7) // 8
+        raw = n.to_bytes(byte_len, "big")
+    if pad_len is not None and len(raw) < pad_len:
+        return b"\x00" * (pad_len - len(raw)) + raw
+    return raw
+
+
+class HapSrpServerSession:
+    """HomeKit SRP-6a server session (3072-bit group, SHA-512)."""
+
+    def __init__(self, setup_code: str, salt: bytes | None = None, priv_b: int | None = None) -> None:
+        self.username = b"Pair-Setup"
+        self.password = setup_code.encode("utf-8")
+        self.salt = salt if salt is not None else secrets.token_bytes(16)
+        # k = H(N | PAD(g))
+        k_hash = hashlib.sha512(
+            _int_to_bytes(SRP_N, SRP_N_BYTES) + _int_to_bytes(SRP_G, SRP_N_BYTES)
+        ).digest()
+        self.k = int.from_bytes(k_hash, "big")
+        # x = H(s | H(I | ":" | P))
+        user_pass_hash = hashlib.sha512(self.username + b":" + self.password).digest()
+        x_hash = hashlib.sha512(self.salt + user_pass_hash).digest()
+        self.x = int.from_bytes(x_hash, "big")
+        self.v = pow(SRP_G, self.x, SRP_N)
+        self.b = priv_b if priv_b is not None else int.from_bytes(secrets.token_bytes(32), "big")
+        self.B = (self.k * self.v + pow(SRP_G, self.b, SRP_N)) % SRP_N
+        self.A: int | None = None
+        self.K: bytes | None = None
+        self.M1_expected: bytes | None = None
+        self.M2: bytes | None = None
+
+    @property
+    def public_key_bytes(self) -> bytes:
+        return _int_to_bytes(self.B, SRP_N_BYTES)
+
+    def compute_client_proof(self, client_pub_bytes: bytes, client_proof: bytes) -> bytes | None:
+        A = int.from_bytes(client_pub_bytes, "big")
+        if A % SRP_N == 0:
+            return None
+        self.A = A
+        u_hash = hashlib.sha512(
+            _int_to_bytes(A, SRP_N_BYTES) + _int_to_bytes(self.B, SRP_N_BYTES)
+        ).digest()
+        u = int.from_bytes(u_hash, "big")
+        if u == 0:
+            return None
+        base = (A * pow(self.v, u, SRP_N)) % SRP_N
+        S = pow(base, self.b, SRP_N)
+        K = hashlib.sha512(_int_to_bytes(S, SRP_N_BYTES)).digest()
+        self.K = K
+
+        h_N = hashlib.sha512(_int_to_bytes(SRP_N, SRP_N_BYTES)).digest()
+        h_g = hashlib.sha512(_int_to_bytes(SRP_G)).digest()
+        h_xor = bytes(a ^ b for a, b in zip(h_N, h_g))
+        h_I = hashlib.sha512(self.username).digest()
+        A_unpadded = _int_to_bytes(A)
+        B_unpadded = _int_to_bytes(self.B)
+        M1 = hashlib.sha512(h_xor + h_I + self.salt + A_unpadded + B_unpadded + K).digest()
+        self.M1_expected = M1
+        if not hmac.compare_digest(M1, client_proof):
+            return None
+        M2 = hashlib.sha512(A_unpadded + M1 + K).digest()
+        self.M2 = M2
+        return M2
+
+
+# --- HomeKit Setup URI (X-HM://) and Setup Hash ---
+
+
+def compute_setup_uri(setup_code: str, setup_id: str, category: int = DEFAULT_CATEGORY_TELEVISION) -> str:
+    digits = re.sub(r"[^0-9]", "", setup_code)
+    if len(digits) != 8:
+        raise ValueError("INVALID_SETUP_CODE")
+    clean_id = setup_id.strip().upper()
+    if not re.fullmatch(r"[0-9A-Z]{4}", clean_id):
+        raise ValueError("INVALID_SETUP_ID")
+    pin = int(digits, 10)
+    # HAP Setup Payload bit layout:
+    # version (3b)=0 | reserved (4b)=0 | category (8b) | flags (4b, 2=IP) | pin (27b)
+    payload = ((category & 0xFF) << 31) | (2 << 27) | (pin & 0x7FFFFFF)
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    chars = []
+    val = payload
+    for _ in range(9):
+        chars.append(alphabet[val % 36])
+        val //= 36
+    base36_str = "".join(reversed(chars))
+    return f"X-HM://{base36_str}{clean_id}"
+
+
+def compute_setup_hash(setup_id: str, device_id: str) -> str:
+    digest = hashlib.sha512((setup_id.strip().upper() + device_id.strip().upper()).encode("utf-8")).digest()
+    return base64.b64encode(digest[:4]).decode("ascii")
+
+
+# --- Wake-on-LAN Magic Packet ---
+
+
+def build_wol_magic_packet(mac_address: str) -> bytes:
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", mac_address or "")
+    if len(cleaned) != 12:
+        raise ValueError("INVALID_MAC_ADDRESS")
+    mac_bytes = bytes.fromhex(cleaned)
+    return b"\xff" * 6 + mac_bytes * 16
+
+
+def send_wol_magic_packets(
+    mac_addresses: list[str] | tuple[str, ...],
+    broadcast_ips: tuple[str, ...] = ("255.255.255.255",),
+    ports: tuple[int, ...] = (9, 7),
+    sock_factory: Callable[..., Any] | None = None,
+) -> int:
+    sent = 0
+    packets = []
+    for mac in mac_addresses:
+        try:
+            packets.append(build_wol_magic_packet(mac))
+        except ValueError:
+            continue
+    if not packets:
+        return 0
+    factory = sock_factory or (lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+    sock = factory()
+    try:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except Exception:
+            pass
+        for pkt in packets:
+            for ip in broadcast_ips:
+                for port in ports:
+                    try:
+                        sock.sendto(pkt, (ip, port))
+                        sent += 1
+                    except Exception:
+                        pass
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    return sent
+
+
+# --- TV Remote Control Client (Resident :4183 fast path + SSAP :3001 fallback) ---
+
+
+def sign_resident_remote_request(voice_key: str, timestamp_ms: int, nonce: str, raw_body: str) -> str:
+    msg = f"{timestamp_ms}:{nonce}:{raw_body}".encode("utf-8")
+    return hmac.new(voice_key.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+class TvRemoteController:
+    """Dispatches Apple Home Remote commands to the TV via resident HTTP (:4183) or SSAP (:3001)."""
+
+    def __init__(
+        self,
+        tv_ip: str = TV_IP,
+        remote_port: int = DEFAULT_REMOTE_PORT,
+        voice_key: str = "",
+        tv_macs: list[str] | None = None,
+        ssap_client_key: str = "",
+        http_post_fn: Callable[[str, int, str, dict[str, str], str, float], tuple[int, str]] | None = None,
+        ssap_request_fn: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+        wol_sender_fn: Callable[[list[str]], int] | None = None,
+        status_reader_fn: Callable[[], dict[str, Any]] | None = None,
+        now_ms_fn: Callable[[], int] | None = None,
+    ) -> None:
+        self.tv_ip = tv_ip
+        self.remote_port = remote_port
+        self.voice_key = voice_key
+        self.tv_macs = list(tv_macs or [])
+        self.ssap_client_key = ssap_client_key
+        self._http_post_fn = http_post_fn or self._default_http_post
+        self._ssap_request_fn = ssap_request_fn or self._default_ssap_request
+        self._wol_sender_fn = wol_sender_fn or self._default_wol_send
+        self._status_reader_fn = status_reader_fn
+        self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
+        self._play_paused = False
+
+    def _default_http_post(
+        self, host: str, port: int, path: str, headers: dict[str, str], body: str, timeout: float
+    ) -> tuple[int, str]:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        try:
+            conn.request("POST", path, body=body.encode("utf-8"), headers=headers)
+            resp = conn.getresponse()
+            data = resp.read().decode("utf-8", errors="replace")
+            return resp.status, data
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _default_wol_send(self, macs: list[str]) -> int:
+        bcast = ["255.255.255.255"]
+        parts = self.tv_ip.split(".")
+        if len(parts) == 4:
+            bcast.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
+        return send_wol_magic_packets(macs, broadcast_ips=tuple(dict.fromkeys(bcast)))
+
+    def _default_ssap_request(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.ssap_client_key:
+            return {"ok": False, "error": "no_ssap_key"}
+        try:
+            return self._ssap_send_once(uri, payload, timeout=1.8)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _ssap_send_once(self, uri: str, payload: dict[str, Any], timeout: float = 1.8) -> dict[str, Any]:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((self.tv_ip, DEFAULT_SSAP_PORT), timeout=timeout) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=self.tv_ip) as tls_sock:
+                tls_sock.settimeout(timeout)
+                ws_key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+                handshake = (
+                    f"GET / HTTP/1.1\r\n"
+                    f"Host: {self.tv_ip}:{DEFAULT_SSAP_PORT}\r\n"
+                    f"Upgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {ws_key}\r\n"
+                    f"Sec-WebSocket-Version: 13\r\n\r\n"
+                )
+                tls_sock.sendall(handshake.encode("ascii"))
+                resp_buf = b""
+                while b"\r\n\r\n" not in resp_buf:
+                    chunk = tls_sock.recv(4096)
+                    if not chunk:
+                        raise ConnectionError("SSAP handshake EOF")
+                    resp_buf += chunk
+
+                def send_ws_text(obj: dict[str, Any]) -> None:
+                    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+                    mask = secrets.token_bytes(4)
+                    header = bytearray([0x81])
+                    if len(raw) < 126:
+                        header.append(0x80 | len(raw))
+                    elif len(raw) < 65536:
+                        header.append(0x80 | 126)
+                        header.extend(struct.pack("!H", len(raw)))
+                    else:
+                        header.append(0x80 | 127)
+                        header.extend(struct.pack("!Q", len(raw)))
+                    header.extend(mask)
+                    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
+                    tls_sock.sendall(bytes(header) + masked)
+
+                def recv_ws_json() -> dict[str, Any]:
+                    hdr = tls_sock.recv(2)
+                    if len(hdr) < 2:
+                        raise ConnectionError("SSAP frame EOF")
+                    length = hdr[1] & 0x7F
+                    if length == 126:
+                        length = struct.unpack("!H", tls_sock.recv(2))[0]
+                    elif length == 127:
+                        length = struct.unpack("!Q", tls_sock.recv(8))[0]
+                    masked = bool(hdr[1] & 0x80)
+                    mask_bytes = tls_sock.recv(4) if masked else b""
+                    data = bytearray()
+                    while len(data) < length:
+                        part = tls_sock.recv(length - len(data))
+                        if not part:
+                            break
+                        data.extend(part)
+                    if masked:
+                        data = bytearray(b ^ mask_bytes[i % 4] for i, b in enumerate(data))
+                    return json.loads(data.decode("utf-8", errors="replace"))
+
+                send_ws_text(
+                    {
+                        "type": "register",
+                        "id": "reg_1",
+                        "payload": {"client-key": self.ssap_client_key},
+                    }
+                )
+                for _ in range(4):
+                    msg = recv_ws_json()
+                    if msg.get("type") == "registered":
+                        break
+                send_ws_text(
+                    {
+                        "type": "request",
+                        "id": "req_1",
+                        "uri": uri,
+                        "payload": payload,
+                    }
+                )
+                reply = recv_ws_json()
+                pl = reply.get("payload") if isinstance(reply, dict) else {}
+                return {
+                    "ok": bool(reply.get("type") == "response" and (not isinstance(pl, dict) or pl.get("returnValue", True))),
+                    "payload": pl if isinstance(pl, dict) else {},
+                }
+
+    def call_resident_remote(self, action_payload: dict[str, Any], timeout: float = 0.9) -> dict[str, Any]:
+        if not self.voice_key or len(self.voice_key) != 64:
+            return {"ok": False, "error": "missing_voice_key"}
+        raw_body = json.dumps(action_payload, separators=(",", ":"))
+        ts_ms = self._now_ms_fn()
+        nonce = secrets.token_hex(16)
+        sig = sign_resident_remote_request(self.voice_key, ts_ms, nonce, raw_body)
+        headers = {
+            "Content-Type": "application/json",
+            "X-R2D2-Timestamp": str(ts_ms),
+            "X-R2D2-Nonce": nonce,
+            "X-R2D2-Signature": sig,
+        }
+        try:
+            status, body_text = self._http_post_fn(
+                self.tv_ip, self.remote_port, "/remote", headers, raw_body, timeout
+            )
+            parsed = json.loads(body_text or "{}")
+            if status == 200 and isinstance(parsed, dict) and parsed.get("ok"):
+                return parsed
+            return {"ok": False, "status": status, "error": parsed.get("error", "remote_failed")}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def send_remote_key(self, hap_key: int) -> dict[str, Any]:
+        key_name = HAP_REMOTE_KEY_TO_ACTION_KEY.get(hap_key)
+        if not key_name:
+            return {"ok": False, "error": "unsupported_remote_key", "hapKey": hap_key}
+        res = self.call_resident_remote({"action": "key", "key": key_name})
+        if res.get("ok"):
+            return res
+        # Fallback for media transport keys over SSAP if resident server is still starting
+        if key_name == "play_pause":
+            uri = "ssap://media.controls/play" if self._play_paused else "ssap://media.controls/pause"
+            self._play_paused = not self._play_paused
+            return self._ssap_request_fn(uri, {})
+        if key_name == "rewind":
+            return self._ssap_request_fn("ssap://media.controls/rewind", {})
+        if key_name == "fast_forward":
+            return self._ssap_request_fn("ssap://media.controls/fastForward", {})
+        return res
+
+    def send_power_mode_selection(self, mode: int) -> dict[str, Any]:
+        key_name = "home" if mode == 0 else "menu"
+        res = self.call_resident_remote({"action": "key", "key": key_name})
+        if res.get("ok"):
+            return res
+        if key_name == "home":
+            return self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
+        return res
+
+    def step_volume(self, decrement: bool) -> dict[str, Any]:
+        action = "volume_down" if decrement else "volume_up"
+        res = self.call_resident_remote({"action": action})
+        if res.get("ok"):
+            return res
+        uri = "ssap://audio/volumeDown" if decrement else "ssap://audio/volumeUp"
+        return self._ssap_request_fn(uri, {})
+
+    def set_volume(self, volume: int) -> dict[str, Any]:
+        clamped = max(0, min(100, int(volume)))
+        res = self.call_resident_remote({"action": "set_volume", "volume": clamped})
+        if res.get("ok"):
+            return res
+        return self._ssap_request_fn("ssap://audio/setVolume", {"volume": clamped})
+
+    def set_mute(self, muted: bool) -> dict[str, Any]:
+        res = self.call_resident_remote({"action": "set_mute", "mute": bool(muted)})
+        if res.get("ok"):
+            return res
+        return self._ssap_request_fn("ssap://audio/setMute", {"mute": bool(muted)})
+
+    def set_power(self, active: bool) -> dict[str, Any]:
+        if active:
+            wol_sent = 0
+            if self.tv_macs:
+                wol_sent = self._wol_sender_fn(self.tv_macs)
+            res = self.call_resident_remote({"action": "power_on"}, timeout=0.6)
+            return {"ok": True, "action": "power_on", "wolSent": wol_sent, "remote": res.get("ok", False)}
+        res = self.call_resident_remote({"action": "power_off"})
+        if res.get("ok"):
+            return res
+        return self._ssap_request_fn("ssap://system/turnOff", {})
+
+    def launch_app(self, app_id: str) -> dict[str, Any]:
+        res = self.call_resident_remote({"action": "launch_app", "appId": app_id})
+        if res.get("ok"):
+            return res
+        return self._ssap_request_fn("ssap://system.launcher/launch", {"id": app_id})
+
+    def poll_tv_state(self) -> dict[str, Any]:
+        if self._status_reader_fn is not None:
+            try:
+                st = self._status_reader_fn()
+                if isinstance(st, dict):
+                    return st
+            except Exception:
+                pass
+        res = self.call_resident_remote({"action": "status"}, timeout=0.6)
+        if res.get("ok"):
+            return {
+                "tvPower": res.get("tvPower", "active"),
+                "fgAppId": res.get("fgAppId", ""),
+            }
+        return {}
+
+
+# --- HomeKit Television Accessory State & Characteristic Model ---
+
+
+class HomeKitTvAccessory:
+    """Represents the HAP-IP Television Accessory (aid=1) and dispatches characteristic writes."""
+
+    # Characteristic (aid=1, iid) constants
+    IID_IDENTIFY = 2
+    IID_MANUFACTURER = 3
+    IID_MODEL = 4
+    IID_NAME = 5
+    IID_SERIAL = 6
+    IID_FIRMWARE = 7
+
+    IID_TV_SERVICE = 10
+    IID_TV_ACTIVE = 11
+    IID_TV_ACTIVE_IDENTIFIER = 12
+    IID_TV_CONFIGURED_NAME = 13
+    IID_TV_SLEEP_DISCOVERY = 14
+    IID_TV_REMOTE_KEY = 15
+    IID_TV_POWER_MODE = 16
+    IID_TV_CURRENT_MEDIA = 17
+    IID_TV_TARGET_MEDIA = 18
+
+    IID_SPEAKER_SERVICE = 20
+    IID_SPEAKER_ACTIVE = 21
+    IID_SPEAKER_MUTE = 22
+    IID_SPEAKER_VOL_CONTROL_TYPE = 23
+    IID_SPEAKER_VOLUME = 24
+    IID_SPEAKER_VOLUME_SELECTOR = 25
+
+    def __init__(
+        self,
+        controller: TvRemoteController,
+        name: str = "R2D2 TV",
+        manufacturer: str = "R2D2 Local",
+        model: str = "OLED65C1PUB",
+        serial_number: str = "R2D2-TV-LOCAL",
+        firmware_revision: str = "1.0.0",
+        input_sources: tuple[dict[str, Any], ...] = DEFAULT_INPUT_SOURCES,
+    ) -> None:
+        self.controller = controller
+        self.name = name
+        self.manufacturer = manufacturer
+        self.model = model
+        self.serial_number = serial_number
+        self.firmware_revision = firmware_revision
+        self.input_sources = list(input_sources)
+
+        self._app_to_identifier: dict[str, int] = {}
+        self._identifier_to_app: dict[int, str] = {}
+        for src in self.input_sources:
+            ident = int(src["identifier"])
+            app_id = str(src["app_id"])
+            self._app_to_identifier[app_id] = ident
+            self._identifier_to_app[ident] = app_id
+
+        self._values: dict[int, Any] = {
+            self.IID_MANUFACTURER: self.manufacturer,
+            self.IID_MODEL: self.model,
+            self.IID_NAME: self.name,
+            self.IID_SERIAL: self.serial_number,
+            self.IID_FIRMWARE: self.firmware_revision,
+            self.IID_TV_ACTIVE: 1,
+            self.IID_TV_ACTIVE_IDENTIFIER: 1,
+            self.IID_TV_CONFIGURED_NAME: self.name,
+            self.IID_TV_SLEEP_DISCOVERY: 1,
+            self.IID_TV_CURRENT_MEDIA: 0,
+            self.IID_TV_TARGET_MEDIA: 0,
+            self.IID_SPEAKER_ACTIVE: 1,
+            self.IID_SPEAKER_MUTE: False,
+            self.IID_SPEAKER_VOL_CONTROL_TYPE: 3,
+            self.IID_SPEAKER_VOLUME: 20,
+        }
+        for idx, src in enumerate(self.input_sources):
+            base_iid = 100 + idx * 10
+            self._values[base_iid + 1] = src["name"]
+            self._values[base_iid + 2] = src["name"]
+            self._values[base_iid + 3] = int(src["source_type"])
+            self._values[base_iid + 4] = 1
+            self._values[base_iid + 5] = 0
+            self._values[base_iid + 6] = 0
+            self._values[base_iid + 7] = int(src["identifier"])
+
+    def sync_from_tv_state(self, state: dict[str, Any] | None = None) -> list[tuple[int, int, Any]]:
+        st = state if state is not None else self.controller.poll_tv_state()
+        if not isinstance(st, dict) or not st:
+            return []
+        changed: list[tuple[int, int, Any]] = []
+        tv_power = str(st.get("tvPower") or "").strip().lower()
+        if tv_power in ("active", "on"):
+            new_active = 1
+        elif tv_power in ("standby", "off", "suspend", "unreachable"):
+            new_active = 0
+        else:
+            new_active = None
+        if new_active is not None and self._values.get(self.IID_TV_ACTIVE) != new_active:
+            self._values[self.IID_TV_ACTIVE] = new_active
+            changed.append((1, self.IID_TV_ACTIVE, new_active))
+
+        fg_app = str(st.get("fgAppId") or st.get("foregroundAppId") or "").strip()
+        if fg_app and fg_app in self._app_to_identifier:
+            new_ident = self._app_to_identifier[fg_app]
+            if self._values.get(self.IID_TV_ACTIVE_IDENTIFIER) != new_ident:
+                self._values[self.IID_TV_ACTIVE_IDENTIFIER] = new_ident
+                changed.append((1, self.IID_TV_ACTIVE_IDENTIFIER, new_ident))
+        return changed
+
+    def get_characteristic(self, iid: int) -> tuple[int, Any]:
+        if iid in (self.IID_IDENTIFY, self.IID_TV_REMOTE_KEY, self.IID_TV_POWER_MODE, self.IID_SPEAKER_VOLUME_SELECTOR):
+            # Write-only characteristic (-70405)
+            return -70405, None
+        if iid not in self._values:
+            return -70409, None
+        return 0, self._values[iid]
+
+    def put_characteristic(self, iid: int, value: Any) -> tuple[int, list[tuple[int, int, Any]]]:
+        events: list[tuple[int, int, Any]] = []
+        if iid == self.IID_IDENTIFY:
+            return 0, events
+        if iid == self.IID_TV_REMOTE_KEY:
+            self.controller.send_remote_key(int(value))
+            return 0, events
+        if iid == self.IID_TV_POWER_MODE:
+            self.controller.send_power_mode_selection(int(value))
+            return 0, events
+        if iid == self.IID_SPEAKER_VOLUME_SELECTOR:
+            decrement = int(value) == 1
+            self.controller.step_volume(decrement=decrement)
+            delta = -2 if decrement else 2
+            cur_vol = int(self._values.get(self.IID_SPEAKER_VOLUME, 20))
+            next_vol = max(0, min(100, cur_vol + delta))
+            self._values[self.IID_SPEAKER_VOLUME] = next_vol
+            events.append((1, self.IID_SPEAKER_VOLUME, next_vol))
+            return 0, events
+        if iid == self.IID_SPEAKER_VOLUME:
+            vol = max(0, min(100, int(value)))
+            self._values[self.IID_SPEAKER_VOLUME] = vol
+            self.controller.set_volume(vol)
+            events.append((1, self.IID_SPEAKER_VOLUME, vol))
+            return 0, events
+        if iid == self.IID_SPEAKER_MUTE:
+            muted = bool(value)
+            self._values[self.IID_SPEAKER_MUTE] = muted
+            self.controller.set_mute(muted)
+            events.append((1, self.IID_SPEAKER_MUTE, muted))
+            return 0, events
+        if iid == self.IID_SPEAKER_ACTIVE:
+            act = 1 if int(value) else 0
+            self._values[self.IID_SPEAKER_ACTIVE] = act
+            events.append((1, self.IID_SPEAKER_ACTIVE, act))
+            return 0, events
+        if iid == self.IID_TV_ACTIVE:
+            act = 1 if int(value) else 0
+            self._values[self.IID_TV_ACTIVE] = act
+            self.controller.set_power(active=bool(act))
+            events.append((1, self.IID_TV_ACTIVE, act))
+            return 0, events
+        if iid == self.IID_TV_ACTIVE_IDENTIFIER:
+            ident = int(value)
+            app_id = self._identifier_to_app.get(ident)
+            if not app_id:
+                return -70410, events
+            self._values[self.IID_TV_ACTIVE_IDENTIFIER] = ident
+            self.controller.launch_app(app_id)
+            events.append((1, self.IID_TV_ACTIVE_IDENTIFIER, ident))
+            return 0, events
+        if iid == self.IID_TV_CONFIGURED_NAME:
+            self._values[self.IID_TV_CONFIGURED_NAME] = str(value)[:64]
+            events.append((1, self.IID_TV_CONFIGURED_NAME, self._values[self.IID_TV_CONFIGURED_NAME]))
+            return 0, events
+        if iid == self.IID_TV_TARGET_MEDIA:
+            state_val = int(value) & 0x03
+            self._values[self.IID_TV_TARGET_MEDIA] = state_val
+            self._values[self.IID_TV_CURRENT_MEDIA] = state_val
+            self.controller.send_remote_key(HAP_REMOTE_KEY_PLAY_PAUSE)
+            events.append((1, self.IID_TV_TARGET_MEDIA, state_val))
+            events.append((1, self.IID_TV_CURRENT_MEDIA, state_val))
+            return 0, events
+
+        # Editable InputSource characteristics (ConfiguredName, IsConfigured, TargetVisibilityState)
+        for idx in range(len(self.input_sources)):
+            base_iid = 100 + idx * 10
+            if iid == base_iid + 2:
+                self._values[iid] = str(value)[:64]
+                events.append((1, iid, self._values[iid]))
+                return 0, events
+            if iid == base_iid + 4:
+                self._values[iid] = 1 if int(value) else 0
+                events.append((1, iid, self._values[iid]))
+                return 0, events
+            if iid == base_iid + 6:
+                vis = 1 if int(value) else 0
+                self._values[base_iid + 6] = vis
+                self._values[base_iid + 5] = vis
+                events.append((1, base_iid + 6, vis))
+                events.append((1, base_iid + 5, vis))
+                return 0, events
+
+        if iid in self._values:
+            return -70404, events
+        return -70409, events
+
+    def to_hap_accessories_dict(self) -> dict[str, Any]:
+        input_service_iids = [100 + idx * 10 for idx in range(len(self.input_sources))]
+        linked_iids = [self.IID_SPEAKER_SERVICE] + input_service_iids
+
+        services: list[dict[str, Any]] = [
+            {
+                "iid": 1,
+                "type": hap_uuid("3E"),
+                "characteristics": [
+                    {
+                        "iid": self.IID_IDENTIFY,
+                        "type": hap_uuid("14"),
+                        "perms": ["pw"],
+                        "format": "bool",
+                    },
+                    {
+                        "iid": self.IID_MANUFACTURER,
+                        "type": hap_uuid("20"),
+                        "perms": ["pr"],
+                        "format": "string",
+                        "value": self._values[self.IID_MANUFACTURER],
+                    },
+                    {
+                        "iid": self.IID_MODEL,
+                        "type": hap_uuid("21"),
+                        "perms": ["pr"],
+                        "format": "string",
+                        "value": self._values[self.IID_MODEL],
+                    },
+                    {
+                        "iid": self.IID_NAME,
+                        "type": hap_uuid("23"),
+                        "perms": ["pr"],
+                        "format": "string",
+                        "value": self._values[self.IID_NAME],
+                    },
+                    {
+                        "iid": self.IID_SERIAL,
+                        "type": hap_uuid("30"),
+                        "perms": ["pr"],
+                        "format": "string",
+                        "value": self._values[self.IID_SERIAL],
+                    },
+                    {
+                        "iid": self.IID_FIRMWARE,
+                        "type": hap_uuid("52"),
+                        "perms": ["pr"],
+                        "format": "string",
+                        "value": self._values[self.IID_FIRMWARE],
+                    },
+                ],
+            },
+            {
+                "iid": self.IID_TV_SERVICE,
+                "type": hap_uuid("D8"),
+                "primary": True,
+                "linked": linked_iids,
+                "characteristics": [
+                    {
+                        "iid": self.IID_TV_ACTIVE,
+                        "type": hap_uuid("B0"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 1,
+                        "minStep": 1,
+                        "value": self._values[self.IID_TV_ACTIVE],
+                    },
+                    {
+                        "iid": self.IID_TV_ACTIVE_IDENTIFIER,
+                        "type": hap_uuid("E7"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "uint32",
+                        "minValue": 1,
+                        "maxValue": max(1, len(self.input_sources)),
+                        "minStep": 1,
+                        "value": self._values[self.IID_TV_ACTIVE_IDENTIFIER],
+                    },
+                    {
+                        "iid": self.IID_TV_CONFIGURED_NAME,
+                        "type": hap_uuid("E3"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "string",
+                        "value": self._values[self.IID_TV_CONFIGURED_NAME],
+                    },
+                    {
+                        "iid": self.IID_TV_SLEEP_DISCOVERY,
+                        "type": hap_uuid("E8"),
+                        "perms": ["pr", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 1,
+                        "minStep": 1,
+                        "value": self._values[self.IID_TV_SLEEP_DISCOVERY],
+                    },
+                    {
+                        "iid": self.IID_TV_REMOTE_KEY,
+                        "type": hap_uuid("E1"),
+                        "perms": ["pw"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 16,
+                        "minStep": 1,
+                        "valid-values": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15],
+                    },
+                    {
+                        "iid": self.IID_TV_POWER_MODE,
+                        "type": hap_uuid("DF"),
+                        "perms": ["pw"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 1,
+                        "minStep": 1,
+                    },
+                    {
+                        "iid": self.IID_TV_CURRENT_MEDIA,
+                        "type": hap_uuid("180"),
+                        "perms": ["pr", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 5,
+                        "minStep": 1,
+                        "value": self._values[self.IID_TV_CURRENT_MEDIA],
+                    },
+                    {
+                        "iid": self.IID_TV_TARGET_MEDIA,
+                        "type": hap_uuid("137"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 2,
+                        "minStep": 1,
+                        "value": self._values[self.IID_TV_TARGET_MEDIA],
+                    },
+                ],
+            },
+            {
+                "iid": self.IID_SPEAKER_SERVICE,
+                "type": hap_uuid("113"),
+                "characteristics": [
+                    {
+                        "iid": self.IID_SPEAKER_ACTIVE,
+                        "type": hap_uuid("B0"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 1,
+                        "minStep": 1,
+                        "value": self._values[self.IID_SPEAKER_ACTIVE],
+                    },
+                    {
+                        "iid": self.IID_SPEAKER_MUTE,
+                        "type": hap_uuid("11A"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "bool",
+                        "value": self._values[self.IID_SPEAKER_MUTE],
+                    },
+                    {
+                        "iid": self.IID_SPEAKER_VOL_CONTROL_TYPE,
+                        "type": hap_uuid("E9"),
+                        "perms": ["pr", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 3,
+                        "minStep": 1,
+                        "value": self._values[self.IID_SPEAKER_VOL_CONTROL_TYPE],
+                    },
+                    {
+                        "iid": self.IID_SPEAKER_VOLUME,
+                        "type": hap_uuid("119"),
+                        "perms": ["pr", "pw", "ev"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 100,
+                        "minStep": 1,
+                        "unit": "percentage",
+                        "value": self._values[self.IID_SPEAKER_VOLUME],
+                    },
+                    {
+                        "iid": self.IID_SPEAKER_VOLUME_SELECTOR,
+                        "type": hap_uuid("EA"),
+                        "perms": ["pw"],
+                        "format": "uint8",
+                        "minValue": 0,
+                        "maxValue": 1,
+                        "minStep": 1,
+                    },
+                ],
+            },
+        ]
+
+        for idx, _ in enumerate(self.input_sources):
+            base_iid = 100 + idx * 10
+            services.append(
+                {
+                    "iid": base_iid,
+                    "type": hap_uuid("D9"),
+                    "characteristics": [
+                        {
+                            "iid": base_iid + 1,
+                            "type": hap_uuid("23"),
+                            "perms": ["pr"],
+                            "format": "string",
+                            "value": self._values[base_iid + 1],
+                        },
+                        {
+                            "iid": base_iid + 2,
+                            "type": hap_uuid("E3"),
+                            "perms": ["pr", "pw", "ev"],
+                            "format": "string",
+                            "value": self._values[base_iid + 2],
+                        },
+                        {
+                            "iid": base_iid + 3,
+                            "type": hap_uuid("DB"),
+                            "perms": ["pr", "ev"],
+                            "format": "uint8",
+                            "minValue": 0,
+                            "maxValue": 10,
+                            "minStep": 1,
+                            "value": self._values[base_iid + 3],
+                        },
+                        {
+                            "iid": base_iid + 4,
+                            "type": hap_uuid("D6"),
+                            "perms": ["pr", "pw", "ev"],
+                            "format": "uint8",
+                            "minValue": 0,
+                            "maxValue": 1,
+                            "minStep": 1,
+                            "value": self._values[base_iid + 4],
+                        },
+                        {
+                            "iid": base_iid + 5,
+                            "type": hap_uuid("135"),
+                            "perms": ["pr", "ev"],
+                            "format": "uint8",
+                            "minValue": 0,
+                            "maxValue": 1,
+                            "minStep": 1,
+                            "value": self._values[base_iid + 5],
+                        },
+                        {
+                            "iid": base_iid + 6,
+                            "type": hap_uuid("134"),
+                            "perms": ["pr", "pw", "ev"],
+                            "format": "uint8",
+                            "minValue": 0,
+                            "maxValue": 1,
+                            "minStep": 1,
+                            "value": self._values[base_iid + 6],
+                        },
+                        {
+                            "iid": base_iid + 7,
+                            "type": hap_uuid("E6"),
+                            "perms": ["pr", "ev"],
+                            "format": "uint32",
+                            "minValue": 1,
+                            "maxValue": 100,
+                            "minStep": 1,
+                            "value": self._values[base_iid + 7],
+                        },
+                    ],
+                }
+            )
+
+        return {"accessories": [{"aid": 1, "services": services}]}
+
+
+# --- Persistent Pairing Store ---
+
+
+class HapPairingState:
+    """Stores long-term Ed25519 accessory keys, setup code/ID, and paired HomeKit controllers."""
+
+    def __init__(
+        self,
+        state_path: Path | None = None,
+        device_id: str | None = None,
+        setup_code: str | None = None,
+        setup_id: str | None = None,
+        ltsk_seed: bytes | None = None,
+    ) -> None:
+        self.state_path = state_path
+        self.device_id = device_id or self._random_device_id()
+        self.setup_code = setup_code or self._random_setup_code()
+        self.setup_id = setup_id or self._random_setup_id()
+        self.ltsk_seed = ltsk_seed or secrets.token_bytes(32)
+        self.ltpk = ed25519_public_key(self.ltsk_seed)
+        self.config_num = 1
+        self.pairings: dict[str, dict[str, Any]] = {}
+        if self.state_path is not None and self.state_path.is_file():
+            self.load()
+        elif self.state_path is not None:
+            self.save()
+
+    @staticmethod
+    def _random_device_id() -> str:
+        raw = bytearray(secrets.token_bytes(6))
+        raw[0] = (raw[0] | 0x02) & 0xFE
+        return ":".join(f"{b:02X}" for b in raw)
+
+    @staticmethod
+    def _random_setup_code() -> str:
+        banned = {
+            "000-00-000",
+            "111-11-111",
+            "222-22-222",
+            "333-33-333",
+            "444-44-444",
+            "555-55-555",
+            "666-66-666",
+            "777-77-777",
+            "888-88-888",
+            "999-99-999",
+            "123-45-678",
+            "876-54-321",
+        }
+        while True:
+            d = "".join(str(secrets.randbelow(10)) for _ in range(8))
+            code = f"{d[:3]}-{d[3:5]}-{d[5:]}"
+            if code not in banned:
+                return code
+
+    @staticmethod
+    def _random_setup_id() -> str:
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return "".join( alphabet[secrets.randbelow(len(alphabet))] for _ in range(4) )
+
+    @property
+    def is_paired(self) -> bool:
+        return len(self.pairings) > 0
+
+    @property
+    def setup_uri(self) -> str:
+        return compute_setup_uri(self.setup_code, self.setup_id, DEFAULT_CATEGORY_TELEVISION)
+
+    @property
+    def setup_hash(self) -> str:
+        return compute_setup_hash(self.setup_id, self.device_id)
+
+    def load(self) -> None:
+        if self.state_path is None or not self.state_path.is_file():
+            return
+        data = json.loads(self.state_path.read_text("utf-8"))
+        self.device_id = str(data.get("device_id") or self.device_id)
+        self.setup_code = str(data.get("setup_code") or self.setup_code)
+        self.setup_id = str(data.get("setup_id") or self.setup_id)
+        if data.get("ltsk_hex"):
+            self.ltsk_seed = bytes.fromhex(data["ltsk_hex"])
+            self.ltpk = ed25519_public_key(self.ltsk_seed)
+        self.config_num = int(data.get("config_num") or 1)
+        raw_pairings = data.get("pairings")
+        if isinstance(raw_pairings, dict):
+            self.pairings = {
+                str(k): {
+                    "public_key": str(v.get("public_key", "")),
+                    "permissions": int(v.get("permissions", 0)),
+                }
+                for k, v in raw_pairings.items()
+                if isinstance(v, dict) and v.get("public_key")
+            }
+
+    def save(self) -> None:
+        if self.state_path is None:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = self.state_path.with_suffix(".tmp")
+        payload = {
+            "schema": 1,
+            "device_id": self.device_id,
+            "setup_code": self.setup_code,
+            "setup_id": self.setup_id,
+            "setup_uri": self.setup_uri,
+            "ltsk_hex": self.ltsk_seed.hex(),
+            "ltpk_hex": self.ltpk.hex(),
+            "config_num": self.config_num,
+            "pairings": self.pairings,
+        }
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.replace(str(tmp_path), str(self.state_path))
+
+
+# --- HAP Encrypted Session Framing (ChaCha20-Poly1305 1024-byte blocks) ---
+
+
+class HapSessionCipher:
+    """Encrypts and decrypts HAP-IP HTTP frames after /pair-verify M4."""
+
+    def __init__(self, shared_secret: bytes) -> None:
+        self.accessory_to_controller_key = hkdf_sha512(
+            shared_secret, b"Control-Salt", b"Control-Read-Encryption-Key", 32
+        )
+        self.controller_to_accessory_key = hkdf_sha512(
+            shared_secret, b"Control-Salt", b"Control-Write-Encryption-Key", 32
+        )
+        self.send_counter = 0
+        self.recv_counter = 0
+        self._recv_buf = bytearray()
+
+    def encrypt_bytes(self, data: bytes) -> bytes:
+        out = bytearray()
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset : offset + 1024]
+            aad = struct.pack("<H", len(chunk))
+            nonce = b"\x00\x00\x00\x00" + struct.pack("<Q", self.send_counter)
+            self.send_counter += 1
+            ct = chacha20_poly1305_encrypt(self.accessory_to_controller_key, nonce, chunk, aad)
+            out.extend(aad)
+            out.extend(ct)
+            offset += len(chunk)
+        return bytes(out)
+
+    def feed_and_decrypt(self, encrypted_bytes: bytes) -> bytes:
+        self._recv_buf.extend(encrypted_bytes)
+        plaintext = bytearray()
+        while len(self._recv_buf) >= 2:
+            block_len = struct.unpack("<H", self._recv_buf[:2])[0]
+            total_frame_len = 2 + block_len + 16
+            if len(self._recv_buf) < total_frame_len:
+                break
+            aad = bytes(self._recv_buf[:2])
+            ct_and_tag = bytes(self._recv_buf[2:total_frame_len])
+            del self._recv_buf[:total_frame_len]
+            nonce = b"\x00\x00\x00\x00" + struct.pack("<Q", self.recv_counter)
+            self.recv_counter += 1
+            pt = chacha20_poly1305_decrypt(self.controller_to_accessory_key, nonce, ct_and_tag, aad)
+            plaintext.extend(pt)
+        return bytes(plaintext)
+
+
+# --- HAP Protocol Request Processor ---
+
+
+class HapProtocolProcessor:
+    """Processes HAP HTTP requests (/pair-setup, /pair-verify, /pairings, /accessories, /characteristics)."""
+
+    def __init__(self, pairing_state: HapPairingState, accessory: HomeKitTvAccessory) -> None:
+        self.pairing_state = pairing_state
+        self.accessory = accessory
+        self.srp_session: HapSrpServerSession | None = None
+
+    def handle_pair_setup(self, body: bytes) -> tuple[int, str, bytes]:
+        tlv = tlv8_decode(body)
+        state = tlv.get(TLV_STATE, b"\x00")[0]
+
+        if state == 1:
+            if self.pairing_state.is_paired:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x02"), (TLV_ERROR, bytes([TLV_ERROR_UNAVAILABLE]))]),
+                )
+            self.srp_session = HapSrpServerSession(self.pairing_state.setup_code)
+            return (
+                200,
+                "application/pairing+tlv8",
+                tlv8_encode(
+                    [
+                        (TLV_STATE, b"\x02"),
+                        (TLV_PUBLIC_KEY, self.srp_session.public_key_bytes),
+                        (TLV_SALT, self.srp_session.salt),
+                    ]
+                ),
+            )
+
+        if state == 3:
+            if self.srp_session is None:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))]),
+                )
+            client_pub = tlv.get(TLV_PUBLIC_KEY, b"")
+            client_proof = tlv.get(TLV_PROOF, b"")
+            server_proof = self.srp_session.compute_client_proof(client_pub, client_proof)
+            if server_proof is None:
+                self.srp_session = None
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                )
+            return (
+                200,
+                "application/pairing+tlv8",
+                tlv8_encode([(TLV_STATE, b"\x04"), (TLV_PROOF, server_proof)]),
+            )
+
+        if state == 5:
+            if self.srp_session is None or self.srp_session.K is None:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))]),
+                )
+            enc_data = tlv.get(TLV_ENCRYPTED_DATA, b"")
+            session_key = hkdf_sha512(
+                self.srp_session.K, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32
+            )
+            try:
+                sub_bytes = chacha20_poly1305_decrypt(session_key, b"\x00\x00\x00\x00PS-Msg05", enc_data)
+            except Exception:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                )
+            sub_tlv = tlv8_decode(sub_bytes)
+            ios_id = sub_tlv.get(TLV_IDENTIFIER, b"")
+            ios_ltpk = sub_tlv.get(TLV_PUBLIC_KEY, b"")
+            ios_sig = sub_tlv.get(TLV_SIGNATURE, b"")
+            ios_x = hkdf_sha512(
+                self.srp_session.K,
+                b"Pair-Setup-Controller-Sign-Salt",
+                b"Pair-Setup-Controller-Sign-Info",
+                32,
+            )
+            if not ed25519_verify(ios_ltpk, ios_sig, ios_x + ios_id + ios_ltpk):
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                )
+            self.pairing_state.pairings[ios_id.decode("utf-8", errors="replace")] = {
+                "public_key": ios_ltpk.hex(),
+                "permissions": 1,
+            }
+            self.pairing_state.save()
+
+            acc_x = hkdf_sha512(
+                self.srp_session.K,
+                b"Pair-Setup-Accessory-Sign-Salt",
+                b"Pair-Setup-Accessory-Sign-Info",
+                32,
+            )
+            acc_id = self.pairing_state.device_id.encode("utf-8")
+            acc_sig = ed25519_sign(self.pairing_state.ltsk_seed, acc_x + acc_id + self.pairing_state.ltpk)
+            resp_sub = tlv8_encode(
+                [
+                    (TLV_IDENTIFIER, acc_id),
+                    (TLV_PUBLIC_KEY, self.pairing_state.ltpk),
+                    (TLV_SIGNATURE, acc_sig),
+                ]
+            )
+            resp_enc = chacha20_poly1305_encrypt(session_key, b"\x00\x00\x00\x00PS-Msg06", resp_sub)
+            self.srp_session = None
+            return (
+                200,
+                "application/pairing+tlv8",
+                tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ENCRYPTED_DATA, resp_enc)]),
+            )
+
+        return (
+            200,
+            "application/pairing+tlv8",
+            tlv8_encode([(TLV_STATE, bytes([state + 1])), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))]),
+        )
+
+    def handle_pair_verify(
+        self, body: bytes, conn_verify_ctx: dict[str, Any]
+    ) -> tuple[int, str, bytes, bytes | None]:
+        tlv = tlv8_decode(body)
+        state = tlv.get(TLV_STATE, b"\x00")[0]
+
+        if state == 1:
+            client_curve_pub = tlv.get(TLV_PUBLIC_KEY, b"")
+            if len(client_curve_pub) != 32:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x02"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                    None,
+                )
+            acc_curve_priv, acc_curve_pub = x25519_keypair()
+            shared_secret = x25519_scalarmult(acc_curve_priv, client_curve_pub)
+            acc_id = self.pairing_state.device_id.encode("utf-8")
+            acc_info = acc_curve_pub + acc_id + client_curve_pub
+            acc_sig = ed25519_sign(self.pairing_state.ltsk_seed, acc_info)
+            sub_tlv = tlv8_encode([(TLV_IDENTIFIER, acc_id), (TLV_SIGNATURE, acc_sig)])
+            session_key = hkdf_sha512(
+                shared_secret, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32
+            )
+            enc_sub = chacha20_poly1305_encrypt(session_key, b"\x00\x00\x00\x00PV-Msg02", sub_tlv)
+            conn_verify_ctx["shared_secret"] = shared_secret
+            conn_verify_ctx["session_key"] = session_key
+            conn_verify_ctx["acc_curve_pub"] = acc_curve_pub
+            conn_verify_ctx["client_curve_pub"] = client_curve_pub
+            return (
+                200,
+                "application/pairing+tlv8",
+                tlv8_encode(
+                    [
+                        (TLV_STATE, b"\x02"),
+                        (TLV_PUBLIC_KEY, acc_curve_pub),
+                        (TLV_ENCRYPTED_DATA, enc_sub),
+                    ]
+                ),
+                None,
+            )
+
+        if state == 3:
+            session_key = conn_verify_ctx.get("session_key")
+            shared_secret = conn_verify_ctx.get("shared_secret")
+            acc_curve_pub = conn_verify_ctx.get("acc_curve_pub")
+            client_curve_pub = conn_verify_ctx.get("client_curve_pub")
+            if not (session_key and shared_secret and acc_curve_pub and client_curve_pub):
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                    None,
+                )
+            enc_data = tlv.get(TLV_ENCRYPTED_DATA, b"")
+            try:
+                sub_bytes = chacha20_poly1305_decrypt(session_key, b"\x00\x00\x00\x00PV-Msg03", enc_data)
+            except Exception:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                    None,
+                )
+            sub_tlv = tlv8_decode(sub_bytes)
+            ios_id_bytes = sub_tlv.get(TLV_IDENTIFIER, b"")
+            ios_sig = sub_tlv.get(TLV_SIGNATURE, b"")
+            ios_id_str = ios_id_bytes.decode("utf-8", errors="replace")
+            pairing = self.pairing_state.pairings.get(ios_id_str)
+            if not pairing:
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                    None,
+                )
+            ios_ltpk = bytes.fromhex(pairing["public_key"])
+            ios_info = client_curve_pub + ios_id_bytes + acc_curve_pub
+            if not ed25519_verify(ios_ltpk, ios_sig, ios_info):
+                return (
+                    200,
+                    "application/pairing+tlv8",
+                    tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))]),
+                    None,
+                )
+            conn_verify_ctx["verified_controller"] = ios_id_str
+            return (
+                200,
+                "application/pairing+tlv8",
+                tlv8_encode([(TLV_STATE, b"\x04")]),
+                shared_secret,
+            )
+
+        return (
+            200,
+            "application/pairing+tlv8",
+            tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))]),
+            None,
+        )
+
+    def handle_pairings(self, body: bytes) -> tuple[int, str, bytes]:
+        tlv = tlv8_decode(body)
+        method = tlv.get(TLV_METHOD, b"\x00")[0]
+        if method == 3:  # Add pairing
+            ident = tlv.get(TLV_IDENTIFIER, b"").decode("utf-8", errors="replace")
+            pk = tlv.get(TLV_PUBLIC_KEY, b"")
+            perms = tlv.get(TLV_PERMISSIONS, b"\x00")[0]
+            if ident and len(pk) == 32:
+                self.pairing_state.pairings[ident] = {"public_key": pk.hex(), "permissions": perms}
+                self.pairing_state.save()
+            return 200, "application/pairing+tlv8", tlv8_encode([(TLV_STATE, b"\x02")])
+        if method == 4:  # Remove pairing
+            ident = tlv.get(TLV_IDENTIFIER, b"").decode("utf-8", errors="replace")
+            self.pairing_state.pairings.pop(ident, None)
+            self.pairing_state.save()
+            return 200, "application/pairing+tlv8", tlv8_encode([(TLV_STATE, b"\x02")])
+        if method == 5:  # List pairings
+            items: list[tuple[int, bytes]] = [(TLV_STATE, b"\x02")]
+            first = True
+            for ident, info in self.pairing_state.pairings.items():
+                if not first:
+                    items.append((TLV_SEPARATOR, b""))
+                first = False
+                items.append((TLV_IDENTIFIER, ident.encode("utf-8")))
+                items.append((TLV_PUBLIC_KEY, bytes.fromhex(info["public_key"])))
+                items.append((TLV_PERMISSIONS, bytes([int(info.get("permissions", 0))])))
+            return 200, "application/pairing+tlv8", tlv8_encode(items)
+        return (
+            200,
+            "application/pairing+tlv8",
+            tlv8_encode([(TLV_STATE, b"\x02"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))]),
+        )
+
+
+# --- Terminal QR Code & Setup Card Renderer ---
+
+
+def render_setup_banner(pairing_state: HapPairingState, port: int) -> str:
+    lines = [
+        "==============================================================",
+        "  R2D2 TV — Apple HomeKit Television Remote",
+        "==============================================================",
+        f"  Accessory Name : R2D2 TV",
+        f"  Category       : Television (ci={DEFAULT_CATEGORY_TELEVISION})",
+        f"  Device ID      : {pairing_state.device_id}",
+        f"  HAP TCP Port   : {port}",
+        f"  Setup Code     : {pairing_state.setup_code}",
+        f"  Setup URI      : {pairing_state.setup_uri}",
+        f"  Paired         : {'Yes' if pairing_state.is_paired else 'No (Ready to Pair in Apple Home)'}",
+        "==============================================================",
+    ]
+    return "\n".join(lines)
+
+
+# --- Live HAP-IP Socket Server & Avahi mDNS Publisher ---
+
+
+class HomeKitTvServer:
+    """Multithreaded HAP-IP HTTP/1.1 + EVENT/1.0 server with encrypted session upgrading."""
+
+    def __init__(
+        self,
+        pairing_state: HapPairingState,
+        accessory: HomeKitTvAccessory,
+        host: str = "0.0.0.0",
+        port: int = DEFAULT_HAP_PORT,
+        enable_mdns: bool = True,
+    ) -> None:
+        self.pairing_state = pairing_state
+        self.accessory = accessory
+        self.processor = HapProtocolProcessor(pairing_state, accessory)
+        self.host = host
+        self.port = port
+        self.enable_mdns = enable_mdns
+        self._sock: socket.socket | None = None
+        self._stop_event = threading.Event()
+        self._clients_lock = threading.Lock()
+        self._subscribed_clients: dict[socket.socket, tuple[HapSessionCipher, set[tuple[int, int]]]] = {}
+        self._avahi_proc: subprocess.Popen[bytes] | None = None
+        self._last_paired_flag: bool | None = None
+
+    def _update_mdns_advertisement(self) -> None:
+        if not self.enable_mdns:
+            return
+        avahi_bin = shutil.which("avahi-publish-service")
+        if not avahi_bin:
+            return
+        paired = self.pairing_state.is_paired
+        if self._avahi_proc is not None and self._avahi_proc.poll() is None and self._last_paired_flag == paired:
+            return
+        self._stop_mdns()
+        sf = "0" if paired else "1"
+        cmd = [
+            avahi_bin,
+            "R2D2 TV",
+            "_hap._tcp",
+            str(self.port),
+            f"c#={self.pairing_state.config_num}",
+            "ff=0",
+            f"id={self.pairing_state.device_id}",
+            f"md={self.accessory.model}",
+            "pv=1.1",
+            "s#=1",
+            f"sf={sf}",
+            f"ci={DEFAULT_CATEGORY_TELEVISION}",
+            f"sh={self.pairing_state.setup_hash}",
+        ]
+        try:
+            self._avahi_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            self._last_paired_flag = paired
+        except Exception:
+            self._avahi_proc = None
+
+    def _stop_mdns(self) -> None:
+        if self._avahi_proc is not None:
+            try:
+                self._avahi_proc.terminate()
+                self._avahi_proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    self._avahi_proc.kill()
+                except Exception:
+                    pass
+            self._avahi_proc = None
+
+    def broadcast_events(self, changes: list[tuple[int, int, Any]], exclude_sock: socket.socket | None = None) -> None:
+        if not changes:
+            return
+        with self._clients_lock:
+            targets = list(self._subscribed_clients.items())
+        for sock, (cipher, subs) in targets:
+            if sock is exclude_sock:
+                continue
+            relevant = [
+                {"aid": aid, "iid": iid, "value": val}
+                for (aid, iid, val) in changes
+                if (aid, iid) in subs
+            ]
+            if not relevant:
+                continue
+            body_bytes = json.dumps({"characteristics": relevant}, separators=(",", ":")).encode("utf-8")
+            event_http = (
+                b"EVENT/1.0 200 OK\r\n"
+                b"Content-Type: application/hap+json\r\n"
+                + f"Content-Length: {len(body_bytes)}\r\n\r\n".encode("ascii")
+                + body_bytes
+            )
+            try:
+                sock.sendall(cipher.encrypt_bytes(event_http))
+            except Exception:
+                with self._clients_lock:
+                    self._subscribed_clients.pop(sock, None)
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        conn.settimeout(60.0)
+        cipher: HapSessionCipher | None = None
+        verify_ctx: dict[str, Any] = {}
+        subscriptions: set[tuple[int, int]] = set()
+        plain_buf = bytearray()
+
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    raw = conn.recv(8192)
+                except socket.timeout:
+                    continue
+                if not raw:
+                    break
+
+                if cipher is not None:
+                    plain_buf.extend(cipher.feed_and_decrypt(raw))
+                else:
+                    plain_buf.extend(raw)
+
+                while b"\r\n\r\n" in plain_buf:
+                    hdr_end = plain_buf.index(b"\r\n\r\n")
+                    hdr_bytes = bytes(plain_buf[:hdr_end])
+                    hdr_lines = hdr_bytes.decode("iso-8859-1", errors="replace").split("\r\n")
+                    req_line = hdr_lines[0].split(" ")
+                    if len(req_line) < 2:
+                        del plain_buf[:]
+                        break
+                    method = req_line[0].upper()
+                    target = req_line[1]
+                    headers: dict[str, str] = {}
+                    for line in hdr_lines[1:]:
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            headers[k.strip().lower()] = v.strip()
+                    content_len = int(headers.get("content-length", "0") or "0")
+                    total_needed = hdr_end + 4 + content_len
+                    if len(plain_buf) < total_needed:
+                        break
+                    body = bytes(plain_buf[hdr_end + 4 : total_needed])
+                    del plain_buf[:total_needed]
+
+                    path_part, _, query_part = target.partition("?")
+                    new_shared_secret: bytes | None = None
+                    pending_events: list[tuple[int, int, Any]] = []
+
+                    if path_part == "/pair-setup" and method == "POST":
+                        status, ctype, resp_body = self.processor.handle_pair_setup(body)
+                        self._update_mdns_advertisement()
+                    elif path_part == "/pair-verify" and method == "POST":
+                        status, ctype, resp_body, new_shared_secret = self.processor.handle_pair_verify(
+                            body, verify_ctx
+                        )
+                    elif path_part == "/identify" and method == "POST":
+                        if self.pairing_state.is_paired:
+                            status = 400
+                            ctype = "application/hap+json"
+                            resp_body = json.dumps({"status": -70401}).encode("utf-8")
+                        else:
+                            status = 204
+                            ctype = "application/hap+json"
+                            resp_body = b""
+                    elif cipher is None:
+                        status = 470
+                        ctype = "application/hap+json"
+                        resp_body = json.dumps({"status": -70401}).encode("utf-8")
+                    elif path_part == "/pairings" and method == "POST":
+                        status, ctype, resp_body = self.processor.handle_pairings(body)
+                        self._update_mdns_advertisement()
+                    elif path_part == "/accessories" and method == "GET":
+                        self.accessory.sync_from_tv_state()
+                        status = 200
+                        ctype = "application/hap+json"
+                        resp_body = json.dumps(
+                            self.accessory.to_hap_accessories_dict(), separators=(",", ":")
+                        ).encode("utf-8")
+                    elif path_part == "/characteristics" and method == "GET":
+                        self.accessory.sync_from_tv_state()
+                        ids_param = ""
+                        for kv in query_part.split("&"):
+                            if kv.startswith("id="):
+                                ids_param = kv[3:]
+                        chars_out = []
+                        any_error = False
+                        for item in ids_param.split(","):
+                            if "." not in item:
+                                continue
+                            aid_s, iid_s = item.split(".", 1)
+                            aid_i = int(aid_s)
+                            iid_i = int(iid_s)
+                            st_code, val = self.accessory.get_characteristic(iid_i)
+                            if st_code == 0:
+                                chars_out.append({"aid": aid_i, "iid": iid_i, "value": val})
+                            else:
+                                any_error = True
+                                chars_out.append({"aid": aid_i, "iid": iid_i, "status": st_code})
+                        if any_error:
+                            for entry in chars_out:
+                                entry.setdefault("status", 0)
+                            status = 207
+                        else:
+                            status = 200
+                        ctype = "application/hap+json"
+                        resp_body = json.dumps(
+                            {"characteristics": chars_out}, separators=(",", ":")
+                        ).encode("utf-8")
+                    elif path_part == "/characteristics" and method == "PUT":
+                        req_json = json.loads(body.decode("utf-8", errors="replace") or "{}")
+                        req_chars = req_json.get("characteristics", [])
+                        status_list = []
+                        any_err = False
+                        for ch in req_chars:
+                            aid_i = int(ch.get("aid", 1))
+                            iid_i = int(ch.get("iid", 0))
+                            st_code = 0
+                            if "ev" in ch:
+                                if ch["ev"]:
+                                    subscriptions.add((aid_i, iid_i))
+                                else:
+                                    subscriptions.discard((aid_i, iid_i))
+                                with self._clients_lock:
+                                    self._subscribed_clients[conn] = (cipher, subscriptions)
+                            if "value" in ch:
+                                st_code, evs = self.accessory.put_characteristic(iid_i, ch["value"])
+                                pending_events.extend(evs)
+                            if st_code != 0:
+                                any_err = True
+                            status_list.append({"aid": aid_i, "iid": iid_i, "status": st_code})
+                        if any_err:
+                            status = 207
+                            ctype = "application/hap+json"
+                            resp_body = json.dumps(
+                                {"characteristics": status_list}, separators=(",", ":")
+                            ).encode("utf-8")
+                        else:
+                            status = 204
+                            ctype = "application/hap+json"
+                            resp_body = b""
+                    else:
+                        status = 404
+                        ctype = "application/hap+json"
+                        resp_body = json.dumps({"status": -70409}).encode("utf-8")
+
+                    reason = {200: "OK", 204: "No Content", 207: "Multi-Status", 400: "Bad Request", 404: "Not Found", 470: "Connection Authorization Required"}.get(
+                        status, "OK"
+                    )
+                    if status == 204:
+                        http_resp = f"HTTP/1.1 204 {reason}\r\n\r\n".encode("ascii")
+                    else:
+                        http_resp = (
+                            f"HTTP/1.1 {status} {reason}\r\n"
+                            f"Content-Type: {ctype}\r\n"
+                            f"Content-Length: {len(resp_body)}\r\n"
+                            f"Connection: keep-alive\r\n\r\n".encode("ascii")
+                            + resp_body
+                        )
+
+                    if cipher is not None:
+                        conn.sendall(cipher.encrypt_bytes(http_resp))
+                    else:
+                        conn.sendall(http_resp)
+
+                    if new_shared_secret is not None:
+                        cipher = HapSessionCipher(new_shared_secret)
+                        with self._clients_lock:
+                            self._subscribed_clients[conn] = (cipher, subscriptions)
+
+                    if pending_events:
+                        self.broadcast_events(pending_events, exclude_sock=conn)
+        except Exception:
+            pass
+        finally:
+            with self._clients_lock:
+                self._subscribed_clients.pop(conn, None)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def start(self) -> int:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((self.host, self.port))
+        sock.listen(16)
+        self.port = int(sock.getsockname()[1])
+        self._sock = sock
+        self._stop_event.clear()
+        self._update_mdns_advertisement()
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+        threading.Thread(target=self._poll_loop, daemon=True).start()
+        return self.port
+
+    def _accept_loop(self) -> None:
+        while not self._stop_event.is_set() and self._sock is not None:
+            try:
+                rlist, _, _ = select.select([self._sock], [], [], 0.5)
+                if not rlist:
+                    continue
+                conn, _ = self._sock.accept()
+                threading.Thread(target=self._handle_client, args=(conn,), daemon=True).start()
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.is_set():
+            time.sleep(5.0)
+            if self._stop_event.is_set():
+                break
+            try:
+                changes = self.accessory.sync_from_tv_state()
+                if changes:
+                    self.broadcast_events(changes)
+                self._update_mdns_advertisement()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self._stop_event.set()
+        self._stop_mdns()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        with self._clients_lock:
+            for sock in list(self._subscribed_clients.keys()):
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            self._subscribed_clients.clear()
+
+
+# --- CLI & Runtime Loader on Spark ---
+
+
+def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, Any]:
+    base = agent_data_dir or (Path.home() / ".local/share/r2d2-agent")
+    voice_key = ""
+    tv_macs: list[str] = []
+    ssap_client_key = ""
+
+    for vk_candidate in (base / "state/voice.key", base / "voice.key"):
+        if vk_candidate.is_file():
+            try:
+                voice_key = vk_candidate.read_text("utf-8").strip()
+                if voice_key:
+                    break
+            except Exception:
+                pass
+
+    for enr_candidate in (base / "state/enrollment.json", base / "enrollment.json"):
+        if enr_candidate.is_file():
+            try:
+                enr = json.loads(enr_candidate.read_text("utf-8"))
+                if not voice_key:
+                    voice_key = str(enr.get("voice_key") or "").strip()
+                if isinstance(enr.get("tv_macs"), list):
+                    tv_macs.extend(str(m) for m in enr["tv_macs"] if m)
+            except Exception:
+                pass
+
+    for ssap_candidate in (
+        base / "state/tv-ssap/pairing.json",
+        Path.home() / ".config/r2d2-tv-ssap/client-key.json",
+    ):
+        if ssap_candidate.is_file():
+            try:
+                sk = json.loads(ssap_candidate.read_text("utf-8"))
+                ssap_client_key = str(
+                    sk.get("client-key") or sk.get("client_key") or sk.get("clientKey") or ""
+                ).strip()
+                if ssap_client_key:
+                    break
+            except Exception:
+                pass
+
+    pair_sock = base / "pair/pair.sock"
+    agentctl_candidates = [base / "current/agentctl.py"]
+    versions_dir = base / "versions"
+    if versions_dir.is_dir():
+        for vdir in sorted(versions_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            cand = vdir / "agentctl.py"
+            if cand.is_file():
+                agentctl_candidates.insert(0, cand)
+
+    def read_agentctl_status() -> dict[str, Any]:
+        agentctl_path = next((p for p in agentctl_candidates if p.is_file()), None)
+        if agentctl_path is None:
+            return {}
+        try:
+            cmd = [sys.executable, "-B", str(agentctl_path)]
+            if pair_sock.exists():
+                cmd.extend(["--socket", str(pair_sock)])
+            cmd.append("status")
+            proc = subprocess.run(
+                cmd,
+                cwd=str(agentctl_path.parent),
+                capture_output=True,
+                text=True,
+                timeout=2.5,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return {}
+            parsed = json.loads(proc.stdout or "{}")
+            result = parsed.get("result") if isinstance(parsed.get("result"), dict) else parsed
+            resident = result.get("resident") if isinstance(result.get("resident"), dict) else {}
+            last_report = (
+                resident.get("lastMaintenanceReport")
+                if isinstance(resident.get("lastMaintenanceReport"), dict)
+                else {}
+            )
+            tv_obj = result.get("tv") if isinstance(result.get("tv"), dict) else {}
+            for mac_list in (last_report.get("tvMacs"), tv_obj.get("tv_macs")):
+                if isinstance(mac_list, list):
+                    for m in mac_list:
+                        if isinstance(m, str) and m and m not in tv_macs:
+                            tv_macs.append(m)
+            last_poll_at = resident.get("lastPollAt")
+            # Consider TV in standby if resident hasn't polled recently (>60s) when monotonic clock is available
+            tv_power = str(
+                resident.get("tvPower")
+                or last_report.get("tvPower")
+                or tv_obj.get("tv_power")
+                or ""
+            ).strip()
+            if isinstance(last_poll_at, (int, float)) and time.monotonic() - float(last_poll_at) > 45.0:
+                tv_power = "standby"
+            fg_app = str(
+                resident.get("foregroundAppId")
+                or last_report.get("foregroundAppId")
+                or tv_obj.get("foreground_app")
+                or ""
+            ).strip()
+            return {
+                "tvPower": tv_power,
+                "fgAppId": fg_app,
+            }
+        except Exception:
+            return {}
+
+    read_agentctl_status()
+    return {
+        "voice_key": voice_key,
+        "tv_macs": tv_macs,
+        "ssap_client_key": ssap_client_key,
+        "status_reader_fn": read_agentctl_status,
+        "state_path": base / "homekit-tv/state.json",
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="R2D2 TV HomeKit Television Bridge")
+    parser.add_argument("--port", type=int, default=DEFAULT_HAP_PORT)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--state-file", default="")
+    parser.add_argument("--no-mdns", action="store_true")
+    parser.add_argument("--print-setup", action="store_true")
+    args = parser.parse_args(argv)
+
+    ctx = load_spark_runtime_context()
+    state_path = Path(args.state_file) if args.state_file else ctx["state_path"]
+    pairing_state = HapPairingState(state_path=state_path)
+
+    if args.print_setup:
+        print(render_setup_banner(pairing_state, args.port), flush=True)
+        return 0
+
+    controller = TvRemoteController(
+        tv_ip=TV_IP,
+        remote_port=DEFAULT_REMOTE_PORT,
+        voice_key=ctx["voice_key"],
+        tv_macs=ctx["tv_macs"],
+        ssap_client_key=ctx["ssap_client_key"],
+        status_reader_fn=ctx["status_reader_fn"],
+    )
+    accessory = HomeKitTvAccessory(controller=controller)
+    accessory.sync_from_tv_state()
+    server = HomeKitTvServer(
+        pairing_state=pairing_state,
+        accessory=accessory,
+        host=args.host,
+        port=args.port,
+        enable_mdns=not args.no_mdns,
+    )
+    bound_port = server.start()
+    print(render_setup_banner(pairing_state, bound_port), flush=True)
+
+    stop_ev = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, lambda *_: stop_ev.set())
+        except Exception:
+            pass
+    try:
+        while not stop_ev.is_set():
+            stop_ev.wait(1.0)
+    finally:
+        server.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

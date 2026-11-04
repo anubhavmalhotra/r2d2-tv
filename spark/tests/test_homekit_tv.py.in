@@ -1,0 +1,277 @@
+import hashlib
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+import homekit_tv
+
+
+class HomeKitTvTests(unittest.TestCase):
+    def test_tlv8_roundtrip_and_fragmentation(self):
+        big_payload = bytes(range(256)) * 2 + b"tail"
+        encoded = homekit_tv.tlv8_encode(
+            [
+                (homekit_tv.TLV_STATE, b"\x02"),
+                (homekit_tv.TLV_PUBLIC_KEY, big_payload),
+                (homekit_tv.TLV_SALT, b"0123456789abcdef"),
+            ]
+        )
+        decoded = homekit_tv.tlv8_decode(encoded)
+        self.assertEqual(decoded[homekit_tv.TLV_STATE], b"\x02")
+        self.assertEqual(decoded[homekit_tv.TLV_PUBLIC_KEY], big_payload)
+        self.assertEqual(decoded[homekit_tv.TLV_SALT], b"0123456789abcdef")
+
+    def test_crypto_primitives_and_session_cipher(self):
+        seed_a = b"\x11" * 32
+        pub_a = homekit_tv.ed25519_public_key(seed_a)
+        self.assertEqual(len(pub_a), 32)
+        sig = homekit_tv.ed25519_sign(seed_a, b"homekit-test-message")
+        self.assertEqual(len(sig), 64)
+        self.assertTrue(homekit_tv.ed25519_verify(pub_a, sig, b"homekit-test-message"))
+        self.assertFalse(homekit_tv.ed25519_verify(pub_a, sig, b"tampered"))
+
+        priv1, pub1 = homekit_tv.x25519_keypair(b"\x22" * 32)
+        priv2, pub2 = homekit_tv.x25519_keypair(b"\x33" * 32)
+        shared1 = homekit_tv.x25519_scalarmult(priv1, pub2)
+        shared2 = homekit_tv.x25519_scalarmult(priv2, pub1)
+        self.assertEqual(shared1, shared2)
+
+        key = homekit_tv.hkdf_sha512(shared1, b"salt", b"info", 32)
+        nonce = b"\x00\x00\x00\x0012345678"
+        ct = homekit_tv.chacha20_poly1305_encrypt(key, nonce, b"secret-payload", b"aad")
+        pt = homekit_tv.chacha20_poly1305_decrypt(key, nonce, ct, b"aad")
+        self.assertEqual(pt, b"secret-payload")
+
+    def test_setup_uri_and_wol_magic_packet(self):
+        synth_mac = ":".join(("02", "11", "22", "33", "44", "55"))
+        uri = homekit_tv.compute_setup_uri("942-38-174", "R2TV", category=31)
+        self.assertTrue(uri.startswith("X-HM://"))
+        self.assertEqual(len(uri), len("X-HM://") + 13)
+        self.assertTrue(uri.endswith("R2TV"))
+
+        setup_hash = homekit_tv.compute_setup_hash("R2TV", synth_mac)
+        self.assertEqual(len(setup_hash), 8)
+
+        pkt = homekit_tv.build_wol_magic_packet(synth_mac)
+        self.assertEqual(len(pkt), 102)
+        self.assertEqual(pkt[:6], b"\xff" * 6)
+        self.assertEqual(pkt[6:12], bytes.fromhex("021122334455"))
+
+    def test_accessory_database_and_remote_actions(self):
+        synth_mac = ":".join(("02", "11", "22", "33", "44", "55"))
+        http_calls = []
+        ssap_calls = []
+        wol_calls = []
+
+        def fake_http_post(host, port, path, headers, body, timeout):
+            parsed = json.loads(body)
+            http_calls.append((host, port, path, headers, parsed))
+            return 200, json.dumps({"ok": True, "action": parsed.get("action")})
+
+        def fake_ssap(uri, payload):
+            ssap_calls.append((uri, payload))
+            return {"ok": True}
+
+        def fake_wol(macs):
+            wol_calls.append(list(macs))
+            return len(macs)
+
+        ctrl = homekit_tv.TvRemoteController(
+            tv_ip=homekit_tv.TV_IP,
+            voice_key="b" * 64,
+            tv_macs=[synth_mac],
+            ssap_client_key="test-key",
+            http_post_fn=fake_http_post,
+            ssap_request_fn=fake_ssap,
+            wol_sender_fn=fake_wol,
+            now_ms_fn=lambda: 1700000000000,
+        )
+        acc = homekit_tv.HomeKitTvAccessory(controller=ctrl)
+
+        db = acc.to_hap_accessories_dict()
+        self.assertEqual(len(db["accessories"]), 1)
+        services = db["accessories"][0]["services"]
+        # 1 AccessoryInformation + 1 Television + 1 TelevisionSpeaker + 12 InputSources = 15 services
+        self.assertEqual(len(services), 15)
+        tv_svc = next(s for s in services if s["iid"] == acc.IID_TV_SERVICE)
+        self.assertTrue(tv_svc["primary"])
+        self.assertIn(acc.IID_SPEAKER_SERVICE, tv_svc["linked"])
+
+        # D-pad and Back remote keys
+        st, _ = acc.put_characteristic(acc.IID_TV_REMOTE_KEY, homekit_tv.HAP_REMOTE_KEY_ARROW_UP)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "key", "key": "up"})
+
+        st, _ = acc.put_characteristic(acc.IID_TV_REMOTE_KEY, homekit_tv.HAP_REMOTE_KEY_BACK)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "key", "key": "back"})
+
+        # Hardware volume button step down via VolumeSelector
+        st, evs = acc.put_characteristic(acc.IID_SPEAKER_VOLUME_SELECTOR, 1)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "volume_down"})
+        self.assertEqual(evs, [(1, acc.IID_SPEAKER_VOLUME, 18)])
+
+        # Switch input source to Netflix (identifier=3)
+        st, evs = acc.put_characteristic(acc.IID_TV_ACTIVE_IDENTIFIER, 3)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "launch_app", "appId": "netflix"})
+        self.assertEqual(evs, [(1, acc.IID_TV_ACTIVE_IDENTIFIER, 3)])
+
+        # Power on sends Wake-on-LAN magic packet + power_on
+        st, evs = acc.put_characteristic(acc.IID_TV_ACTIVE, 1)
+        self.assertEqual(st, 0)
+        self.assertEqual(wol_calls[-1], [synth_mac])
+        self.assertEqual(http_calls[-1][4], {"action": "power_on"})
+
+        # Sync state from TV poll
+        changes = acc.sync_from_tv_state({"tvPower": "standby", "fgAppId": "youtube.leanback.v4"})
+        self.assertIn((1, acc.IID_TV_ACTIVE, 0), changes)
+        self.assertIn((1, acc.IID_TV_ACTIVE_IDENTIFIER, 4), changes)
+
+    def test_pair_setup_and_pair_verify_protocol(self):
+        synth_dev_id = ":".join(("02", "AA", "BB", "CC", "DD", "EE"))
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "state.json"
+            pairing = homekit_tv.HapPairingState(
+                state_path=state_path,
+                device_id=synth_dev_id,
+                setup_code="942-38-174",
+                setup_id="R2TV",
+                ltsk_seed=b"\x44" * 32,
+            )
+            ctrl = homekit_tv.TvRemoteController(voice_key="c" * 64)
+            acc = homekit_tv.HomeKitTvAccessory(controller=ctrl)
+            proc = homekit_tv.HapProtocolProcessor(pairing, acc)
+
+            # M1 -> M2
+            st, _, m2_bytes = proc.handle_pair_setup(
+                homekit_tv.tlv8_encode([(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_METHOD, b"\x00")])
+            )
+            self.assertEqual(st, 200)
+            m2 = homekit_tv.tlv8_decode(m2_bytes)
+            self.assertEqual(m2[homekit_tv.TLV_STATE], b"\x02")
+            salt = m2[homekit_tv.TLV_SALT]
+            B_bytes = m2[homekit_tv.TLV_PUBLIC_KEY]
+            B = int.from_bytes(B_bytes, "big")
+
+            # Compute client SRP-6a values (A, M1)
+            a = int.from_bytes(b"\x55" * 32, "big")
+            A = pow(homekit_tv.SRP_G, a, homekit_tv.SRP_N)
+            A_bytes = homekit_tv._int_to_bytes(A, homekit_tv.SRP_N_BYTES)
+            u = int.from_bytes(
+                hashlib.sha512(A_bytes + B_bytes).digest(), "big"
+            )
+            k = int.from_bytes(
+                hashlib.sha512(
+                    homekit_tv._int_to_bytes(homekit_tv.SRP_N, homekit_tv.SRP_N_BYTES)
+                    + homekit_tv._int_to_bytes(homekit_tv.SRP_G, homekit_tv.SRP_N_BYTES)
+                ).digest(),
+                "big",
+            )
+            up_hash = hashlib.sha512(b"Pair-Setup:942-38-174").digest()
+            x = int.from_bytes(hashlib.sha512(salt + up_hash).digest(), "big")
+            v = pow(homekit_tv.SRP_G, x, homekit_tv.SRP_N)
+            base = (B - k * v) % homekit_tv.SRP_N
+            exp = a + u * x
+            S = pow(base, exp, homekit_tv.SRP_N)
+            K = hashlib.sha512(homekit_tv._int_to_bytes(S, homekit_tv.SRP_N_BYTES)).digest()
+
+            h_N = hashlib.sha512(homekit_tv._int_to_bytes(homekit_tv.SRP_N, homekit_tv.SRP_N_BYTES)).digest()
+            h_g = hashlib.sha512(homekit_tv._int_to_bytes(homekit_tv.SRP_G)).digest()
+            h_xor = bytes(x1 ^ y1 for x1, y1 in zip(h_N, h_g))
+            h_I = hashlib.sha512(b"Pair-Setup").digest()
+            M1 = hashlib.sha512(
+                h_xor
+                + h_I
+                + salt
+                + homekit_tv._int_to_bytes(A)
+                + homekit_tv._int_to_bytes(B)
+                + K
+            ).digest()
+
+            # M3 -> M4
+            st, _, m4_bytes = proc.handle_pair_setup(
+                homekit_tv.tlv8_encode(
+                    [
+                        (homekit_tv.TLV_STATE, b"\x03"),
+                        (homekit_tv.TLV_PUBLIC_KEY, A_bytes),
+                        (homekit_tv.TLV_PROOF, M1),
+                    ]
+                )
+            )
+            self.assertEqual(st, 200)
+            m4 = homekit_tv.tlv8_decode(m4_bytes)
+            self.assertEqual(m4[homekit_tv.TLV_STATE], b"\x04")
+            self.assertIn(homekit_tv.TLV_PROOF, m4)
+
+            # M5 -> M6
+            ios_seed = b"\x66" * 32
+            ios_ltpk = homekit_tv.ed25519_public_key(ios_seed)
+            ios_id = b"iOS-Controller-UUID"
+            ios_x = homekit_tv.hkdf_sha512(
+                K, b"Pair-Setup-Controller-Sign-Salt", b"Pair-Setup-Controller-Sign-Info", 32
+            )
+            ios_sig = homekit_tv.ed25519_sign(ios_seed, ios_x + ios_id + ios_ltpk)
+            m5_sub = homekit_tv.tlv8_encode(
+                [
+                    (homekit_tv.TLV_IDENTIFIER, ios_id),
+                    (homekit_tv.TLV_PUBLIC_KEY, ios_ltpk),
+                    (homekit_tv.TLV_SIGNATURE, ios_sig),
+                ]
+            )
+            enc_key = homekit_tv.hkdf_sha512(
+                K, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32
+            )
+            m5_enc = homekit_tv.chacha20_poly1305_encrypt(
+                enc_key, b"\x00\x00\x00\x00PS-Msg05", m5_sub
+            )
+            st, _, m6_bytes = proc.handle_pair_setup(
+                homekit_tv.tlv8_encode(
+                    [(homekit_tv.TLV_STATE, b"\x05"), (homekit_tv.TLV_ENCRYPTED_DATA, m5_enc)]
+                )
+            )
+            self.assertEqual(st, 200)
+            m6 = homekit_tv.tlv8_decode(m6_bytes)
+            self.assertEqual(m6[homekit_tv.TLV_STATE], b"\x06")
+            self.assertTrue(pairing.is_paired)
+
+            # Now test /pair-verify M1 -> M2 and M3 -> M4
+            verify_ctx = {}
+            c_priv, c_pub = homekit_tv.x25519_keypair(b"\x77" * 32)
+            st, _, pv2_bytes, sec = proc.handle_pair_verify(
+                homekit_tv.tlv8_encode(
+                    [(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_PUBLIC_KEY, c_pub)]
+                ),
+                verify_ctx,
+            )
+            self.assertEqual(st, 200)
+            self.assertIsNone(sec)
+            pv2 = homekit_tv.tlv8_decode(pv2_bytes)
+            acc_curve_pub = pv2[homekit_tv.TLV_PUBLIC_KEY]
+            shared_sec = homekit_tv.x25519_scalarmult(c_priv, acc_curve_pub)
+            pv_session_key = homekit_tv.hkdf_sha512(
+                shared_sec, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32
+            )
+            pv3_sig = homekit_tv.ed25519_sign(ios_seed, c_pub + ios_id + acc_curve_pub)
+            pv3_sub = homekit_tv.tlv8_encode(
+                [(homekit_tv.TLV_IDENTIFIER, ios_id), (homekit_tv.TLV_SIGNATURE, pv3_sig)]
+            )
+            pv3_enc = homekit_tv.chacha20_poly1305_encrypt(
+                pv_session_key, b"\x00\x00\x00\x00PV-Msg03", pv3_sub
+            )
+            st, _, pv4_bytes, final_secret = proc.handle_pair_verify(
+                homekit_tv.tlv8_encode(
+                    [(homekit_tv.TLV_STATE, b"\x03"), (homekit_tv.TLV_ENCRYPTED_DATA, pv3_enc)]
+                ),
+                verify_ctx,
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(final_secret, shared_sec)
+            pv4 = homekit_tv.tlv8_decode(pv4_bytes)
+            self.assertEqual(pv4[homekit_tv.TLV_STATE], b"\x04")
+
+
+if __name__ == "__main__":
+    unittest.main()

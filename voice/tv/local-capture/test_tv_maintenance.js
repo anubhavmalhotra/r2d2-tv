@@ -2489,6 +2489,158 @@ let groups = 0;
     groups++;
   }
 
+  // 22. Resident Remote Control Server & EV_KEY injection on /dev/input/event2
+  {
+    const voiceKey = 'a'.repeat(64);
+    const ts = '1700000000000';
+    const nonce = '0123456789abcdef0123456789abcdef';
+    const body = JSON.stringify({ action: 'key', key: 'up' });
+    const sig = maint.signRemoteControlRequest(voiceKey, ts, nonce, body);
+    assert.strictEqual(sig.length, 64);
+
+    const seenNonces = new Map();
+    const verOk = maint.verifyRemoteControlRequest({
+      voiceKey,
+      timestamp: ts,
+      nonce,
+      signature: sig,
+      rawBody: body,
+      nowMsValue: 1700000005000,
+      seenNonces
+    });
+    assert.strictEqual(verOk.ok, true);
+
+    // Replay with the same nonce is rejected
+    const verReplay = maint.verifyRemoteControlRequest({
+      voiceKey,
+      timestamp: ts,
+      nonce,
+      signature: sig,
+      rawBody: body,
+      nowMsValue: 1700000005000,
+      seenNonces
+    });
+    assert.strictEqual(verReplay.ok, false);
+    assert.strictEqual(verReplay.error, 'replayed_nonce');
+
+    // Out-of-window timestamp is rejected
+    const verExpired = maint.verifyRemoteControlRequest({
+      voiceKey,
+      timestamp: ts,
+      nonce: 'fedcba9876543210fedcba9876543210',
+      signature: maint.signRemoteControlRequest(
+        voiceKey,
+        ts,
+        'fedcba9876543210fedcba9876543210',
+        body
+      ),
+      rawBody: body,
+      nowMsValue: 1700000060000,
+      seenNonces
+    });
+    assert.strictEqual(verExpired.ok, false);
+    assert.strictEqual(verExpired.error, 'timestamp_out_of_range');
+
+    // Verify 32-bit struct input_event layout and key codes (including back=412 on event2)
+    assert.strictEqual(maint.REMOTE_KEY_CODES.up, 103);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.down, 108);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.left, 105);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.right, 106);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.select, 28);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.back, 412);
+    assert.strictEqual(maint.REMOTE_KEY_CODES.exit, 174);
+
+    const writtenEvents = [];
+    const lunaCalls = [];
+    let markedActive = 0;
+    const fakeFs = {
+      openSync: (devPath) => devPath,
+      writeSync: (fd, buf) => {
+        writtenEvents.push({ devPath: fd, buf: Buffer.from(buf) });
+        return buf.length;
+      },
+      closeSync: () => {}
+    };
+    const actionDeps = {
+      fs: fakeFs,
+      inputDevicePath: '/dev/input/event2',
+      fallbackInputDevicePath: '/dev/input/event0',
+      callLunaSend: (uri, payload) => {
+        lunaCalls.push({ uri, payload });
+        if (uri === 'luna://com.webos.audio/getVolume') {
+          return { ok: true, parsed: { volumeStatus: { volume: 18, muteStatus: false } } };
+        }
+        return { ok: true, parsed: { returnValue: true } };
+      },
+      getTvPower: () => 'active',
+      getForegroundAppId: () => 'netflix',
+      markUserActive: () => {
+        markedActive++;
+      },
+      nowMs: () => 1700000000000,
+      state: { playStatePaused: false }
+    };
+
+    const resBack = maint.executeResidentRemoteAction({ action: 'key', key: 'back' }, actionDeps);
+    assert.strictEqual(resBack.ok, true);
+    assert.strictEqual(resBack.code, 412);
+    assert.strictEqual(writtenEvents.length, 4); // press+release on event2 (412) + press+release on event0 (158)
+    assert.strictEqual(writtenEvents[0].devPath, '/dev/input/event2');
+    assert.strictEqual(writtenEvents[0].buf.readUInt16LE(8), 1); // EV_KEY
+    assert.strictEqual(writtenEvents[0].buf.readUInt16LE(10), 412); // KEY_PREVIOUS (webOS Back on event2)
+    assert.strictEqual(writtenEvents[0].buf.readInt32LE(12), 1); // press
+    assert.strictEqual(writtenEvents[2].devPath, '/dev/input/event0');
+    assert.strictEqual(writtenEvents[2].buf.readUInt16LE(10), 158); // KEY_BACK on event0
+
+    // Home key launches R2D2 Home (local.owner.applibrary)
+    const resHome = maint.executeResidentRemoteAction({ action: 'key', key: 'home' }, actionDeps);
+    assert.strictEqual(resHome.ok, true);
+    assert.strictEqual(resHome.appId, 'local.owner.applibrary');
+    assert.strictEqual(lunaCalls[0].uri, 'luna://com.webos.applicationManager/launch');
+    assert.deepStrictEqual(lunaCalls[0].payload, { id: 'local.owner.applibrary' });
+
+    // Play/pause toggles between pause (119) and play (207)
+    const resPP1 = maint.executeResidentRemoteAction({ action: 'key', key: 'play_pause' }, actionDeps);
+    const resPP2 = maint.executeResidentRemoteAction({ action: 'key', key: 'play_pause' }, actionDeps);
+    assert.strictEqual(resPP1.code, 119);
+    assert.strictEqual(resPP2.code, 207);
+
+    // Volume, power, and app launch actions
+    assert.strictEqual(maint.executeResidentRemoteAction({ action: 'volume_up' }, actionDeps).ok, true);
+    assert.strictEqual(maint.executeResidentRemoteAction({ action: 'volume_down' }, actionDeps).ok, true);
+    assert.strictEqual(
+      maint.executeResidentRemoteAction({ action: 'set_volume', volume: 25 }, actionDeps).volume,
+      25
+    );
+    assert.strictEqual(
+      maint.executeResidentRemoteAction({ action: 'set_mute', mute: true }, actionDeps).mute,
+      true
+    );
+    const gv = maint.executeResidentRemoteAction({ action: 'get_volume' }, actionDeps);
+    assert.strictEqual(gv.ok, true);
+    assert.strictEqual(gv.volume, 18);
+    assert.strictEqual(gv.muted, false);
+    assert.strictEqual(maint.executeResidentRemoteAction({ action: 'power_on' }, actionDeps).ok, true);
+    assert.strictEqual(maint.executeResidentRemoteAction({ action: 'power_off' }, actionDeps).ok, true);
+    assert.strictEqual(
+      maint.executeResidentRemoteAction({ action: 'launch_app', appId: 'youtube.leanback.v4' }, actionDeps).ok,
+      true
+    );
+    // Reject blocked LG update apps in launch_app
+    assert.strictEqual(
+      maint.executeResidentRemoteAction(
+        { action: 'launch_app', appId: 'com.webos.app.softwareupdate' },
+        actionDeps
+      ).ok,
+      false
+    );
+    const st = maint.executeResidentRemoteAction({ action: 'status' }, actionDeps);
+    assert.strictEqual(st.tvPower, 'active');
+    assert.strictEqual(st.fgAppId, 'netflix');
+    assert(markedActive >= 7);
+    groups++;
+  }
+
   process.stdout.write(JSON.stringify({ groups, nativeCalls: 0, modelCalls: 0 }) + '\n');
 })().catch((err) => {
   console.error(err);

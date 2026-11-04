@@ -5075,6 +5075,425 @@ function createResidentMaintenanceController(deps = {}) {
   };
 }
 
+const DEFAULT_REMOTE_PORT = 4183;
+const DEFAULT_REMOTE_INPUT_DEVICE = '/dev/input/event2';
+const DEFAULT_REMOTE_FALLBACK_INPUT_DEVICE = '/dev/input/event0';
+const DEFAULT_REMOTE_MAX_SKEW_MS = 30 * 1000;
+const DEFAULT_REMOTE_NONCE_LIMIT = 512;
+
+// Linux EV_KEY codes enabled in /dev/input/event2 ("LGE M-RCU - Builtin [0]")
+const REMOTE_KEY_CODES = Object.freeze({
+  up: 103,
+  down: 108,
+  left: 105,
+  right: 106,
+  select: 28,
+  back: 412,
+  exit: 174,
+  play: 207,
+  pause: 119,
+  rewind: 168,
+  fast_forward: 208,
+  info: 358,
+  menu: 139,
+  volume_up: 115,
+  volume_down: 114,
+  mute: 113,
+  power: 116
+});
+
+function makeInputEvent32(type, code, value, nowMsValue) {
+  const buf = Buffer.alloc(16);
+  const ms = Number.isFinite(nowMsValue) ? Math.max(0, Math.floor(nowMsValue)) : Date.now();
+  const sec = Math.floor(ms / 1000) | 0;
+  const usec = ((ms % 1000) * 1000) | 0;
+  buf.writeInt32LE(sec, 0);
+  buf.writeInt32LE(usec, 4);
+  buf.writeUInt16LE(type & 0xffff, 8);
+  buf.writeUInt16LE(code & 0xffff, 10);
+  buf.writeInt32LE(value | 0, 12);
+  return buf;
+}
+
+function buildKeyTapFrames32(code, nowMsValue) {
+  const t0 = Number.isFinite(nowMsValue) ? nowMsValue : Date.now();
+  const press = Buffer.concat([
+    makeInputEvent32(1, code, 1, t0),
+    makeInputEvent32(0, 0, 0, t0)
+  ]);
+  const release = Buffer.concat([
+    makeInputEvent32(1, code, 0, t0 + 15),
+    makeInputEvent32(0, 0, 0, t0 + 15)
+  ]);
+  return { press, release };
+}
+
+function signRemoteControlRequest(voiceKey, timestamp, nonce, rawBody) {
+  if (typeof voiceKey !== 'string' || !voiceKey) return '';
+  const tsStr = String(timestamp == null ? '' : timestamp);
+  const nonceStr = String(nonce == null ? '' : nonce);
+  const bodyStr = Buffer.isBuffer(rawBody)
+    ? rawBody.toString('utf8')
+    : String(rawBody == null ? '' : rawBody);
+  return crypto
+    .createHmac('sha256', voiceKey)
+    .update(tsStr + ':' + nonceStr + ':' + bodyStr, 'utf8')
+    .digest('hex');
+}
+
+function verifyRemoteControlRequest(opts) {
+  const o = opts && typeof opts === 'object' ? opts : {};
+  const voiceKey = typeof o.voiceKey === 'string' ? o.voiceKey : '';
+  const timestamp = typeof o.timestamp === 'string' ? o.timestamp.trim() : String(o.timestamp || '').trim();
+  const nonce = typeof o.nonce === 'string' ? o.nonce.trim() : '';
+  const signature = typeof o.signature === 'string' ? o.signature.trim().toLowerCase() : '';
+  const rawBody = typeof o.rawBody === 'string' || Buffer.isBuffer(o.rawBody) ? o.rawBody : '';
+  const nowMsValue = Number.isFinite(o.nowMsValue) ? o.nowMsValue : Date.now();
+  const maxSkewMs = Number.isFinite(o.maxSkewMs) && o.maxSkewMs > 0 ? o.maxSkewMs : DEFAULT_REMOTE_MAX_SKEW_MS;
+  const seenNonces = o.seenNonces instanceof Map ? o.seenNonces : null;
+
+  if (!voiceKey || !/^[0-9a-f]{64}$/i.test(voiceKey)) {
+    return { ok: false, error: 'invalid_key' };
+  }
+  if (!/^\d{10,16}$/.test(timestamp)) {
+    return { ok: false, error: 'invalid_timestamp' };
+  }
+  if (!/^[0-9a-fA-F_-]{16,128}$/.test(nonce)) {
+    return { ok: false, error: 'invalid_nonce' };
+  }
+  if (!/^[0-9a-f]{64}$/.test(signature)) {
+    return { ok: false, error: 'invalid_signature_format' };
+  }
+  const rawNum = Number(timestamp);
+  const tsMs = timestamp.length <= 10 ? rawNum * 1000 : rawNum;
+  if (!Number.isFinite(tsMs) || Math.abs(nowMsValue - tsMs) > maxSkewMs) {
+    return { ok: false, error: 'timestamp_out_of_range' };
+  }
+  const expected = signRemoteControlRequest(voiceKey, timestamp, nonce, rawBody);
+  const sigBuf = Buffer.from(signature, 'hex');
+  const expBuf = Buffer.from(expected, 'hex');
+  if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+    return { ok: false, error: 'bad_signature' };
+  }
+  if (seenNonces) {
+    for (const [k, expAt] of seenNonces.entries()) {
+      if (expAt <= nowMsValue) seenNonces.delete(k);
+    }
+    if (seenNonces.has(nonce)) {
+      return { ok: false, error: 'replayed_nonce' };
+    }
+    while (seenNonces.size >= DEFAULT_REMOTE_NONCE_LIMIT) {
+      const oldestKey = seenNonces.keys().next().value;
+      if (oldestKey === undefined) break;
+      seenNonces.delete(oldestKey);
+    }
+    seenNonces.set(nonce, nowMsValue + maxSkewMs * 2);
+  }
+  return { ok: true };
+}
+
+function executeResidentRemoteAction(payload, deps = {}) {
+  const io = deps.fs || fs;
+  const inputDevicePath = deps.inputDevicePath || DEFAULT_REMOTE_INPUT_DEVICE;
+  const fallbackInputDevicePath =
+    deps.fallbackInputDevicePath !== undefined
+      ? deps.fallbackInputDevicePath
+      : DEFAULT_REMOTE_FALLBACK_INPUT_DEVICE;
+  const callLunaSend =
+    typeof deps.callLunaSend === 'function'
+      ? deps.callLunaSend
+      : () => ({ ok: false, parsed: null });
+  const getTvPower =
+    typeof deps.getTvPower === 'function' ? deps.getTvPower : () => 'active';
+  const getForegroundAppId =
+    typeof deps.getForegroundAppId === 'function' ? deps.getForegroundAppId : () => '';
+  const markUserActive =
+    typeof deps.markUserActive === 'function' ? deps.markUserActive : () => {};
+  const nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
+  const state = deps.state && typeof deps.state === 'object' ? deps.state : { playStatePaused: false };
+
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const action = typeof body.action === 'string' ? body.action.trim().toLowerCase() : '';
+
+  function writeKeyTap(devPath, code) {
+    if (!devPath) return false;
+    const frames = buildKeyTapFrames32(code, nowMs());
+    let fd = null;
+    try {
+      fd = io.openSync(devPath, 'w');
+      io.writeSync(fd, frames.press, 0, frames.press.length);
+      io.writeSync(fd, frames.release, 0, frames.release.length);
+      return true;
+    } catch (_) {
+      return false;
+    } finally {
+      if (fd !== null) {
+        try {
+          io.closeSync(fd);
+        } catch (_) {}
+      }
+    }
+  }
+
+  if (action === 'status') {
+    return {
+      ok: true,
+      action: 'status',
+      tvPower: getTvPower(),
+      fgAppId: getForegroundAppId()
+    };
+  }
+
+  if (action === 'key') {
+    const keyName = typeof body.key === 'string' ? body.key.trim().toLowerCase() : '';
+    if (!keyName) {
+      return { ok: false, error: 'missing_key' };
+    }
+    markUserActive();
+    if (keyName === 'home') {
+      const r = callLunaSend('luna://com.webos.applicationManager/launch', {
+        id: 'local.owner.applibrary'
+      });
+      return {
+        ok: Boolean(r && r.ok),
+        action: 'key',
+        key: 'home',
+        appId: 'local.owner.applibrary'
+      };
+    }
+    let resolvedKey = keyName;
+    if (keyName === 'play_pause') {
+      resolvedKey = state.playStatePaused ? 'play' : 'pause';
+      state.playStatePaused = !state.playStatePaused;
+    }
+    const code = REMOTE_KEY_CODES[resolvedKey];
+    if (!Number.isInteger(code)) {
+      return { ok: false, error: 'unknown_key', key: keyName };
+    }
+    const primaryOk = writeKeyTap(inputDevicePath, code);
+    if (resolvedKey === 'back' && fallbackInputDevicePath) {
+      // Also emit standard KEY_BACK (158) on fallback event0 if present
+      writeKeyTap(fallbackInputDevicePath, 158);
+    }
+    return {
+      ok: primaryOk,
+      action: 'key',
+      key: keyName,
+      code
+    };
+  }
+
+  if (action === 'volume_up' || action === 'volume_down') {
+    markUserActive();
+    const uri =
+      action === 'volume_up'
+        ? 'luna://com.webos.audio/volumeUp'
+        : 'luna://com.webos.audio/volumeDown';
+    const r = callLunaSend(uri, {});
+    if (r && r.ok) {
+      return { ok: true, action };
+    }
+    const fallbackCode =
+      action === 'volume_up' ? REMOTE_KEY_CODES.volume_up : REMOTE_KEY_CODES.volume_down;
+    const tapOk = writeKeyTap(inputDevicePath, fallbackCode);
+    return { ok: tapOk, action, fallbackHid: true };
+  }
+
+  if (action === 'set_volume') {
+    markUserActive();
+    const vol = Math.max(0, Math.min(100, Math.round(Number(body.volume) || 0)));
+    const r = callLunaSend('luna://com.webos.audio/setVolume', { volume: vol });
+    return { ok: Boolean(r && r.ok), action: 'set_volume', volume: vol };
+  }
+
+  if (action === 'set_mute') {
+    markUserActive();
+    const mute = Boolean(body.mute);
+    const r = callLunaSend('luna://com.webos.audio/setMute', { mute });
+    return { ok: Boolean(r && r.ok), action: 'set_mute', mute };
+  }
+
+  if (action === 'get_volume') {
+    const r = callLunaSend('luna://com.webos.audio/getVolume', {});
+    const parsed = (r && r.parsed) || {};
+    const status = parsed.volumeStatus && typeof parsed.volumeStatus === 'object' ? parsed.volumeStatus : parsed;
+    const volume = typeof status.volume === 'number' ? status.volume : 0;
+    const muted = Boolean(status.muteStatus ?? status.mute ?? false);
+    return {
+      ok: Boolean(r && r.ok),
+      action: 'get_volume',
+      volume,
+      muted
+    };
+  }
+
+  if (action === 'power_on') {
+    markUserActive();
+    const r = callLunaSend('luna://com.webos.service.tvpower/power/turnOnScreen', {});
+    return { ok: Boolean(r && r.ok), action: 'power_on' };
+  }
+
+  if (action === 'power_off') {
+    const r = callLunaSend('luna://com.webos.service.tvpower/power/turnOff', {
+      reason: 'remoteKey'
+    });
+    return { ok: Boolean(r && r.ok), action: 'power_off' };
+  }
+
+  if (action === 'launch_app') {
+    const appId = typeof body.appId === 'string' ? body.appId.trim() : '';
+    if (!appId || !/^[A-Za-z0-9._-]+$/.test(appId) || NEVER_UPDATE_APPS.has(appId) && appId !== 'local.owner.applibrary') {
+      return { ok: false, error: 'invalid_app_id' };
+    }
+    markUserActive();
+    const r = callLunaSend('luna://com.webos.applicationManager/launch', { id: appId });
+    return { ok: Boolean(r && r.ok), action: 'launch_app', appId };
+  }
+
+  return { ok: false, error: 'unknown_action', action };
+}
+
+function isAllowedRemoteClientAddress(remoteAddress, sparkIp) {
+  if (typeof remoteAddress !== 'string' || !remoteAddress) return false;
+  const addr = remoteAddress.trim().toLowerCase();
+  if (addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1') {
+    return true;
+  }
+  if (typeof sparkIp === 'string' && sparkIp.trim()) {
+    const cleanSpark = sparkIp.trim().toLowerCase();
+    if (addr === cleanSpark || addr === '::ffff:' + cleanSpark) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function createResidentRemoteServer(deps = {}) {
+  const httpMod = deps.httpMod || require('http');
+  const port = Number.isInteger(deps.port) && deps.port >= 0 ? deps.port : DEFAULT_REMOTE_PORT;
+  const host = typeof deps.host === 'string' && deps.host ? deps.host : '0.0.0.0';
+  const sparkIp = typeof deps.sparkIp === 'string' ? deps.sparkIp.trim() : '';
+  const getVoiceKey =
+    typeof deps.getVoiceKey === 'function'
+      ? deps.getVoiceKey
+      : () => (typeof deps.voiceKey === 'string' ? deps.voiceKey : '');
+  const nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
+  const log = typeof deps.log === 'function' ? deps.log : () => {};
+  const seenNonces = new Map();
+  const remoteState = { playStatePaused: false };
+
+  const server = httpMod.createServer((req, res) => {
+    const remoteAddr = (req.socket && req.socket.remoteAddress) || '';
+    if (!isAllowedRemoteClientAddress(remoteAddr, sparkIp)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'forbidden_ip' }));
+      return;
+    }
+    const urlPath = String(req.url || '').split('?')[0];
+    if (req.method !== 'POST' || urlPath !== '/remote') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+      return;
+    }
+    let rawBody = '';
+    let aborted = false;
+    req.setEncoding('utf8');
+    req.on('data', (chunk) => {
+      if (aborted) return;
+      rawBody += chunk;
+      if (rawBody.length > 4096) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'payload_too_large' }));
+      }
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      const headers = req.headers || {};
+      const verify = verifyRemoteControlRequest({
+        voiceKey: getVoiceKey(),
+        timestamp: headers['x-r2d2-timestamp'],
+        nonce: headers['x-r2d2-nonce'],
+        signature: headers['x-r2d2-signature'],
+        rawBody,
+        nowMsValue: nowMs(),
+        seenNonces
+      });
+      if (!verify.ok) {
+        log('resident_remote_auth_failed', { error: verify.error, remoteAddr });
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: verify.error }));
+        return;
+      }
+      let parsed = null;
+      try {
+        parsed = JSON.parse(rawBody || '{}');
+      } catch (_) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'invalid_json' }));
+        return;
+      }
+      const result = executeResidentRemoteAction(parsed, {
+        ...deps,
+        nowMs,
+        state: remoteState
+      });
+      log('resident_remote_action', {
+        action: result.action || (parsed && parsed.action) || '',
+        key: result.key || '',
+        appId: result.appId || '',
+        ok: Boolean(result.ok)
+      });
+      res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    });
+  });
+
+  server.on('error', (err) => {
+    log('resident_remote_server_error', {
+      error: String(err && (err.code || err.message || err))
+    });
+  });
+
+  function start() {
+    return new Promise((resolve, reject) => {
+      const onError = (err) => {
+        server.removeListener('listening', onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener('error', onError);
+        const addr = server.address();
+        log('resident_remote_listening', {
+          host,
+          port: addr && typeof addr === 'object' ? addr.port : port
+        });
+        resolve(addr);
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(port, host);
+    });
+  }
+
+  function close() {
+    return new Promise((resolve) => {
+      try {
+        server.close(() => resolve(true));
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  }
+
+  return {
+    server,
+    start,
+    close,
+    seenNonces
+  };
+}
+
 module.exports = {
   BLOCK_BEGIN,
   BLOCK_END,
@@ -5093,6 +5512,9 @@ module.exports = {
   FALLBACK_VOICE_SOUND_MODES,
   VOICE_LEVELING_SOUND_MODES,
   SPORTS_SEASON_CATALOG,
+  DEFAULT_REMOTE_PORT,
+  DEFAULT_REMOTE_INPUT_DEVICE,
+  REMOTE_KEY_CODES,
   isAutoVolumeEnabled,
   isPreferredVoiceSoundMode,
   isVoiceLevelingSoundMode,
@@ -5123,5 +5545,12 @@ module.exports = {
   createLgNetworkGuard,
   createPrivacyRetirementEnforcer,
   createAutoVoiceLevelingEnforcer,
-  createResidentMaintenanceController
+  createResidentMaintenanceController,
+  makeInputEvent32,
+  buildKeyTapFrames32,
+  signRemoteControlRequest,
+  verifyRemoteControlRequest,
+  executeResidentRemoteAction,
+  isAllowedRemoteClientAddress,
+  createResidentRemoteServer
 };
