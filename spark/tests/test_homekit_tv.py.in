@@ -282,6 +282,107 @@ class HomeKitTvTests(unittest.TestCase):
             pv4 = homekit_tv.tlv8_decode(pv4_bytes)
             self.assertEqual(pv4[homekit_tv.TLV_STATE], b"\x04")
 
+    def test_direct_iphone_web_remote_and_pairing_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "pairing.json"
+            pairing = homekit_tv.HapPairingState(
+                state_path=state_path,
+                device_id=":".join(("02", "11", "22", "33", "44", "55")),
+                setup_code="111-22-333",
+                setup_id="R2TV",
+                ltsk_seed=b"\x44" * 32,
+            )
+            pairing.pairings["iphone-1"] = {"public_key": "aa" * 32, "permissions": 1}
+
+            http_calls = []
+
+            def fake_http_post(ip, port, path, headers, body, timeout_s):
+                http_calls.append((ip, port, path, dict(headers), json.loads(body)))
+                return 200, json.dumps({"ok": True})
+
+            ctl = homekit_tv.TvRemoteController(
+                tv_ip=homekit_tv.TV_IP,
+                voice_key="b" * 64,
+                http_post_fn=fake_http_post,
+            )
+            acc = homekit_tv.HomeKitTvAccessory(controller=ctl)
+            srv = homekit_tv.HomeKitTvServer(pairing, acc, enable_mdns=False)
+
+            # Without pairing window open, /pair-setup M1 is rejected because iphone-1 is paired
+            st, _, m2_closed = srv.processor.handle_pair_setup(
+                homekit_tv.tlv8_encode(
+                    [(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_METHOD, b"\x00")]
+                )
+            )
+            self.assertEqual(st, 200)
+            self.assertEqual(
+                homekit_tv.tlv8_decode(m2_closed).get(homekit_tv.TLV_ERROR),
+                bytes([homekit_tv.TLV_ERROR_UNAVAILABLE]),
+            )
+
+            # Open pairing window via POST /api/pairing-window so a second iPhone can pair directly
+            res_pw = srv.handle_web_remote_request("POST", "/api/pairing-window", b"{}")
+            self.assertIsNotNone(res_pw)
+            assert res_pw is not None
+            self.assertEqual(res_pw[0], 200)
+            self.assertTrue(srv.processor.is_pairing_window_open())
+
+            st, _, m2_open = srv.processor.handle_pair_setup(
+                homekit_tv.tlv8_encode(
+                    [(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_METHOD, b"\x00")]
+                )
+            )
+            self.assertEqual(st, 200)
+            self.assertIn(homekit_tv.TLV_PUBLIC_KEY, homekit_tv.tlv8_decode(m2_open))
+
+            # Direct iPhone WebApp HTML + PWA manifest + status + remote control endpoints
+            res_html = srv.handle_web_remote_request("GET", "/iphone", b"")
+            self.assertIsNotNone(res_html)
+            assert res_html is not None
+            self.assertEqual(res_html[0], 200)
+            self.assertIn("apple-mobile-web-app-capable", res_html[2].decode("utf-8"))
+            self.assertIn("R2D2 Home", res_html[2].decode("utf-8"))
+
+            res_mf = srv.handle_web_remote_request("GET", "/manifest.webmanifest", b"")
+            self.assertIsNotNone(res_mf)
+            assert res_mf is not None
+            self.assertEqual(res_mf[0], 200)
+
+            # Test direct Home button on iPhone web remote
+            res_home = srv.handle_web_remote_request(
+                "POST",
+                "/api/remote",
+                b'{"action":"key","key":"home"}',
+            )
+            self.assertIsNotNone(res_home)
+            assert res_home is not None
+            self.assertEqual(res_home[0], 200)
+            self.assertEqual(
+                http_calls[-1][4],
+                {"action": "launch_app", "appId": homekit_tv.APP_LIBRARY_ID},
+            )
+
+            # Test app launch, volume step, and power toggle via /api/remote
+            res_app = srv.handle_web_remote_request(
+                "POST",
+                "/api/remote",
+                b'{"action":"launch_app","appId":"youtube.leanback.v4"}',
+            )
+            self.assertIsNotNone(res_app)
+            assert res_app is not None
+            self.assertEqual(res_app[0], 200)
+            self.assertEqual(acc._values[acc.IID_TV_ACTIVE_IDENTIFIER], 4)
+
+            res_vol = srv.handle_web_remote_request(
+                "POST",
+                "/api/remote",
+                b'{"action":"volume_step","direction":"up"}',
+            )
+            self.assertIsNotNone(res_vol)
+            assert res_vol is not None
+            self.assertEqual(res_vol[0], 200)
+            self.assertEqual(http_calls[-1][4], {"action": "volume_up"})
+
 
 if __name__ == "__main__":
     unittest.main()
