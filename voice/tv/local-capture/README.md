@@ -180,6 +180,18 @@ app updates:
   `voiceLeveling` in maintenance receipts, resident status headers
   (`X-R2D2-Voice-Leveling` and `|vl=on` in `X-R2D2-Hidraw`), and Spark's
   `voice/agent/nightly_maintenance.py` (`tvVoiceLeveling`).
+- **Permanent system-wide OS update retirement and app-only updates (`createLgNetworkGuard`, `createPrivacyRetirementEnforcer`, `runUpdateWorkflow`)**:
+  Permanently blocks all LG firmware and OS update endpoints (`snu.lge.com`,
+  `su.lge.com`, `fota.lge.com`, `nsu.lge.com`, `ota.lge.com`, `swupdate.lge.com`,
+  and their resolved OTA IPs) in `/etc/hosts` and `iptables` (`R2D2_LG_GUARD`,
+  with `ip -6 route` fallback on kernels without `CONFIG_IP6_NF_IPTABLES`),
+  runtime-masks and stops `update.service` and `uploadd.service`, bind-mounts
+  `/usr/sbin/update`, `com.webos.app.renewupdate`, and
+  `com.webos.app.softwareupdate` read-only to `/bin/true` / an empty directory,
+  and dismisses any open system update dialogs. Only streaming app updates via
+  `com.webos.appUpdateService` / `com.webos.appInstallService` are permitted
+  during the brief 3:00 AM or 30-minute verified-idle App Store window, with
+  `NEVER_UPDATE_APPS` excluding system updater and ad/ACR packages.
 - **Seasonal sports app suggestions and off-season cleanup (`evaluateSeasonalSports`, `runSeasonalAppCleanup`)**:
   Pairs with Home's `Sports & seasons` preferences (`baaz.sports.v1`) across a
   curated 9-sport catalog (`nfl`, `nba`, `mlb`, `nhl`, `f1`, `soccer`, `mls`,

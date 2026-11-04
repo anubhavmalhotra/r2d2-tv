@@ -11,10 +11,17 @@ const BLOCK_END = '# END R2D2-LG-BLOCK';
 const LG_PERMANENT_BLOCK_DOMAINS = Object.freeze([
   'snu.lge.com',
   'snu-dev.lge.com',
+  'us.snu.lge.com',
+  'aic.snu.lge.com',
+  'eic.snu.lge.com',
+  'kic.snu.lge.com',
+  'nsu.lge.com',
   'su.lge.com',
   'su-dev.lge.com',
   'su-ssl.lge.com',
   'fota.lge.com',
+  'ota.lge.com',
+  'swupdate.lge.com',
   'redirect.lgsmartplatform.com',
   'lgsmartplatform.com',
   'us.lgsmartplatform.com',
@@ -98,10 +105,18 @@ const LG_APPSTORE_DOMAINS = Object.freeze([
   'kic.lgtvsdp.com'
 ]);
 
-const LG_PERMANENT_BLOCK_IPS = Object.freeze(['156.147.69.32']);
+const LG_PERMANENT_BLOCK_IPS = Object.freeze([
+  '156.147.69.32',
+  '15.165.189.166',
+  '52.79.67.32'
+]);
 const LG_PERMANENT_BLOCK_IPV6S = Object.freeze([
   '::ffff:156.147.69.32',
-  '64:ff9b::9c93:4520'
+  '::ffff:15.165.189.166',
+  '::ffff:52.79.67.32',
+  '64:ff9b::9c93:4520',
+  '64:ff9b::fa5:bda6',
+  '64:ff9b::344f:4320'
 ]);
 
 function isValidIpv4(ip) {
@@ -3533,17 +3548,122 @@ function createLgNetworkGuard(deps = {}) {
     return getMountedTargets().has('/etc/hosts') && fileSha('/etc/hosts') === expectedHostsSha;
   }
 
-  function runFirewallCommands(binPath, cmds) {
+  function runFirewallCommandsWithDetail(binPath, cmds) {
+    let kernelTableMissing = false;
+    try {
+      if (
+        io.existsSync('/proc/net/ip_tables_names') &&
+        !io.existsSync('/proc/net/ip6_tables_names')
+      ) {
+        kernelTableMissing = true;
+      }
+    } catch (_) {}
     for (const args of cmds) {
       const res = spawnSync(binPath, args, { env, timeout: 1500 });
+      const errText =
+        res && res.stderr
+          ? Buffer.isBuffer(res.stderr)
+            ? res.stderr.toString('utf8')
+            : String(res.stderr)
+          : '';
+      const outText =
+        res && res.stdout
+          ? Buffer.isBuffer(res.stdout)
+            ? res.stdout.toString('utf8')
+            : String(res.stdout)
+          : '';
+      if (
+        /can't initialize ip6tables|Table does not exist|Protocol not supported|ip6_tables/i.test(
+          errText + '\n' + outText
+        )
+      ) {
+        kernelTableMissing = true;
+      }
       const op = args[0];
       if (op !== '-N' && op !== '-D') {
         if (!res || res.status !== 0) {
+          return { ok: false, kernelTableMissing };
+        }
+      }
+    }
+    return { ok: true, kernelTableMissing: false };
+  }
+
+  function runFirewallCommands(binPath, cmds) {
+    return runFirewallCommandsWithDetail(binPath, cmds).ok;
+  }
+
+  function applyIpv6RouteFallback(options = {}) {
+    const allowAppStore = Boolean(options && options.allowAppStore === true);
+    const extraAppStoreIps = Array.isArray(options && options.appStoreIps)
+      ? options.appStoreIps
+      : [];
+    let ipBin = '/sbin/ip';
+    for (const candidate of ['/sbin/ip', '/usr/sbin/ip', '/bin/ip']) {
+      try {
+        if (io.existsSync(candidate)) {
+          ipBin = candidate;
+          break;
+        }
+      } catch (_) {}
+    }
+
+    if (allowAppStore) {
+      for (const rawIp of extraAppStoreIps) {
+        if (typeof rawIp !== 'string') continue;
+        const trimmed = rawIp.trim().toLowerCase();
+        if (isValidIpv6(trimmed) && !trimmed.startsWith('::ffff:')) {
+          try {
+            spawnSync(ipBin, ['-6', 'route', 'del', 'unreachable', trimmed], {
+              env,
+              timeout: 1500
+            });
+          } catch (_) {}
+        }
+      }
+    }
+
+    const blockedNativeIpv6s = new Set();
+    for (const ip6 of LG_PERMANENT_BLOCK_IPV6S) {
+      const lower = String(ip6).trim().toLowerCase();
+      if (isValidIpv6(lower) && !lower.startsWith('::ffff:')) {
+        blockedNativeIpv6s.add(lower);
+      }
+    }
+    if (!allowAppStore) {
+      for (const rawIp of extraAppStoreIps) {
+        if (typeof rawIp !== 'string') continue;
+        const trimmed = rawIp.trim().toLowerCase();
+        if (isValidIpv6(trimmed) && !trimmed.startsWith('::ffff:')) {
+          blockedNativeIpv6s.add(trimmed);
+        }
+      }
+    }
+
+    let anyChecked = false;
+    for (const ip6 of blockedNativeIpv6s) {
+      anyChecked = true;
+      let res = spawnSync(ipBin, ['-6', 'route', 'replace', 'unreachable', ip6], {
+        env,
+        timeout: 1500
+      });
+      if (!res || res.status !== 0) {
+        res = spawnSync(ipBin, ['-6', 'route', 'add', 'unreachable', ip6], {
+          env,
+          timeout: 1500
+        });
+        const errText =
+          res && res.stderr
+            ? Buffer.isBuffer(res.stderr)
+              ? res.stderr.toString('utf8')
+              : String(res.stderr)
+            : '';
+        if ((!res || res.status !== 0) && !/File exists/i.test(errText)) {
           return false;
         }
       }
     }
-    return true;
+    return anyChecked;
   }
 
   function apply(allowAppStore = false) {
@@ -3607,7 +3727,13 @@ function createLgNetworkGuard(deps = {}) {
         persistAppStoreIpState([], true);
         mountHostsForState(baseHosts, false);
         runFirewallCommands(iptBin, buildIptablesCommands({ allowAppStore: false, appStoreIps: [] }));
-        runFirewallCommands(ip6tBin, buildIp6tablesCommands({ allowAppStore: false, appStoreIps: [] }));
+        const ip6FailClosed = runFirewallCommandsWithDetail(
+          ip6tBin,
+          buildIp6tablesCommands({ allowAppStore: false, appStoreIps: [] })
+        );
+        if (!ip6FailClosed.ok) {
+          applyIpv6RouteFallback({ allowAppStore: false, appStoreIps: [] });
+        }
         currentAppStoreOpen = false;
         lgServerBlocked = false;
         return false;
@@ -3621,10 +3747,20 @@ function createLgNetworkGuard(deps = {}) {
       const iptCmds = buildIptablesCommands({ allowAppStore: wantOpen, appStoreIps });
       const ip6tCmds = buildIp6tablesCommands({ allowAppStore: wantOpen, appStoreIps });
 
-      if (!runFirewallCommands(iptBin, iptCmds) || !runFirewallCommands(ip6tBin, ip6tCmds)) {
+      if (!runFirewallCommands(iptBin, iptCmds)) {
         currentAppStoreOpen = null;
         lgServerBlocked = false;
         return false;
+      }
+
+      const ip6Res = runFirewallCommandsWithDetail(ip6tBin, ip6tCmds);
+      if (!ip6Res.ok) {
+        const route6Ok = applyIpv6RouteFallback({ allowAppStore: wantOpen, appStoreIps });
+        if (!route6Ok && !ip6Res.kernelTableMissing) {
+          currentAppStoreOpen = null;
+          lgServerBlocked = false;
+          return false;
+        }
       }
 
       if (wantOpen) {
@@ -3800,11 +3936,36 @@ function createPrivacyRetirementEnforcer(deps = {}) {
       ) {
         for (const svc of systemdServices) {
           try {
+            spawnSync('/bin/systemctl', ['mask', '--runtime', svc], {
+              env,
+              timeout: 2500
+            });
+          } catch (_) {}
+          try {
             spawnSync('/bin/systemctl', ['stop', svc], {
               env,
               timeout: 2500
             });
           } catch (_) {}
+        }
+
+        for (const updateAppId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
+          if (presentDirs.some((d) => d.endsWith('/' + updateAppId))) {
+            try {
+              spawnSync(
+                '/usr/bin/luna-send',
+                [
+                  '-n',
+                  '1',
+                  '-w',
+                  '1200',
+                  'luna://com.webos.applicationManager/closeByAppId',
+                  JSON.stringify({ id: updateAppId })
+                ],
+                { env, timeout: 1500 }
+              );
+            } catch (_) {}
+          }
         }
 
         for (const manifestPath of presentManifests) {

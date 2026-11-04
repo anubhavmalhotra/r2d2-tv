@@ -2305,6 +2305,190 @@ let groups = 0;
     groups++;
   }
 
+  // 14. System-wide webOS update permanent block (snu/su/fota domains + OTA IPs, CONFIG_IP6_NF_IPTABLES=n fallback, update.service runtime mask, renewupdate/softwareupdate window dismissal, app-only updates)
+  {
+    const baseHosts = '127.0.0.1\tlocalhost\n::1\tlocalhost\n';
+    const openHosts = maint.renderBlockedHosts(baseHosts, { allowAppStore: true });
+    for (const otaDomain of [
+      'snu.lge.com',
+      'snu-dev.lge.com',
+      'us.snu.lge.com',
+      'aic.snu.lge.com',
+      'eic.snu.lge.com',
+      'kic.snu.lge.com',
+      'nsu.lge.com',
+      'su.lge.com',
+      'su-dev.lge.com',
+      'su-ssl.lge.com',
+      'fota.lge.com',
+      'ota.lge.com',
+      'swupdate.lge.com'
+    ]) {
+      assert(
+        openHosts.includes('0.0.0.0 ' + otaDomain),
+        'OTA domain must remain blocked during app update window: ' + otaDomain
+      );
+      assert(
+        openHosts.includes(':: ' + otaDomain),
+        'OTA domain IPv6 must remain blocked during app update window: ' + otaDomain
+      );
+    }
+
+    const openIpt = maint
+      .buildIptablesCommands({ allowAppStore: true, appStoreIps: ['203.0.113.50'] })
+      .map((c) => c.join(' '));
+    for (const otaIp of ['156.147.69.32', '15.165.189.166', '52.79.67.32']) {
+      assert(
+        openIpt.includes('-A R2D2_LG_GUARD -d ' + otaIp + ' -j REJECT'),
+        'OTA IP must remain rejected during app update window: ' + otaIp
+      );
+    }
+
+    // Kernel with CONFIG_IP6_NF_IPTABLES=n: ip6tables fails, ip -6 route fallback succeeds
+    const kFiles = new Map([
+      ['/etc/hosts', Buffer.from(baseHosts, 'utf8')],
+      ['/usr/sbin/iptables', Buffer.alloc(0)],
+      ['/usr/sbin/ip6tables', Buffer.alloc(0)],
+      ['/sbin/ip', Buffer.alloc(0)],
+      ['/proc/net/ip_tables_names', Buffer.from('filter\n', 'utf8')]
+    ]);
+    const kMounted = new Map();
+    const ip6RouteCalls = [];
+    let failIpRouteToo = false;
+    const kGuard = maint.createLgNetworkGuard({
+      fs: {
+        existsSync: (p) => kFiles.has(p),
+        readFileSync: (p, enc) => {
+          if (!kFiles.has(p)) throw new Error('ENOENT: ' + p);
+          const b = kFiles.get(p);
+          return enc ? b.toString(enc) : b;
+        },
+        unlinkSync: (p) => kFiles.delete(p)
+      },
+      getMountedTargets: () => kMounted,
+      writeAtomic: (p, b) => kFiles.set(p, Buffer.from(b)),
+      spawnSync: (cmd, args) => {
+        if (cmd === '/bin/umount') {
+          kMounted.delete('/etc/hosts');
+          return { status: 0 };
+        }
+        if (cmd === '/bin/mount' && args.includes('--bind')) {
+          kFiles.set('/etc/hosts', Buffer.from(kFiles.get('/tmp/r2d2-hosts')));
+          kMounted.set('/etc/hosts', {});
+          return { status: 0 };
+        }
+        if (cmd === '/bin/mount' && args.some((a) => a.includes('remount'))) {
+          return { status: 0 };
+        }
+        if (cmd.endsWith('/ip6tables')) {
+          return {
+            status: 3,
+            stderr: Buffer.from(
+              "ip6tables v1.8.4 (legacy): can't initialize ip6tables table `filter': Table does not exist\n",
+              'utf8'
+            )
+          };
+        }
+        if (cmd === '/sbin/ip' && args[0] === '-6' && args[1] === 'route') {
+          ip6RouteCalls.push(args.join(' '));
+          return { status: failIpRouteToo ? 2 : 0 };
+        }
+        return { status: 0, stdout: Buffer.alloc(0) };
+      }
+    });
+
+    assert.strictEqual(kGuard.apply(false), true);
+    assert.strictEqual(kGuard.isBlocked(), true);
+    assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::9c93:4520')));
+    assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::fa5:bda6')));
+    assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::344f:4320')));
+
+    // Even if ip -6 route returns non-zero when IPv6 routing is disabled, kernelTableMissing allows IPv4 iptables + /etc/hosts to succeed
+    failIpRouteToo = true;
+    assert.strictEqual(kGuard.apply(false), true);
+    assert.strictEqual(kGuard.isBlocked(), true);
+
+    // PrivacyRetirementEnforcer runtime-masks update.service and closes renewupdate/softwareupdate dialogs
+    const sysCalls = [];
+    const mountedSet = new Set();
+    const pEnforcer = maint.createPrivacyRetirementEnforcer({
+      fs: {
+        mkdirSync() {},
+        chmodSync() {},
+        existsSync: (p) =>
+          [
+            '/usr/sbin/update',
+            '/usr/palm/applications/com.webos.app.renewupdate',
+            '/usr/palm/applications/com.webos.app.softwareupdate',
+            '/usr/share/luna-service2/manifests.d/update.manifest.json'
+          ].includes(p)
+      },
+      getAllMountPoints: () => mountedSet,
+      retirePrivacyProcesses: () => 0,
+      systemdServices: ['uploadd.service', 'update.service'],
+      ls2Manifests: ['/usr/share/luna-service2/manifests.d/update.manifest.json'],
+      binTargets: ['/usr/sbin/update'],
+      dirTargets: [
+        '/usr/palm/applications/com.webos.app.renewupdate',
+        '/usr/palm/applications/com.webos.app.softwareupdate'
+      ],
+      spawnSync: (cmd, args) => {
+        sysCalls.push([cmd, ...args]);
+        if (cmd === '/bin/mount' && args.includes('bind')) {
+          mountedSet.add(args[args.length - 1]);
+        }
+        return {
+          status: 0,
+          stdout: Buffer.from(JSON.stringify({ returnValue: true }), 'utf8')
+        };
+      }
+    });
+    const enfRes = pEnforcer.enforce();
+    assert.strictEqual(enfRes.ok, true);
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/bin/systemctl' &&
+          c[1] === 'mask' &&
+          c[2] === '--runtime' &&
+          c[3] === 'update.service'
+      )
+    );
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/usr/bin/luna-send' &&
+          c.includes('luna://com.webos.applicationManager/closeByAppId') &&
+          c.some((a) => a.includes('com.webos.app.renewupdate'))
+      )
+    );
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/usr/bin/luna-send' &&
+          c.includes('luna://com.webos.applicationManager/closeByAppId') &&
+          c.some((a) => a.includes('com.webos.app.softwareupdate'))
+      )
+    );
+
+    // App-only updates: selectUpdatableApps excludes renewupdate & softwareupdate while allowing streaming apps
+    const sel = maint.selectUpdatableApps(
+      [
+        { id: 'com.webos.app.renewupdate', version: '1.0.0' },
+        { id: 'com.webos.app.softwareupdate', version: '1.0.0' },
+        { id: 'netflix', version: '2.0.0' }
+      ],
+      [
+        { id: 'com.webos.app.renewupdate', updateYN: 'Y', version: '2.0.0' },
+        { id: 'com.webos.app.softwareupdate', updateYN: 'Y', version: '2.0.0' },
+        { id: 'netflix', updateYN: 'Y', version: '2.1.0' }
+      ],
+      'local.owner.applibrary'
+    );
+    assert.deepStrictEqual(sel.updatable, ['netflix']);
+    groups++;
+  }
+
   process.stdout.write(JSON.stringify({ groups, nativeCalls: 0, modelCalls: 0 }) + '\n');
 })().catch((err) => {
   console.error(err);
