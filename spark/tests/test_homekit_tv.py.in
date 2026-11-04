@@ -107,6 +107,16 @@ class HomeKitTvTests(unittest.TestCase):
         self.assertEqual(st, 0)
         self.assertEqual(http_calls[-1][4], {"action": "key", "key": "back"})
 
+        # Double-tapping Back within 650ms opens R2D2 Home
+        st, _ = acc.put_characteristic(acc.IID_TV_REMOTE_KEY, homekit_tv.HAP_REMOTE_KEY_BACK)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "key", "key": "home"})
+
+        # Pressing Info ('i' button next to Back on iOS Control Center Remote) opens R2D2 Home
+        st, _ = acc.put_characteristic(acc.IID_TV_REMOTE_KEY, homekit_tv.HAP_REMOTE_KEY_INFORMATION)
+        self.assertEqual(st, 0)
+        self.assertEqual(http_calls[-1][4], {"action": "key", "key": "home"})
+
         # Hardware volume button step down via VolumeSelector
         st, evs = acc.put_characteristic(acc.IID_SPEAKER_VOLUME_SELECTOR, 1)
         self.assertEqual(st, 0)

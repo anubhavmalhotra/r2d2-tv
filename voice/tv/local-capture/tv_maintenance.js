@@ -5166,7 +5166,7 @@ function verifyRemoteControlRequest(opts) {
   }
   const rawNum = Number(timestamp);
   const tsMs = timestamp.length <= 10 ? rawNum * 1000 : rawNum;
-  if (!Number.isFinite(tsMs) || Math.abs(nowMsValue - tsMs) > maxSkewMs) {
+  if (!Number.isFinite(tsMs)) {
     return { ok: false, error: 'timestamp_out_of_range' };
   }
   const expected = signRemoteControlRequest(voiceKey, timestamp, nonce, rawBody);
@@ -5174,6 +5174,24 @@ function verifyRemoteControlRequest(opts) {
   const expBuf = Buffer.from(expected, 'hex');
   if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
     return { ok: false, error: 'bad_signature' };
+  }
+  let effectiveNowMs = nowMsValue;
+  if (nowMsValue < 1577836800000 && tsMs >= 1577836800000) {
+    // TV booted offline with 1970 clock (NTP blocked); anchor monotonic offset from authenticated Spark timestamp
+    if (seenNonces) {
+      if (
+        typeof seenNonces._clockOffsetMs !== 'number' ||
+        tsMs > nowMsValue + seenNonces._clockOffsetMs
+      ) {
+        seenNonces._clockOffsetMs = tsMs - nowMsValue;
+      }
+      effectiveNowMs = nowMsValue + seenNonces._clockOffsetMs;
+    } else {
+      effectiveNowMs = tsMs;
+    }
+  }
+  if (Math.abs(effectiveNowMs - tsMs) > maxSkewMs) {
+    return { ok: false, error: 'timestamp_out_of_range' };
   }
   if (seenNonces) {
     for (const [k, expAt] of seenNonces.entries()) {

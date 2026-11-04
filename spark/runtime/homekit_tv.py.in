@@ -95,9 +95,9 @@ HAP_REMOTE_KEY_TO_ACTION_KEY = {
     HAP_REMOTE_KEY_ARROW_RIGHT: "right",
     HAP_REMOTE_KEY_SELECT: "select",
     HAP_REMOTE_KEY_BACK: "back",
-    HAP_REMOTE_KEY_EXIT: "exit",
+    HAP_REMOTE_KEY_EXIT: "home",
     HAP_REMOTE_KEY_PLAY_PAUSE: "play_pause",
-    HAP_REMOTE_KEY_INFORMATION: "info",
+    HAP_REMOTE_KEY_INFORMATION: "home",
 }
 
 # Input Sources exposed in the Apple Home app & Control Center Remote input picker
@@ -689,6 +689,7 @@ class TvRemoteController:
         self._status_reader_fn = status_reader_fn
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         self._play_paused = False
+        self._last_back_ms = 0
 
     def _default_http_post(
         self, host: str, port: int, path: str, headers: dict[str, str], body: str, timeout: float
@@ -835,10 +836,19 @@ class TvRemoteController:
         key_name = HAP_REMOTE_KEY_TO_ACTION_KEY.get(hap_key)
         if not key_name:
             return {"ok": False, "error": "unsupported_remote_key", "hapKey": hap_key}
+        if hap_key == HAP_REMOTE_KEY_BACK:
+            now_ms = self._now_ms_fn()
+            if self._last_back_ms > 0 and 0 <= (now_ms - self._last_back_ms) <= 650:
+                self._last_back_ms = 0
+                key_name = "home"
+            else:
+                self._last_back_ms = now_ms
         res = self.call_resident_remote({"action": "key", "key": key_name})
         if res.get("ok"):
             return res
-        # Fallback for media transport keys over SSAP if resident server is still starting
+        # Fallback over SSAP if resident server is still starting
+        if key_name == "home":
+            return self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
         if key_name == "play_pause":
             uri = "ssap://media.controls/play" if self._play_paused else "ssap://media.controls/pause"
             self._play_paused = not self._play_paused
