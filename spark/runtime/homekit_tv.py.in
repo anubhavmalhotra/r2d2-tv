@@ -100,9 +100,11 @@ HAP_REMOTE_KEY_TO_ACTION_KEY = {
     HAP_REMOTE_KEY_INFORMATION: "home",
 }
 
+APP_LIBRARY_ID = "local.owner.applibrary"
+
 # Input Sources exposed in the Apple Home app & Control Center Remote input picker
 DEFAULT_INPUT_SOURCES = (
-    {"identifier": 1, "name": "R2D2 Home", "app_id": "local.owner.applibrary", "source_type": 2},
+    {"identifier": 1, "name": "R2D2 Home", "app_id": APP_LIBRARY_ID, "source_type": 2},
     {"identifier": 2, "name": "Spark Browser", "app_id": "com.webos.app.tinybrowser", "source_type": 10},
     {"identifier": 3, "name": "Netflix", "app_id": "netflix", "source_type": 10},
     {"identifier": 4, "name": "YouTube", "app_id": "youtube.leanback.v4", "source_type": 10},
@@ -1572,13 +1574,21 @@ class HapProtocolProcessor:
         self.pairing_state = pairing_state
         self.accessory = accessory
         self.srp_session: HapSrpServerSession | None = None
+        self.pairing_window_until: float = 0.0
+
+    def open_pairing_window(self, duration_s: float = 180.0) -> float:
+        self.pairing_window_until = time.monotonic() + max(10.0, float(duration_s))
+        return self.pairing_window_until
+
+    def is_pairing_window_open(self) -> bool:
+        return time.monotonic() < self.pairing_window_until
 
     def handle_pair_setup(self, body: bytes) -> tuple[int, str, bytes]:
         tlv = tlv8_decode(body)
         state = tlv.get(TLV_STATE, b"\x00")[0]
 
         if state == 1:
-            if self.pairing_state.is_paired:
+            if self.pairing_state.is_paired and not self.is_pairing_window_open():
                 return (
                     200,
                     "application/pairing+tlv8",
@@ -1660,6 +1670,7 @@ class HapProtocolProcessor:
                 "permissions": 1,
             }
             self.pairing_state.save()
+            self.pairing_window_until = 0.0
 
             acc_x = hkdf_sha512(
                 self.srp_session.K,
@@ -1830,18 +1841,320 @@ class HapProtocolProcessor:
 def render_setup_banner(pairing_state: HapPairingState, port: int) -> str:
     lines = [
         "==============================================================",
-        "  R2D2 TV — Apple HomeKit Television Remote",
+        "  R2D2 TV — Apple HomeKit & Direct iPhone Remote",
         "==============================================================",
         f"  Accessory Name : R2D2 TV",
         f"  Category       : Television (ci={DEFAULT_CATEGORY_TELEVISION})",
         f"  Device ID      : {pairing_state.device_id}",
         f"  HAP TCP Port   : {port}",
+        f"  iPhone Web App : http://{SPARK_IP}:{port}/iphone",
         f"  Setup Code     : {pairing_state.setup_code}",
         f"  Setup URI      : {pairing_state.setup_uri}",
         f"  Paired         : {'Yes' if pairing_state.is_paired else 'No (Ready to Pair in Apple Home)'}",
         "==============================================================",
     ]
     return "\n".join(lines)
+
+
+def render_iphone_icon_svg() -> str:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180" width="180" height="180">'
+        '<rect width="180" height="180" rx="40" fill="#0d131f"/>'
+        '<rect x="24" y="34" width="132" height="86" rx="14" fill="#162238" stroke="#64d2ff" stroke-width="4"/>'
+        '<circle cx="90" cy="77" r="18" fill="none" stroke="#64d2ff" stroke-width="4"/>'
+        '<circle cx="90" cy="77" r="5" fill="#64d2ff"/>'
+        '<rect x="64" y="132" width="52" height="12" rx="6" fill="#64d2ff"/>'
+        "</svg>"
+    )
+
+
+def render_iphone_manifest_json() -> str:
+    manifest = {
+        "name": "R2D2 TV Remote",
+        "short_name": "R2D2 Remote",
+        "start_url": "/iphone",
+        "display": "standalone",
+        "background_color": "#0b0f19",
+        "theme_color": "#0b0f19",
+        "icons": [
+            {
+                "src": "/apple-touch-icon.svg",
+                "sizes": "180x180",
+                "type": "image/svg+xml",
+                "purpose": "any",
+            }
+        ],
+    }
+    return json.dumps(manifest, indent=2)
+
+
+def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
+    setup_code = pairing_state.setup_code
+    setup_uri = pairing_state.setup_uri
+    direct_url = f"http://{SPARK_IP}:{port}/iphone"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="R2D2 Remote">
+<meta name="theme-color" content="#0b0f19">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/apple-touch-icon.svg">
+<title>R2D2 TV Remote</title>
+<style>
+  :root {{
+    --bg: #0b0f19;
+    --panel: #151c2c;
+    --panel-active: #22304a;
+    --border: rgba(255, 255, 255, 0.1);
+    --accent: #5ac8fa;
+    --accent-glow: rgba(90, 200, 250, 0.22);
+    --danger: #ff453a;
+    --success: #30d158;
+    --text: #f5f7fa;
+    --muted: #8e9bb0;
+  }}
+  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }}
+  body {{
+    margin: 0;
+    padding: env(safe-area-inset-top, 14px) 16px env(safe-area-inset-bottom, 20px);
+    background: radial-gradient(circle at 50% 0%, #17233b 0%, var(--bg) 65%);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }}
+  .shell {{ width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 12px; }}
+  .topbar {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: 20px;
+  }}
+  .title-wrap {{ display: flex; flex-direction: column; gap: 2px; }}
+  .title {{ font-size: 16px; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }}
+  .dot {{ width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); }}
+  .dot.off {{ background: var(--muted); box-shadow: none; }}
+  .subtitle {{ font-size: 12px; color: var(--muted); }}
+  .top-actions {{ display: flex; gap: 8px; }}
+  .btn {{
+    appearance: none; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); border-radius: 16px; font-size: 14px; font-weight: 600;
+    padding: 12px 16px; cursor: pointer; display: flex; align-items: center;
+    justify-content: center; gap: 6px; transition: transform 0.08s ease, background 0.12s ease;
+  }}
+  .btn:active {{ transform: scale(0.95); background: var(--panel-active); }}
+  .btn-circle {{ width: 44px; height: 44px; border-radius: 50%; padding: 0; font-size: 17px; }}
+  .btn-power.on {{ border-color: rgba(48, 209, 88, 0.45); color: var(--success); }}
+  .btn-power.off {{ border-color: rgba(255, 69, 58, 0.45); color: var(--danger); }}
+  .btn-home {{
+    background: linear-gradient(135deg, rgba(90, 200, 250, 0.24), rgba(90, 200, 250, 0.08));
+    border-color: rgba(90, 200, 250, 0.5);
+    color: #fff;
+  }}
+  .touchpad {{
+    position: relative; width: 100%; height: 220px; border-radius: 30px;
+    background: linear-gradient(180deg, #1a2438 0%, #111826 100%);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 10px 28px rgba(0, 0, 0, 0.4);
+    display: flex; align-items: center; justify-content: center; touch-action: none; overflow: hidden;
+  }}
+  .dpad-btn {{
+    position: absolute; background: transparent; border: none; color: var(--muted);
+    font-size: 18px; width: 56px; height: 56px; display: flex; align-items: center;
+    justify-content: center; cursor: pointer; z-index: 2; border-radius: 50%;
+  }}
+  .dpad-btn:active {{ background: rgba(255,255,255,0.08); color: #fff; }}
+  .dpad-up {{ top: 6px; left: calc(50% - 28px); }}
+  .dpad-down {{ bottom: 6px; left: calc(50% - 28px); }}
+  .dpad-left {{ left: 6px; top: calc(50% - 28px); }}
+  .dpad-right {{ right: 6px; top: calc(50% - 28px); }}
+  .dpad-center {{
+    width: 88px; height: 88px; border-radius: 50%;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: 0.4px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; cursor: pointer; z-index: 2;
+  }}
+  .dpad-center:active {{ background: rgba(90, 200, 250, 0.18); transform: scale(0.95); }}
+  .pad-hint {{ font-size: 10px; color: var(--muted); font-weight: 400; }}
+  .row-3 {{ display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 10px; }}
+  .row-4 {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
+  .section-label {{
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
+    color: var(--muted); margin: 4px 4px 0;
+  }}
+  .apps-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
+  .app-tile {{
+    padding: 11px 8px; border-radius: 14px; font-size: 12px; font-weight: 600;
+    text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }}
+  .app-tile.active {{
+    border-color: var(--accent); background: var(--accent-glow); color: #fff;
+  }}
+  .setup-card {{
+    margin-top: 4px; padding: 14px; border-radius: 18px; background: var(--panel);
+    border: 1px solid var(--border); font-size: 12px; color: var(--muted); line-height: 1.45;
+  }}
+  .setup-card strong {{ color: var(--text); }}
+  .code-pill {{
+    display: inline-block; padding: 3px 8px; border-radius: 8px;
+    background: rgba(255,255,255,0.08); color: var(--accent); font-family: ui-monospace, monospace;
+    font-weight: 700; font-size: 13px;
+  }}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="topbar">
+    <div class="title-wrap">
+      <div class="title"><span id="powerDot" class="dot"></span>R2D2 TV</div>
+      <div id="statusSub" class="subtitle">R2D2 Home</div>
+    </div>
+    <div class="top-actions">
+      <button class="btn btn-circle" id="muteBtn" onclick="sendAction({{action:'mute',mode:'toggle'}})" title="Mute">🔇</button>
+      <button class="btn btn-circle btn-power on" id="powerBtn" onclick="sendAction({{action:'power',mode:'toggle'}})" title="Power">⏻</button>
+    </div>
+  </div>
+
+  <div class="touchpad" id="touchpad">
+    <button class="dpad-btn dpad-up" onclick="sendKey('up')">▲</button>
+    <button class="dpad-btn dpad-left" onclick="sendKey('left')">◀</button>
+    <button class="dpad-center" onclick="sendKey('select')">OK<span class="pad-hint">Swipe / Tap</span></button>
+    <button class="dpad-btn dpad-right" onclick="sendKey('right')">▶</button>
+    <button class="dpad-btn dpad-down" onclick="sendKey('down')">▼</button>
+  </div>
+
+  <div class="row-3">
+    <button class="btn" onclick="sendKey('back')">‹ Back</button>
+    <button class="btn btn-home" onclick="sendKey('home')">⌂ R2D2 Home</button>
+    <button class="btn" onclick="sendKey('play_pause')">⏯ Play</button>
+  </div>
+
+  <div class="row-4">
+    <button class="btn" onclick="sendAction({{action:'volume_step',direction:'down'}})">🔉 Vol -</button>
+    <button class="btn" onclick="sendAction({{action:'volume_step',direction:'up'}})">🔊 Vol +</button>
+    <button class="btn" onclick="sendKey('rewind')">⏪</button>
+    <button class="btn" onclick="sendKey('fast_forward')">⏩</button>
+  </div>
+
+  <div class="section-label">Direct App Launch</div>
+  <div class="apps-grid" id="appsGrid"></div>
+
+  <div class="setup-card">
+    <div><strong>Add Directly to iPhone Home Screen:</strong> Tap Safari <strong>Share ↑</strong> → <strong>Add to Home Screen</strong> for a full-screen iPhone remote with the dedicated <strong>⌂ R2D2 Home</strong> button.</div>
+    <div style="margin-top:8px;"><strong>Apple Home App Code:</strong> <span class="code-pill">{setup_code}</span> <span style="opacity:0.75;">({setup_uri})</span></div>
+    <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+      <button class="btn" style="padding:8px 12px; font-size:12px; border-radius:12px;" onclick="openPairingWindow()">+ Pair Another iPhone in Apple Home</button>
+      <span id="pairMsg" style="font-size:11px; color:var(--accent);"></span>
+    </div>
+  </div>
+</div>
+<script>
+const apps = {json.dumps(list(DEFAULT_INPUT_SOURCES))};
+let currentAppId = 'local.owner.applibrary';
+
+function renderApps() {{
+  const grid = document.getElementById('appsGrid');
+  grid.innerHTML = '';
+  apps.forEach(a => {{
+    const b = document.createElement('button');
+    b.className = 'btn app-tile' + (a.app_id === currentAppId ? ' active' : '');
+    b.textContent = a.name;
+    b.onclick = () => sendAction({{action: 'launch_app', appId: a.app_id}});
+    grid.appendChild(b);
+  }});
+}}
+
+async function sendAction(payload) {{
+  try {{
+    const res = await fetch('/api/remote', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload)
+    }});
+    const data = await res.json();
+    if (data && data.status) applyStatus(data.status);
+  }} catch (_) {{}}
+}}
+
+function sendKey(k) {{
+  return sendAction({{action: 'key', key: k}});
+}}
+
+async function openPairingWindow() {{
+  const msg = document.getElementById('pairMsg');
+  msg.textContent = 'Opening 3m pairing window...';
+  try {{
+    const res = await fetch('/api/pairing-window', {{method: 'POST'}});
+    const data = await res.json();
+    if (data && data.ok) {{
+      msg.textContent = 'Ready in Apple Home (Code: ' + data.setupCode + ')';
+    }}
+  }} catch (_) {{
+    msg.textContent = 'Failed to open window';
+  }}
+}}
+
+function applyStatus(st) {{
+  if (!st) return;
+  const dot = document.getElementById('powerDot');
+  const pbtn = document.getElementById('powerBtn');
+  const sub = document.getElementById('statusSub');
+  const active = Boolean(st.active);
+  dot.className = 'dot' + (active ? '' : ' off');
+  pbtn.className = 'btn btn-circle btn-power ' + (active ? 'on' : 'off');
+  if (st.activeAppId) currentAppId = st.activeAppId;
+  const match = apps.find(a => a.app_id === currentAppId);
+  sub.textContent = (active ? (match ? match.name : currentAppId) : 'Standby') + (st.muted ? ' · Muted' : '');
+  renderApps();
+}}
+
+async function pollStatus() {{
+  try {{
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    applyStatus(data);
+  }} catch (_) {{}}
+}}
+
+(function initTouchpad() {{
+  const pad = document.getElementById('touchpad');
+  let startX = null, startY = null;
+  pad.addEventListener('touchstart', e => {{
+    if (e.target !== pad) return;
+    const t = e.touches[0];
+    startX = t.clientX;
+    startY = t.clientY;
+  }}, {{passive: true}});
+  pad.addEventListener('touchend', e => {{
+    if (startX === null || startY === null) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - startX;
+    const dy = t.clientY - startY;
+    startX = null; startY = null;
+    if (Math.abs(dx) < 24 && Math.abs(dy) < 24) {{
+      sendKey('select');
+    }} else if (Math.abs(dx) > Math.abs(dy)) {{
+      sendKey(dx > 0 ? 'right' : 'left');
+    }} else {{
+      sendKey(dy > 0 ? 'down' : 'up');
+    }}
+  }}, {{passive: true}});
+}})();
+
+renderApps();
+pollStatus();
+setInterval(pollStatus, 4000);
+</script>
+</body>
+</html>
+"""
 
 
 # --- Live HAP-IP Socket Server & Avahi mDNS Publisher ---
@@ -1877,7 +2190,8 @@ class HomeKitTvServer:
         avahi_bin = shutil.which("avahi-publish-service")
         if not avahi_bin:
             return
-        paired = self.pairing_state.is_paired
+        discoverable_unpaired = (not self.pairing_state.is_paired) or self.processor.is_pairing_window_open()
+        paired = not discoverable_unpaired
         if self._avahi_proc is not None and self._avahi_proc.poll() is None and self._last_paired_flag == paired:
             return
         self._stop_mdns()
@@ -1904,6 +2218,215 @@ class HomeKitTvServer:
             self._last_paired_flag = paired
         except Exception:
             self._avahi_proc = None
+
+    def build_web_status(self) -> dict[str, Any]:
+        active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
+        active_ident = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE_IDENTIFIER, 1))
+        volume = int(self.accessory._values.get(self.accessory.IID_SPEAKER_VOLUME, 20))
+        muted = bool(self.accessory._values.get(self.accessory.IID_SPEAKER_MUTE, False))
+        active_name = "R2D2 Home"
+        active_app_id = APP_LIBRARY_ID
+        for src in self.accessory.input_sources:
+            if int(src["identifier"]) == active_ident:
+                active_name = str(src["name"])
+                active_app_id = str(src["app_id"])
+                break
+        return {
+            "active": active,
+            "activeIdentifier": active_ident,
+            "activeAppId": active_app_id,
+            "activeInputName": active_name,
+            "volume": volume,
+            "muted": muted,
+            "pairedControllers": len(self.pairing_state.pairings),
+            "pairingWindowOpen": self.processor.is_pairing_window_open(),
+            "setupCode": self.pairing_state.setup_code,
+            "setupUri": self.pairing_state.setup_uri,
+            "sources": [
+                {
+                    "identifier": int(src["identifier"]),
+                    "name": str(src["name"]),
+                    "appId": str(src["app_id"]),
+                }
+                for src in self.accessory.input_sources
+            ],
+        }
+
+    def handle_web_remote_request(
+        self, method: str, path_part: str, body: bytes
+    ) -> tuple[int, str, bytes, list[tuple[int, int, Any]]] | None:
+        if method == "GET" and path_part in ("/", "/iphone", "/remote"):
+            return (
+                200,
+                "text/html; charset=utf-8",
+                render_iphone_remote_html(self.pairing_state, self.port).encode("utf-8"),
+                [],
+            )
+        if method == "GET" and path_part == "/manifest.webmanifest":
+            return (
+                200,
+                "application/manifest+json; charset=utf-8",
+                render_iphone_manifest_json().encode("utf-8"),
+                [],
+            )
+        if method == "GET" and path_part == "/apple-touch-icon.svg":
+            return (
+                200,
+                "image/svg+xml",
+                render_iphone_icon_svg().encode("utf-8"),
+                [],
+            )
+        if method == "GET" and path_part == "/api/status":
+            try:
+                self.accessory.sync_from_tv_state()
+            except Exception:
+                pass
+            return (
+                200,
+                "application/json",
+                json.dumps(self.build_web_status(), separators=(",", ":")).encode("utf-8"),
+                [],
+            )
+        if method == "POST" and path_part == "/api/pairing-window":
+            self.processor.open_pairing_window(180.0)
+            self._update_mdns_advertisement()
+            return (
+                200,
+                "application/json",
+                json.dumps(
+                    {
+                        "ok": True,
+                        "windowSeconds": 180,
+                        "setupCode": self.pairing_state.setup_code,
+                        "setupUri": self.pairing_state.setup_uri,
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                [],
+            )
+        if method == "POST" and path_part == "/api/remote":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                return (
+                    400,
+                    "application/json",
+                    json.dumps({"ok": False, "error": "invalid_json"}).encode("utf-8"),
+                    [],
+                )
+            changes: list[tuple[int, int, Any]] = []
+            action = str(payload.get("action") or "").strip().lower()
+            try:
+                if action == "key":
+                    key_name = str(payload.get("key") or "").strip().lower()
+                    if key_name == "home":
+                        _, changes = self.accessory.put_characteristic(
+                            self.accessory.IID_TV_ACTIVE_IDENTIFIER, 1
+                        )
+                    elif key_name == "menu":
+                        _, changes = self.accessory.put_characteristic(
+                            self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_INFORMATION
+                        )
+                    else:
+                        key_map = {
+                            "up": HAP_REMOTE_KEY_ARROW_UP,
+                            "down": HAP_REMOTE_KEY_ARROW_DOWN,
+                            "left": HAP_REMOTE_KEY_ARROW_LEFT,
+                            "right": HAP_REMOTE_KEY_ARROW_RIGHT,
+                            "select": HAP_REMOTE_KEY_SELECT,
+                            "back": HAP_REMOTE_KEY_BACK,
+                            "exit": HAP_REMOTE_KEY_EXIT,
+                            "play_pause": HAP_REMOTE_KEY_PLAY_PAUSE,
+                            "rewind": HAP_REMOTE_KEY_REWIND,
+                            "fast_forward": HAP_REMOTE_KEY_FAST_FORWARD,
+                        }
+                        if key_name not in key_map:
+                            return (
+                                400,
+                                "application/json",
+                                json.dumps({"ok": False, "error": f"unsupported_key:{key_name}"}).encode("utf-8"),
+                                [],
+                            )
+                        _, changes = self.accessory.put_characteristic(
+                            self.accessory.IID_TV_REMOTE_KEY, key_map[key_name]
+                        )
+                elif action == "power":
+                    value = str(payload.get("value") or "toggle").strip().lower()
+                    cur_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
+                    if value == "on":
+                        target_active = 1
+                    elif value == "off":
+                        target_active = 0
+                    else:
+                        target_active = 0 if cur_active == 1 else 1
+                    _, changes = self.accessory.put_characteristic(
+                        self.accessory.IID_TV_ACTIVE, target_active
+                    )
+                elif action == "volume_step":
+                    direction = str(payload.get("direction") or "up").strip().lower()
+                    hap_sel = 0 if direction == "up" else 1
+                    _, changes = self.accessory.put_characteristic(
+                        self.accessory.IID_SPEAKER_VOLUME_SELECTOR, hap_sel
+                    )
+                elif action == "volume_set":
+                    cur_vol = int(self.accessory._values.get(self.accessory.IID_SPEAKER_VOLUME, 20))
+                    vol = int(payload.get("volume", cur_vol))
+                    _, changes = self.accessory.put_characteristic(
+                        self.accessory.IID_SPEAKER_VOLUME, vol
+                    )
+                elif action == "mute":
+                    val = payload.get("value", "toggle")
+                    cur_muted = bool(self.accessory._values.get(self.accessory.IID_SPEAKER_MUTE, False))
+                    if val == "toggle":
+                        target_mute = not cur_muted
+                    else:
+                        target_mute = bool(val)
+                    _, changes = self.accessory.put_characteristic(
+                        self.accessory.IID_SPEAKER_MUTE, target_mute
+                    )
+                elif action == "launch_app":
+                    app_id = str(payload.get("appId") or "").strip()
+                    matched_ident: int | None = None
+                    for src in self.accessory.input_sources:
+                        if str(src["app_id"]) == app_id:
+                            matched_ident = int(src["identifier"])
+                            break
+                    if matched_ident is not None:
+                        _, changes = self.accessory.put_characteristic(
+                            self.accessory.IID_TV_ACTIVE_IDENTIFIER, matched_ident
+                        )
+                    elif app_id:
+                        self.accessory.controller.launch_app(app_id)
+                        self.accessory._values[self.accessory.IID_TV_ACTIVE] = 1
+                        changes = [(1, self.accessory.IID_TV_ACTIVE, 1)]
+                    else:
+                        return (
+                            400,
+                            "application/json",
+                            json.dumps({"ok": False, "error": "missing_app_id"}).encode("utf-8"),
+                            [],
+                        )
+                else:
+                    return (
+                        400,
+                        "application/json",
+                        json.dumps({"ok": False, "error": f"unsupported_action:{action}"}).encode("utf-8"),
+                        [],
+                    )
+            except Exception as exc:
+                return (
+                    502,
+                    "application/json",
+                    json.dumps({"ok": False, "error": str(exc)}).encode("utf-8"),
+                    [],
+                )
+            return (
+                200,
+                "application/json",
+                json.dumps({"ok": True, "status": self.build_web_status()}, separators=(",", ":")).encode("utf-8"),
+                changes,
+            )
+        return None
 
     def _stop_mdns(self) -> None:
         if self._avahi_proc is not None:
@@ -2009,9 +2532,13 @@ class HomeKitTvServer:
                             ctype = "application/hap+json"
                             resp_body = b""
                     elif cipher is None:
-                        status = 470
-                        ctype = "application/hap+json"
-                        resp_body = json.dumps({"status": -70401}).encode("utf-8")
+                        web_res = self.handle_web_remote_request(method, path_part, body)
+                        if web_res is not None:
+                            status, ctype, resp_body, pending_events = web_res
+                        else:
+                            status = 470
+                            ctype = "application/hap+json"
+                            resp_body = json.dumps({"status": -70401}).encode("utf-8")
                     elif path_part == "/pairings" and method == "POST":
                         status, ctype, resp_body = self.processor.handle_pairings(body)
                         self._update_mdns_advertisement()
