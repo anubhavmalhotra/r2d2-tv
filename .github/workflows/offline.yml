@@ -7,6 +7,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   offline:
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
