@@ -2470,6 +2470,13 @@ let groups = 0;
           c.some((a) => a.includes('com.webos.app.softwareupdate'))
       )
     );
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/usr/bin/luna-send' &&
+          c.includes('luna://com.webos.notification/closeAllAlerts')
+      )
+    );
 
     // App-only updates: selectUpdatableApps excludes renewupdate & softwareupdate while allowing streaming apps
     const sel = maint.selectUpdatableApps(
@@ -2638,6 +2645,44 @@ let groups = 0;
     assert.strictEqual(st.tvPower, 'active');
     assert.strictEqual(st.fgAppId, 'netflix');
     assert(markedActive >= 7);
+
+    // Keyboard text insertion, enter submit, backspace, and update notice dismissal
+    const resText = maint.executeResidentRemoteAction(
+      { action: 'text', text: 'Inception', submit: true },
+      actionDeps
+    );
+    assert.strictEqual(resText.ok, true);
+    assert.strictEqual(resText.length, 9);
+    assert.strictEqual(resText.submit, true);
+    assert(
+      lunaCalls.some(
+        (c) =>
+          c.uri === 'luna://com.webos.service.ime/insertText' &&
+          c.payload.text === 'Inception'
+      )
+    );
+    assert(
+      lunaCalls.some((c) => c.uri === 'luna://com.webos.service.ime/sendEnterKey')
+    );
+
+    const resBs = maint.executeResidentRemoteAction(
+      { action: 'key', key: 'backspace' },
+      actionDeps
+    );
+    assert.strictEqual(resBs.ok, true);
+    assert.strictEqual(resBs.code, 14);
+    assert(
+      lunaCalls.some((c) => c.uri === 'luna://com.webos.service.ime/deleteCharacters')
+    );
+
+    const resDismiss = maint.executeResidentRemoteAction(
+      { action: 'dismiss_update_notices' },
+      actionDeps
+    );
+    assert.strictEqual(resDismiss.ok, true);
+    assert(
+      lunaCalls.some((c) => c.uri === 'luna://com.webos.notification/closeAllAlerts')
+    );
     groups++;
   }
 

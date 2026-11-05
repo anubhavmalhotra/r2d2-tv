@@ -21,6 +21,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import plistlib
 import re
 import select
 import secrets
@@ -34,6 +35,7 @@ import sys
 import threading
 import time
 from typing import Any, Callable
+import uuid
 
 SPARK_IP = "{{SPARK_IP}}"
 TV_IP = "{{TV_IP}}"
@@ -42,6 +44,21 @@ DEFAULT_HAP_PORT = 21066
 DEFAULT_REMOTE_PORT = 4183
 DEFAULT_SSAP_PORT = 3001
 DEFAULT_CATEGORY_TELEVISION = 31
+
+DEFAULT_MRP_PORT = 49152
+DEFAULT_COMPANION_PORT = 49153
+DEFAULT_AIRPLAY_PORT = 49154
+DEFAULT_COMPANION_PIN = "1111"
+COMPANION_SOURCE_VERSION = "715.2"
+COMPANION_DEVICE_MODEL = "AppleTV14,1"
+COMPANION_MEDIA_CONTROL_VOLUME = 0x0100
+
+COMPANION_FRAME_PS_START = 0x03
+COMPANION_FRAME_PS_NEXT = 0x04
+COMPANION_FRAME_PV_START = 0x05
+COMPANION_FRAME_PV_NEXT = 0x06
+COMPANION_FRAME_U_OPACK = 0x07
+COMPANION_FRAME_E_OPACK = 0x08
 
 # HAP TLV8 tag constants
 TLV_METHOD = 0x00
@@ -121,6 +138,11 @@ DEFAULT_INPUT_SOURCES = (
         "app_id": "com.movenetworks.app.sling-tv-sling-production",
         "source_type": 10,
     },
+    {"identifier": 13, "name": "AirPlay", "app_id": "airplay", "source_type": 8},
+    {"identifier": 14, "name": "HDMI 1", "app_id": "com.webos.app.hdmi1", "source_type": 3},
+    {"identifier": 15, "name": "HDMI 2", "app_id": "com.webos.app.hdmi2", "source_type": 3},
+    {"identifier": 16, "name": "HDMI 3", "app_id": "com.webos.app.hdmi3", "source_type": 3},
+    {"identifier": 17, "name": "HDMI 4", "app_id": "com.webos.app.hdmi4", "source_type": 3},
 )
 
 # RFC 5054 3072-bit SRP-6a prime N and generator g=5
@@ -678,6 +700,7 @@ class TvRemoteController:
         ssap_request_fn: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
         wol_sender_fn: Callable[[list[str]], int] | None = None,
         status_reader_fn: Callable[[], dict[str, Any]] | None = None,
+        voice_agent_fn: Callable[[str], dict[str, Any]] | None = None,
         now_ms_fn: Callable[[], int] | None = None,
     ) -> None:
         self.tv_ip = tv_ip
@@ -689,6 +712,7 @@ class TvRemoteController:
         self._ssap_request_fn = ssap_request_fn or self._default_ssap_request
         self._wol_sender_fn = wol_sender_fn or self._default_wol_send
         self._status_reader_fn = status_reader_fn
+        self._voice_agent_fn = voice_agent_fn
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         self._play_paused = False
         self._last_back_ms = 0
@@ -713,7 +737,14 @@ class TvRemoteController:
         parts = self.tv_ip.split(".")
         if len(parts) == 4:
             bcast.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-        return send_wol_magic_packets(macs, broadcast_ips=tuple(dict.fromkeys(bcast)))
+            bcast.append(self.tv_ip)
+        targets = tuple(dict.fromkeys(bcast))
+        total = 0
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(0.04)
+            total += send_wol_magic_packets(macs, broadcast_ips=targets)
+        return total
 
     def _default_ssap_request(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.ssap_client_key:
@@ -810,7 +841,7 @@ class TvRemoteController:
                     "payload": pl if isinstance(pl, dict) else {},
                 }
 
-    def call_resident_remote(self, action_payload: dict[str, Any], timeout: float = 0.9) -> dict[str, Any]:
+    def call_resident_remote(self, action_payload: dict[str, Any], timeout: float = 2.2) -> dict[str, Any]:
         if not self.voice_key or len(self.voice_key) != 64:
             return {"ok": False, "error": "missing_voice_key"}
         raw_body = json.dumps(action_payload, separators=(",", ":"))
@@ -849,26 +880,36 @@ class TvRemoteController:
         if res.get("ok"):
             return res
         # Fallback over SSAP if resident server is still starting
+        sres: dict[str, Any] = {}
         if key_name == "home":
-            return self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
-        if key_name == "play_pause":
+            sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
+        elif key_name == "play_pause":
             uri = "ssap://media.controls/play" if self._play_paused else "ssap://media.controls/pause"
             self._play_paused = not self._play_paused
-            return self._ssap_request_fn(uri, {})
-        if key_name == "rewind":
-            return self._ssap_request_fn("ssap://media.controls/rewind", {})
-        if key_name == "fast_forward":
-            return self._ssap_request_fn("ssap://media.controls/fastForward", {})
-        return res
+            sres = self._ssap_request_fn(uri, {})
+        elif key_name == "rewind":
+            sres = self._ssap_request_fn("ssap://media.controls/rewind", {})
+        elif key_name == "fast_forward":
+            sres = self._ssap_request_fn("ssap://media.controls/fastForward", {})
+        if sres.get("ok"):
+            return sres
+        if self.tv_macs and key_name in ("select", "home", "back", "play_pause"):
+            return self.wake_tv()
+        return sres or res
 
     def send_power_mode_selection(self, mode: int) -> dict[str, Any]:
         key_name = "home" if mode == 0 else "menu"
         res = self.call_resident_remote({"action": "key", "key": key_name})
         if res.get("ok"):
             return res
+        sres: dict[str, Any] = {}
         if key_name == "home":
-            return self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
-        return res
+            sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
+            if sres.get("ok"):
+                return sres
+        if self.tv_macs:
+            return self.wake_tv()
+        return sres or res
 
     def step_volume(self, decrement: bool) -> dict[str, Any]:
         action = "volume_down" if decrement else "volume_up"
@@ -891,23 +932,304 @@ class TvRemoteController:
             return res
         return self._ssap_request_fn("ssap://audio/setMute", {"mute": bool(muted)})
 
+    def wake_tv(self) -> dict[str, Any]:
+        wol_sent = 0
+        if self.tv_macs:
+            wol_sent = self._wol_sender_fn(self.tv_macs)
+        res = self.call_resident_remote({"action": "power_on"}, timeout=0.6)
+        ssap_ok = False
+        if not res.get("ok"):
+            sres = self._ssap_request_fn("ssap://com.webos.service.tvpower/power/turnOnScreen", {})
+            ssap_ok = bool(sres.get("ok"))
+        return {
+            "ok": True,
+            "action": "power_on",
+            "wolSent": wol_sent,
+            "remote": bool(res.get("ok") or ssap_ok),
+        }
+
     def set_power(self, active: bool) -> dict[str, Any]:
         if active:
-            wol_sent = 0
-            if self.tv_macs:
-                wol_sent = self._wol_sender_fn(self.tv_macs)
-            res = self.call_resident_remote({"action": "power_on"}, timeout=0.6)
-            return {"ok": True, "action": "power_on", "wolSent": wol_sent, "remote": res.get("ok", False)}
-        res = self.call_resident_remote({"action": "power_off"})
+            return self.wake_tv()
+        res = self.call_resident_remote({"action": "power_off"}, timeout=0.6)
         if res.get("ok"):
             return res
-        return self._ssap_request_fn("ssap://system/turnOff", {})
+        sres = self._ssap_request_fn("ssap://system/turnOff", {})
+        if sres.get("ok"):
+            return sres
+        if self.tv_macs:
+            woke = self.wake_tv()
+            woke["wokeFromStaleOff"] = True
+            return woke
+        return sres
 
     def launch_app(self, app_id: str) -> dict[str, Any]:
-        res = self.call_resident_remote({"action": "launch_app", "appId": app_id})
+        candidates = (
+            ("airplay", "com.webos.app.airplay", APP_LIBRARY_ID)
+            if app_id == "airplay"
+            else (app_id,)
+        )
+        res: dict[str, Any] = {}
+        for cand in candidates:
+            res = self.call_resident_remote({"action": "launch_app", "appId": cand})
+            if res.get("ok"):
+                return res
+        sres: dict[str, Any] = {}
+        for cand in candidates:
+            sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": cand})
+            if sres.get("ok"):
+                return sres
+        if self.tv_macs:
+            return self.wake_tv()
+        return sres or res
+
+    def send_key_name(self, key_name: str) -> dict[str, Any]:
+        cleaned = str(key_name or "").strip().lower()
+        if not cleaned:
+            return {"ok": False, "error": "missing_key"}
+        res = self.call_resident_remote({"action": "key", "key": cleaned})
         if res.get("ok"):
             return res
-        return self._ssap_request_fn("ssap://system.launcher/launch", {"id": app_id})
+        sres: dict[str, Any] = {}
+        if cleaned == "home":
+            sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": APP_LIBRARY_ID})
+        elif cleaned in ("backspace", "delete"):
+            sres = self._ssap_request_fn("ssap://com.webos.service.ime/deleteCharacters", {"count": 1})
+        elif cleaned == "enter":
+            sres = self._ssap_request_fn("ssap://com.webos.service.ime/sendEnterKey", {})
+        elif cleaned == "play_pause":
+            uri = "ssap://media.controls/play" if self._play_paused else "ssap://media.controls/pause"
+            self._play_paused = not self._play_paused
+            sres = self._ssap_request_fn(uri, {})
+        elif cleaned == "rewind":
+            sres = self._ssap_request_fn("ssap://media.controls/rewind", {})
+        elif cleaned == "fast_forward":
+            sres = self._ssap_request_fn("ssap://media.controls/fastForward", {})
+        if sres.get("ok"):
+            return sres
+        return sres or res
+
+    def send_text(self, text: str, submit: bool = False, replace: bool = False) -> dict[str, Any]:
+        raw_text = str(text or "")
+        if not raw_text and not submit:
+            return {"ok": False, "error": "empty_text"}
+        res = self.call_resident_remote(
+            {
+                "action": "text",
+                "text": raw_text,
+                "submit": bool(submit),
+                "replace": bool(replace),
+            },
+            timeout=2.5,
+        )
+        if res.get("ok") and res.get("imeOk", True):
+            return res
+        sres: dict[str, Any] = {"ok": True}
+        if raw_text:
+            sres = self._ssap_request_fn(
+                "ssap://com.webos.service.ime/insertText",
+                {"text": raw_text, "replace": 1 if replace else 0},
+            )
+        if submit and sres.get("ok"):
+            sres = self._ssap_request_fn("ssap://com.webos.service.ime/sendEnterKey", {})
+        if sres.get("ok") or res.get("ok"):
+            return {"ok": True, "action": "text", "length": len(raw_text), "submit": bool(submit)}
+        return sres or res
+
+    def dismiss_update_notices(self) -> dict[str, Any]:
+        res = self.call_resident_remote({"action": "dismiss_update_notices"}, timeout=2.8)
+        if res.get("ok"):
+            return res
+        sres = self._ssap_request_fn("ssap://system.notifications/closeAllAlerts", {})
+        return {"ok": bool(res.get("ok") or sres.get("ok")), "action": "dismiss_update_notices"}
+
+    def execute_voice_command(self, utterance: str) -> dict[str, Any]:
+        raw = str(utterance or "").strip()
+        if not raw:
+            return {"ok": False, "error": "empty_utterance"}
+        low = re.sub(r"\s+", " ", raw.lower()).strip()
+
+        # 1. Dismiss update / popup / alert notices
+        if any(
+            phrase in low
+            for phrase in (
+                "dismiss",
+                "close alert",
+                "close popup",
+                "close dialog",
+                "close notification",
+                "hide update",
+                "cancel update",
+            )
+        ):
+            res = self.dismiss_update_notices()
+            self.send_key_name("exit")
+            return {"ok": True, "intent": "dismiss_notices", "spoken": "Dismissed TV alerts", "result": res}
+
+        # 2. Power On / Wake / Turn Off
+        if re.search(r"\b(turn on|wake up|wake tv|power on|start tv)\b", low):
+            res = self.wake_tv()
+            return {"ok": True, "intent": "power_on", "spoken": "Turning on R2D2 TV", "result": res}
+        if re.search(r"\b(turn off|power off|sleep tv|shut down tv|standby)\b", low):
+            res = self.set_power(False)
+            return {"ok": True, "intent": "power_off", "spoken": "Turning off R2D2 TV", "result": res}
+
+        # 3. Typing / Searching text directly on TV
+        m_type = re.match(r"^(?:type|enter|input|write)\s+(.+)$", raw, flags=re.IGNORECASE)
+        if m_type:
+            typed_val = m_type.group(1).strip()
+            res = self.send_text(typed_val, submit=False)
+            return {
+                "ok": bool(res.get("ok", True)),
+                "intent": "type_text",
+                "spoken": f"Typed \"{typed_val}\"",
+                "result": res,
+            }
+        m_search = re.match(r"^(?:search(?:\s+for)?|look\s+up|find)\s+(.+)$", raw, flags=re.IGNORECASE)
+        if m_search and " in browser" not in low and " on web" not in low:
+            query_val = m_search.group(1).strip()
+            res = self.send_text(query_val, submit=True)
+            return {
+                "ok": bool(res.get("ok", True)),
+                "intent": "search_text",
+                "spoken": f"Searching for \"{query_val}\"",
+                "result": res,
+            }
+
+        # 4. Volume & Mute controls
+        if re.search(r"\b(unmute|sound on)\b", low):
+            res = self.set_mute(False)
+            return {"ok": True, "intent": "unmute", "spoken": "Unmuted TV", "result": res}
+        if re.search(r"\b(mute|silence|quiet)\b", low):
+            res = self.set_mute(True)
+            return {"ok": True, "intent": "mute", "spoken": "Muted TV", "result": res}
+        m_vol_set = re.search(r"\bvolume\s+(?:to\s+|at\s+)?(\d{1,3})\b", low)
+        if m_vol_set:
+            target_vol = max(0, min(100, int(m_vol_set.group(1))))
+            res = self.set_volume(target_vol)
+            return {
+                "ok": True,
+                "intent": "set_volume",
+                "volume": target_vol,
+                "spoken": f"Volume set to {target_vol}",
+                "result": res,
+            }
+        if re.search(r"\b(volume up|louder|turn it up|increase volume|raise volume)\b", low):
+            res = self.step_volume(decrement=False)
+            return {"ok": True, "intent": "volume_up", "spoken": "Volume up", "result": res}
+        if re.search(r"\b(volume down|quieter|softer|turn it down|decrease volume|lower volume)\b", low):
+            res = self.step_volume(decrement=True)
+            return {"ok": True, "intent": "volume_down", "spoken": "Volume down", "result": res}
+
+        # 5. Home & Navigation & Media controls
+        if low in ("home", "go home", "r2d2 home", "open home", "main menu", "app library", "owner home"):
+            res = self.launch_app(APP_LIBRARY_ID)
+            return {"ok": True, "intent": "home", "appId": APP_LIBRARY_ID, "spoken": "Opening R2D2 Home", "result": res}
+        if low in ("back", "go back", "return", "previous"):
+            res = self.send_key_name("back")
+            return {"ok": True, "intent": "key", "key": "back", "spoken": "Back", "result": res}
+        if low in ("exit", "close", "escape", "cancel"):
+            res = self.send_key_name("exit")
+            return {"ok": True, "intent": "key", "key": "exit", "spoken": "Exit", "result": res}
+        if low in ("select", "ok", "okay", "enter", "click", "confirm"):
+            res = self.send_key_name("select")
+            return {"ok": True, "intent": "key", "key": "select", "spoken": "OK", "result": res}
+        if low in ("backspace", "delete", "clear character"):
+            res = self.send_key_name("backspace")
+            return {"ok": True, "intent": "key", "key": "backspace", "spoken": "Backspace", "result": res}
+        if low in ("up", "go up", "move up", "scroll up"):
+            res = self.send_key_name("up")
+            return {"ok": True, "intent": "key", "key": "up", "spoken": "Up", "result": res}
+        if low in ("down", "go down", "move down", "scroll down"):
+            res = self.send_key_name("down")
+            return {"ok": True, "intent": "key", "key": "down", "spoken": "Down", "result": res}
+        if low in ("left", "go left", "move left"):
+            res = self.send_key_name("left")
+            return {"ok": True, "intent": "key", "key": "left", "spoken": "Left", "result": res}
+        if low in ("right", "go right", "move right"):
+            res = self.send_key_name("right")
+            return {"ok": True, "intent": "key", "key": "right", "spoken": "Right", "result": res}
+        if low in ("play", "pause", "resume", "stop", "play pause", "toggle play"):
+            res = self.send_key_name("play_pause")
+            return {"ok": True, "intent": "key", "key": "play_pause", "spoken": "Play / Pause", "result": res}
+        if low in ("rewind", "go back 10 seconds", "skip back"):
+            res = self.send_key_name("rewind")
+            return {"ok": True, "intent": "key", "key": "rewind", "spoken": "Rewind", "result": res}
+        if low in ("fast forward", "skip ahead", "skip forward"):
+            res = self.send_key_name("fast_forward")
+            return {"ok": True, "intent": "key", "key": "fast_forward", "spoken": "Fast forward", "result": res}
+
+        # 6. App / Input Source Launches (e.g. "open youtube", "launch netflix", "switch to hdmi 1")
+        app_aliases: list[tuple[tuple[str, ...], str, str]] = [
+            (("r2d2 home", "app library", "home screen"), APP_LIBRARY_ID, "R2D2 Home"),
+            (("spark browser", "tinybrowser"), "com.webos.app.tinybrowser", "Spark Browser"),
+            (("browser", "web browser", "internet"), "com.webos.app.browser", "Web Browser"),
+            (("netflix",), "netflix", "Netflix"),
+            (("youtube", "you tube"), "youtube.leanback.v4", "YouTube"),
+            (("disney", "disney+", "disney plus"), "com.disney.disneyplus-prod", "Disney+"),
+            (("prime video", "amazon prime", "prime"), "amazon", "Prime Video"),
+            (("apple tv", "apple tv+", "apple tv plus"), "com.apple.appletv", "Apple TV+"),
+            (("apple music", "music"), "com.apple.applemusic", "Apple Music"),
+            (("max", "hbo", "hbo max"), "com.wbd.stream", "Max"),
+            (("hulu",), "hulu", "Hulu"),
+            (("tubi",), "com.tubitv.ott.tubi", "Tubi"),
+            (("sling", "sling tv"), "com.movenetworks.app.sling-tv-sling-production", "Sling TV"),
+            (("spotify",), "spotify-beehive", "Spotify"),
+            (("hdmi 1", "hdmi one", "hdmi1"), "com.webos.app.hdmi1", "HDMI 1"),
+            (("hdmi 2", "hdmi two", "hdmi2"), "com.webos.app.hdmi2", "HDMI 2"),
+            (("hdmi 3", "hdmi three", "hdmi3"), "com.webos.app.hdmi3", "HDMI 3"),
+        ]
+        # Only match simple app launch if not a complex browser navigation request
+        is_complex_query = any(
+            w in low for w in (" and ", " search ", " play ", " video ", " weather ", " news ", "http", ".com", ".org")
+        )
+        if not is_complex_query:
+            for keywords, target_app_id, app_label in app_aliases:
+                for kw in keywords:
+                    if low == kw or re.search(rf"\b(?:open|launch|start|go to|switch to|watch)\s+{re.escape(kw)}\b", low):
+                        res = self.launch_app(target_app_id)
+                        return {
+                            "ok": True,
+                            "intent": "launch_app",
+                            "appId": target_app_id,
+                            "spoken": f"Opening {app_label}",
+                            "result": res,
+                        }
+
+        # 7. Delegate to Spark Voice Agent (Qwen3-4B-Instruct / AgentBridge) if available
+        if self._voice_agent_fn is not None:
+            try:
+                agent_res = self._voice_agent_fn(raw)
+                if isinstance(agent_res, dict) and agent_res.get("ok"):
+                    return {
+                        "ok": True,
+                        "intent": "voice_agent",
+                        "spoken": str(agent_res.get("spoken") or f"Executed: {raw}"),
+                        "result": agent_res,
+                    }
+            except Exception:
+                pass
+
+        # 8. Fallback: check if any app keyword appears in utterance, otherwise type/search it
+        for keywords, target_app_id, app_label in app_aliases:
+            for kw in keywords:
+                if kw in low:
+                    res = self.launch_app(target_app_id)
+                    return {
+                        "ok": True,
+                        "intent": "launch_app",
+                        "appId": target_app_id,
+                        "spoken": f"Opening {app_label}",
+                        "result": res,
+                    }
+
+        res = self.send_text(raw, submit=True)
+        return {
+            "ok": bool(res.get("ok", True)),
+            "intent": "text_fallback",
+            "spoken": f"Sent \"{raw}\" to TV",
+            "result": res,
+        }
 
     def poll_tv_state(self) -> dict[str, Any]:
         if self._status_reader_fn is not None:
@@ -1009,6 +1331,7 @@ class HomeKitTvAccessory:
             self._values[base_iid + 5] = 0
             self._values[base_iid + 6] = 0
             self._values[base_iid + 7] = int(src["identifier"])
+        self._wake_grace_until: float = 0.0
 
     def sync_from_tv_state(self, state: dict[str, Any] | None = None) -> list[tuple[int, int, Any]]:
         st = state if state is not None else self.controller.poll_tv_state()
@@ -1018,8 +1341,12 @@ class HomeKitTvAccessory:
         tv_power = str(st.get("tvPower") or "").strip().lower()
         if tv_power in ("active", "on"):
             new_active = 1
+            self._wake_grace_until = 0.0
         elif tv_power in ("standby", "off", "suspend", "unreachable"):
-            new_active = 0
+            if state is None and time.monotonic() < self._wake_grace_until:
+                new_active = 1
+            else:
+                new_active = 0
         else:
             new_active = None
         if new_active is not None and self._values.get(self.IID_TV_ACTIVE) != new_active:
@@ -1047,10 +1374,20 @@ class HomeKitTvAccessory:
         if iid == self.IID_IDENTIFY:
             return 0, events
         if iid == self.IID_TV_REMOTE_KEY:
-            self.controller.send_remote_key(int(value))
+            res = self.controller.send_remote_key(int(value))
+            if isinstance(res, dict) and res.get("action") == "power_on":
+                self._wake_grace_until = time.monotonic() + 25.0
+                if self._values.get(self.IID_TV_ACTIVE) != 1:
+                    self._values[self.IID_TV_ACTIVE] = 1
+                    events.append((1, self.IID_TV_ACTIVE, 1))
             return 0, events
         if iid == self.IID_TV_POWER_MODE:
-            self.controller.send_power_mode_selection(int(value))
+            res = self.controller.send_power_mode_selection(int(value))
+            if isinstance(res, dict) and res.get("action") == "power_on":
+                self._wake_grace_until = time.monotonic() + 25.0
+                if self._values.get(self.IID_TV_ACTIVE) != 1:
+                    self._values[self.IID_TV_ACTIVE] = 1
+                    events.append((1, self.IID_TV_ACTIVE, 1))
             return 0, events
         if iid == self.IID_SPEAKER_VOLUME_SELECTOR:
             decrement = int(value) == 1
@@ -1080,8 +1417,13 @@ class HomeKitTvAccessory:
             return 0, events
         if iid == self.IID_TV_ACTIVE:
             act = 1 if int(value) else 0
+            res = self.controller.set_power(active=bool(act))
+            if act == 1 or (isinstance(res, dict) and res.get("action") == "power_on"):
+                act = 1
+                self._wake_grace_until = time.monotonic() + 25.0
+            else:
+                self._wake_grace_until = 0.0
             self._values[self.IID_TV_ACTIVE] = act
-            self.controller.set_power(active=bool(act))
             events.append((1, self.IID_TV_ACTIVE, act))
             return 0, events
         if iid == self.IID_TV_ACTIVE_IDENTIFIER:
@@ -1090,7 +1432,12 @@ class HomeKitTvAccessory:
             if not app_id:
                 return -70410, events
             self._values[self.IID_TV_ACTIVE_IDENTIFIER] = ident
-            self.controller.launch_app(app_id)
+            res = self.controller.launch_app(app_id)
+            if isinstance(res, dict) and res.get("action") == "power_on":
+                self._wake_grace_until = time.monotonic() + 25.0
+                if self._values.get(self.IID_TV_ACTIVE) != 1:
+                    self._values[self.IID_TV_ACTIVE] = 1
+                    events.append((1, self.IID_TV_ACTIVE, 1))
             events.append((1, self.IID_TV_ACTIVE_IDENTIFIER, ident))
             return 0, events
         if iid == self.IID_TV_CONFIGURED_NAME:
@@ -1418,7 +1765,7 @@ class HapPairingState:
         self.setup_id = setup_id or self._random_setup_id()
         self.ltsk_seed = ltsk_seed or secrets.token_bytes(32)
         self.ltpk = ed25519_public_key(self.ltsk_seed)
-        self.config_num = 1
+        self.config_num = 2
         self.pairings: dict[str, dict[str, Any]] = {}
         if self.state_path is not None and self.state_path.is_file():
             self.load()
@@ -1470,6 +1817,31 @@ class HapPairingState:
     def setup_hash(self) -> str:
         return compute_setup_hash(self.setup_id, self.device_id)
 
+    @property
+    def server_identifier(self) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"r2d2-atv.{self.device_id.upper()}")).upper()
+
+    @property
+    def atv_unique_id(self) -> str:
+        return self.server_identifier.replace("-", "").upper()
+
+    @property
+    def atv_mac_bytes(self) -> bytes:
+        digest = hashlib.sha256(b"atv-mac-seed-v1:" + self.server_identifier.encode("utf-8")).digest()
+        b0 = (digest[0] | 0x02) & 0xFE
+        return bytes([b0]) + digest[1:6]
+
+    @property
+    def atv_device_id(self) -> str:
+        return ":".join(f"{b:02X}" for b in self.atv_mac_bytes)
+
+    @property
+    def mac_bytes(self) -> bytes:
+        cleaned = re.sub(r"[^0-9a-fA-F]", "", self.device_id)
+        if len(cleaned) == 12:
+            return bytes.fromhex(cleaned)
+        return b"\x02\x42\xd2\xd2\x00\x01"
+
     def load(self) -> None:
         if self.state_path is None or not self.state_path.is_file():
             return
@@ -1480,7 +1852,8 @@ class HapPairingState:
         if data.get("ltsk_hex"):
             self.ltsk_seed = bytes.fromhex(data["ltsk_hex"])
             self.ltpk = ed25519_public_key(self.ltsk_seed)
-        self.config_num = int(data.get("config_num") or 1)
+        loaded_cfg = int(data.get("config_num") or 1)
+        self.config_num = max(2, loaded_cfg)
         raw_pairings = data.get("pairings")
         if isinstance(raw_pairings, dict):
             self.pairings = {
@@ -1835,18 +2208,1129 @@ class HapProtocolProcessor:
         )
 
 
+# --- Apple Companion Link (`_companion-link._tcp`) OPACK + RTI + Siri Server ---
+
+
+def opack_pack(data: Any) -> bytes:
+    """Serialize Python objects into Apple's binary OPACK format."""
+    obj_list: list[bytes] = []
+
+    def _pack(item: Any) -> bytes:
+        res: bytes | None = None
+        if item is None:
+            res = b"\x04"
+        elif isinstance(item, bool):
+            res = b"\x01" if item else b"\x02"
+        elif isinstance(item, uuid.UUID):
+            res = b"\x05" + item.bytes
+        elif isinstance(item, int):
+            if 0 <= item < 0x28:
+                res = bytes([item + 8])
+            elif (item & ~0xFF) == 0:
+                res = bytes([0x30, item])
+            elif (item & ~0xFFFF) == 0:
+                res = b"\x31" + item.to_bytes(2, "little")
+            elif (item & ~0xFFFFFFFF) == 0:
+                res = b"\x32" + item.to_bytes(4, "little")
+            else:
+                res = b"\x33" + item.to_bytes(8, "little", signed=(item < 0))
+        elif isinstance(item, float):
+            res = b"\x36" + struct.pack("<d", item)
+        elif isinstance(item, str):
+            enc = item.encode("utf-8")
+            n = len(enc)
+            if n <= 0x20:
+                res = bytes([0x40 + n]) + enc
+            elif n <= 0xFF:
+                res = bytes([0x61]) + n.to_bytes(1, "little") + enc
+            elif n <= 0xFFFF:
+                res = bytes([0x62]) + n.to_bytes(2, "little") + enc
+            elif n <= 0xFFFFFF:
+                res = bytes([0x63]) + n.to_bytes(3, "little") + enc
+            else:
+                res = bytes([0x64]) + n.to_bytes(4, "little") + enc
+        elif isinstance(item, (bytes, bytearray)):
+            raw = bytes(item)
+            n = len(raw)
+            if n <= 0x20:
+                res = bytes([0x70 + n]) + raw
+            elif n <= 0xFF:
+                res = bytes([0x91]) + n.to_bytes(1, "little") + raw
+            elif n <= 0xFFFF:
+                res = bytes([0x92]) + n.to_bytes(2, "little") + raw
+            elif n <= 0xFFFFFF:
+                res = bytes([0x93]) + n.to_bytes(3, "little") + raw
+            else:
+                res = bytes([0x94]) + n.to_bytes(4, "little") + raw
+        elif isinstance(item, (list, tuple)):
+            n = len(item)
+            header = bytes([0xD0 + min(n, 0xF)])
+            body = b"".join(_pack(x) for x in item)
+            res = header + body + (b"\x03" if n >= 0xF else b"")
+        elif isinstance(item, dict):
+            n = len(item)
+            header = bytes([0xE0 + min(n, 0xF)])
+            body = b"".join(_pack(k) + _pack(v) for k, v in item.items())
+            res = header + body + (b"\x03" if n >= 0xF else b"")
+        else:
+            return _pack(str(item))
+
+        if len(res) > 1 and not isinstance(item, (list, tuple, dict)):
+            if res in obj_list:
+                idx = obj_list.index(res)
+                if idx < 0x20:
+                    res = bytes([0xA0 + idx])
+                elif idx <= 0xFF:
+                    res = bytes([0xC1]) + idx.to_bytes(1, "little")
+                elif idx <= 0xFFFF:
+                    res = bytes([0xC2]) + idx.to_bytes(2, "little")
+            elif len(obj_list) < 250:
+                obj_list.append(res)
+        return res
+
+    return _pack(data)
+
+
+def opack_unpack(buf: bytes) -> tuple[Any, bytes]:
+    """Deserialize Apple's binary OPACK format into Python objects."""
+    obj_list: list[Any] = []
+
+    def _add_ref(val: Any) -> None:
+        if not isinstance(val, (list, dict)) and val not in obj_list:
+            obj_list.append(val)
+
+    def _unpack(data: bytes) -> tuple[Any, bytes]:
+        if not data:
+            return None, b""
+        b0 = data[0]
+        if b0 == 0x01:
+            return True, data[1:]
+        if b0 == 0x02:
+            return False, data[1:]
+        if b0 == 0x04:
+            return None, data[1:]
+        if b0 == 0x05:
+            val = uuid.UUID(bytes=data[1:17])
+            _add_ref(val)
+            return val, data[17:]
+        if b0 == 0x06:
+            return int.from_bytes(data[1:9], "little"), data[9:]
+        if 0x08 <= b0 <= 0x2F:
+            return (b0 - 8), data[1:]
+        if (b0 & 0xF0) == 0x30:
+            if b0 == 0x35:
+                val = struct.unpack("<f", data[1:5])[0]
+                _add_ref(val)
+                return val, data[5:]
+            if b0 == 0x36:
+                val = struct.unpack("<d", data[1:9])[0]
+                _add_ref(val)
+                return val, data[9:]
+            nbytes = 1 << (b0 & 0x03)
+            val = int.from_bytes(data[1 : 1 + nbytes], "little")
+            _add_ref(val)
+            return val, data[1 + nbytes :]
+        if 0x40 <= b0 <= 0x60:
+            length = b0 - 0x40
+            val = data[1 : 1 + length].decode("utf-8", errors="replace")
+            if length > 0:
+                _add_ref(val)
+            return val, data[1 + length :]
+        if 0x60 < b0 <= 0x64:
+            nbytes = b0 & 0x0F
+            length = int.from_bytes(data[1 : 1 + nbytes], "little")
+            val = data[1 + nbytes : 1 + nbytes + length].decode("utf-8", errors="replace")
+            _add_ref(val)
+            return val, data[1 + nbytes + length :]
+        if 0x70 <= b0 <= 0x90:
+            length = b0 - 0x70
+            val = bytes(data[1 : 1 + length])
+            if length > 0:
+                _add_ref(val)
+            return val, data[1 + length :]
+        if 0x90 < b0 <= 0x94:
+            nbytes = b0 & 0x0F
+            length = int.from_bytes(data[1 : 1 + nbytes], "little")
+            val = bytes(data[1 + nbytes : 1 + nbytes + length])
+            _add_ref(val)
+            return val, data[1 + nbytes + length :]
+        if (b0 & 0xF0) == 0xD0:
+            count = b0 & 0x0F
+            ptr = data[1:]
+            out_list: list[Any] = []
+            if count == 0x0F:
+                while ptr and ptr[0] != 0x03:
+                    item, ptr = _unpack(ptr)
+                    out_list.append(item)
+                if ptr and ptr[0] == 0x03:
+                    ptr = ptr[1:]
+            else:
+                for _ in range(count):
+                    item, ptr = _unpack(ptr)
+                    out_list.append(item)
+            return out_list, ptr
+        if (b0 & 0xF0) == 0xE0:
+            count = b0 & 0x0F
+            ptr = data[1:]
+            out_dict: dict[Any, Any] = {}
+            if count == 0x0F:
+                while ptr and ptr[0] != 0x03:
+                    k, ptr = _unpack(ptr)
+                    v, ptr = _unpack(ptr)
+                    out_dict[k] = v
+                if ptr and ptr[0] == 0x03:
+                    ptr = ptr[1:]
+            else:
+                for _ in range(count):
+                    k, ptr = _unpack(ptr)
+                    v, ptr = _unpack(ptr)
+                    out_dict[k] = v
+            return out_dict, ptr
+        if 0xA0 <= b0 <= 0xC0:
+            idx = b0 - 0xA0
+            return (obj_list[idx] if idx < len(obj_list) else None), data[1:]
+        if 0xC1 <= b0 <= 0xC4:
+            nbytes = b0 - 0xC0
+            idx = int.from_bytes(data[1 : 1 + nbytes], "little")
+            return (obj_list[idx] if idx < len(obj_list) else None), data[1 + nbytes :]
+        return None, data[1:]
+
+    return _unpack(buf)
+
+
+def build_rti_payload(
+    session_uuid_str: str,
+    current_text: str = "",
+    title: str = "R2D2 TV",
+    prompt: str = "Type or tap Mic to speak to R2D2 TV",
+) -> bytes:
+    """Build an RTIKeyedArchiver binary plist for RemoteTextInput.framework (`_tiD`).
+
+    Verified against macOS `RemoteTextInput.framework`'s `RTIInputSystemDataPayload`.
+    """
+    uid = plistlib.UID
+    u_bytes = uuid.UUID(session_uuid_str).bytes
+    objects: list[Any] = [
+        "$null",
+        {
+            "$class": uid(11),
+            "documentTraits": uid(2),
+            "documentState": uid(7),
+            "sessionUUID": uid(9),
+            "version": 1,
+        },
+        {
+            "$class": uid(6),
+            "appId": uid(3),
+            "bundleId": uid(3),
+            "appName": uid(4),
+            "localizedAppName": uid(4),
+            "title": uid(4),
+            "prompt": uid(5),
+            "tiKeyboardOutput": None,
+        },
+        "com.r2d2.tv",
+        title,
+        prompt,
+        {
+            "$classname": "RTIDocumentTraits",
+            "$classes": ["RTIDocumentTraits", "NSObject"],
+        },
+        {
+            "$class": uid(8),
+            "documentState": uid(12),
+        },
+        {
+            "$classname": "RTIDocumentState",
+            "$classes": ["RTIDocumentState", "NSObject"],
+        },
+        {
+            "$class": uid(10),
+            "NS.uuidbytes": u_bytes,
+        },
+        {
+            "$classname": "NSUUID",
+            "$classes": ["NSUUID", "NSObject"],
+        },
+        {
+            "$classname": "RTIInputSystemDataPayload",
+            "$classes": ["RTIInputSystemDataPayload", "RTIDataPayload", "NSObject"],
+        },
+        {
+            "$class": uid(14),
+            "contextBeforeInput": uid(13),
+        },
+        current_text,
+        {
+            "$classname": "TIDocumentState",
+            "$classes": ["TIDocumentState", "NSObject"],
+        },
+    ]
+    archive = {
+        "$archiver": "RTIKeyedArchiver",
+        "$version": 100000,
+        "$top": {"root": uid(1)},
+        "$objects": objects,
+    }
+    return plistlib.dumps(archive, fmt=plistlib.PlistFormat.FMT_BINARY)
+
+
+def parse_rti_text_operations(rti_bytes: bytes) -> dict[str, Any]:
+    """Decode an incoming `_tiD` NSKeyedArchiver/RTIKeyedArchiver payload from iOS."""
+    out: dict[str, Any] = {
+        "insertion_text": "",
+        "deletion_count": 0,
+        "text_to_assert": None,
+        "action_selector": "",
+        "context_before": None,
+        "raw_strings": [],
+    }
+    if not rti_bytes:
+        return out
+    try:
+        pl = plistlib.loads(rti_bytes)
+    except Exception:
+        return out
+    if not isinstance(pl, dict):
+        return out
+    objs = pl.get("$objects")
+    if not isinstance(objs, list):
+        return out
+
+    def _resolve(val: Any) -> Any:
+        if isinstance(val, plistlib.UID):
+            idx = val.data
+            if 0 <= idx < len(objs):
+                target = objs[idx]
+                return None if target == "$null" else target
+            return None
+        return val
+
+    for item in objs:
+        if isinstance(item, str) and item != "$null" and not item.startswith("RTI") and not item.startswith("NS"):
+            out["raw_strings"].append(item)
+        elif isinstance(item, dict):
+            ins = _resolve(item.get("insertionText"))
+            if isinstance(ins, str) and ins:
+                out["insertion_text"] += ins
+            del_cnt = _resolve(item.get("deletionCount") or item.get("backwardDeletionCount"))
+            if isinstance(del_cnt, int) and del_cnt > 0:
+                out["deletion_count"] += del_cnt
+            assert_txt = _resolve(item.get("textToAssert"))
+            if isinstance(assert_txt, str):
+                out["text_to_assert"] = assert_txt
+            sel_name = _resolve(item.get("editingActionSelector") or item.get("customInfoType"))
+            if isinstance(sel_name, str) and sel_name:
+                out["action_selector"] = sel_name
+            ctx_before = _resolve(item.get("contextBeforeInput"))
+            if isinstance(ctx_before, str):
+                out["context_before"] = ctx_before
+    return out
+
+
+def is_voice_command_phrase(text: str) -> bool:
+    """Return True if typed/dictated text from the iOS Remote is a voice command for R2D2."""
+    cleaned = re.sub(r"\s+", " ", (text or "").strip().lower())
+    if not cleaned:
+        return False
+    voice_prefixes = (
+        "open ",
+        "launch ",
+        "start ",
+        "go to ",
+        "switch to ",
+        "turn on",
+        "turn off",
+        "power on",
+        "power off",
+        "wake ",
+        "sleep",
+        "mute",
+        "unmute",
+        "volume ",
+        "set volume",
+        "louder",
+        "quieter",
+        "softer",
+        "turn up",
+        "turn down",
+        "play ",
+        "pause",
+        "resume",
+        "stop",
+        "go home",
+        "go back",
+        "dismiss",
+        "hey r2",
+        "r2d2 ",
+        "ask r2",
+        "what ",
+        "who ",
+        "how ",
+        "tell me",
+        "search for ",
+        "find ",
+    )
+    if any(cleaned.startswith(p) for p in voice_prefixes):
+        return True
+    exact_commands = {
+        "home",
+        "r2d2 home",
+        "back",
+        "menu",
+        "select",
+        "ok",
+        "enter",
+        "up",
+        "down",
+        "left",
+        "right",
+        "youtube",
+        "netflix",
+        "disney",
+        "disney+",
+        "disney plus",
+        "prime video",
+        "amazon prime",
+        "apple tv",
+        "max",
+        "hbo",
+        "plex",
+        "spotify",
+        "browser",
+        "settings",
+    }
+    return cleaned in exact_commands
+
+
+class CompanionSrpServer:
+    """SRP-6a server for Companion Link (`_companion-link._tcp`) matching Apple CoreUtils / `srptools`."""
+
+    def __init__(self, pin: str = DEFAULT_COMPANION_PIN, salt: bytes | None = None, private_b: int | None = None) -> None:
+        self.pin = pin
+        self.salt = salt if salt is not None else secrets.token_bytes(16)
+        self.b = private_b if private_b is not None else int.from_bytes(secrets.token_bytes(32), "big")
+        x = int.from_bytes(
+            hashlib.sha512(
+                self.salt + hashlib.sha512(f"Pair-Setup:{self.pin}".encode("utf-8")).digest()
+            ).digest(),
+            "big",
+        )
+        self.v = pow(SRP_G, x, SRP_N)
+        srp_n_raw = _int_to_bytes(SRP_N, SRP_N_BYTES)
+        k = int.from_bytes(
+            hashlib.sha512(srp_n_raw + _int_to_bytes(SRP_G, SRP_N_BYTES)).digest(),
+            "big",
+        )
+        self.B = (k * self.v + pow(SRP_G, self.b, SRP_N)) % SRP_N
+        self.public_key_bytes = _int_to_bytes(self.B)
+        self.K: bytes | None = None
+
+    def verify_client_proof(self, client_pub_bytes: bytes, client_proof_bytes: bytes) -> bytes | None:
+        if not client_pub_bytes or not client_proof_bytes:
+            return None
+        A = int.from_bytes(client_pub_bytes, "big")
+        if A % SRP_N == 0:
+            return None
+        a_padded = _int_to_bytes(A, SRP_N_BYTES)
+        b_padded = _int_to_bytes(self.B, SRP_N_BYTES)
+        u = int.from_bytes(hashlib.sha512(a_padded + b_padded).digest(), "big")
+        if u == 0:
+            return None
+        S = pow((A * pow(self.v, u, SRP_N)) % SRP_N, self.b, SRP_N)
+        K = hashlib.sha512(_int_to_bytes(S)).digest()
+
+        h_n = int.from_bytes(hashlib.sha512(_int_to_bytes(SRP_N)).digest(), "big")
+        h_g = int.from_bytes(hashlib.sha512(_int_to_bytes(SRP_G)).digest(), "big")
+        h_ng = _int_to_bytes(h_n ^ h_g)
+        h_u = hashlib.sha512(b"Pair-Setup").digest()
+        a_unpadded = _int_to_bytes(A)
+        b_unpadded = _int_to_bytes(self.B)
+        expected_m1 = hashlib.sha512(h_ng + h_u + self.salt + a_unpadded + b_unpadded + K).digest()
+        if not hmac.compare_digest(expected_m1, client_proof_bytes):
+            K_pad = hashlib.sha512(_int_to_bytes(S, SRP_N_BYTES)).digest()
+            expected_m1_pad = hashlib.sha512(h_ng + h_u + self.salt + a_padded + b_padded + K_pad).digest()
+            if not hmac.compare_digest(expected_m1_pad, client_proof_bytes):
+                return None
+            self.K = K_pad
+            return hashlib.sha512(a_padded + expected_m1_pad + K_pad).digest()
+        self.K = K
+        return hashlib.sha512(a_unpadded + expected_m1 + K).digest()
+
+
+class CompanionCipher:
+    """ChaCha20-Poly1305 session cipher for Companion Link `E_OPACK` (0x08) frames."""
+
+    def __init__(self, shared_secret: bytes) -> None:
+        self.output_key = hkdf_sha512(shared_secret, b"", b"ServerEncrypt-main", 32)
+        self.input_key = hkdf_sha512(shared_secret, b"", b"ClientEncrypt-main", 32)
+        self.out_counter = 0
+        self.in_counter = 0
+
+    def encrypt(self, plaintext: bytes, aad: bytes) -> bytes:
+        nonce = struct.pack("<Q", self.out_counter) + b"\x00\x00\x00\x00"
+        self.out_counter += 1
+        return chacha20_poly1305_encrypt(self.output_key, nonce, plaintext, aad)
+
+    def decrypt(self, ciphertext_with_tag: bytes, aad: bytes) -> bytes:
+        nonce = struct.pack("<Q", self.in_counter) + b"\x00\x00\x00\x00"
+        self.in_counter += 1
+        return chacha20_poly1305_decrypt(self.input_key, nonce, ciphertext_with_tag, aad)
+
+
+class CompanionSession:
+    """Handles a single iOS Control Center Remote connection over `_companion-link._tcp`.
+
+    Matches `atv-core` (`session.rs`) wire framing for iOS 17–27 Control Center Remote,
+    plus `RemoteTextInput.framework` (`_tiStart`, `_tiStarted`, `_tiC`) and `Siri` (`_hidC=10`, `_siriStart`).
+    """
+
+    ALT_IRK = bytes(
+        [0x2D, 0x54, 0xE0, 0x7A, 0x88, 0x2A, 0x65, 0x6E, 0x11, 0xAB, 0x82, 0x76, 0x2D, 0x27, 0x25, 0xC5]
+    )
+
+    def __init__(
+        self,
+        conn: socket.socket,
+        pairing_state: HapPairingState,
+        accessory: HomeKitTvAccessory,
+        broadcast_cb: Any = None,
+        pin: str = DEFAULT_COMPANION_PIN,
+    ) -> None:
+        self.conn = conn
+        self.pairing_state = pairing_state
+        self.accessory = accessory
+        self.broadcast_cb = broadcast_cb
+        self.pin = pin
+        self.srp: CompanionSrpServer | None = None
+        self.cipher: CompanionCipher | None = None
+        self.verify_ctx: dict[str, Any] = {}
+        self.send_lock = threading.Lock()
+        self.remote_session_id = secrets.randbelow(0x7FFFFFFF) + 1
+        self.server_xid = secrets.randbelow(0x40000000) + 1000
+        self.rti_uuid = str(uuid.uuid4()).upper()
+        self.current_text = ""
+        self.voice_mode_active = False
+        self._touch_origin: tuple[float, float] | None = None
+        self._last_hid_fire: tuple[int, float] = (-1, 0.0)
+
+    def send_frame(self, frame_type: int, payload_dict: dict[str, Any]) -> None:
+        raw = opack_pack(payload_dict)
+        if frame_type == COMPANION_FRAME_E_OPACK and self.cipher is not None:
+            enc_len = len(raw) + 16
+            header = bytes([COMPANION_FRAME_E_OPACK]) + enc_len.to_bytes(3, "big")
+            body = self.cipher.encrypt(raw, header)
+        else:
+            header = bytes([frame_type]) + len(raw).to_bytes(3, "big")
+            body = raw
+        with self.send_lock:
+            self.conn.sendall(header + body)
+
+    def send_response(
+        self,
+        msg_id: str,
+        xid: int | None,
+        content: dict[str, Any] | None = None,
+        result_type: int = 0,
+        encrypted: bool = True,
+    ) -> None:
+        resp: dict[str, Any] = {
+            "_c": content if content is not None else {},
+            "_rT": result_type,
+            "_t": 3,
+        }
+        if msg_id:
+            resp["_i"] = msg_id
+        if xid is not None:
+            resp["_x"] = int(xid)
+        frame_type = COMPANION_FRAME_E_OPACK if (encrypted and self.cipher is not None) else COMPANION_FRAME_U_OPACK
+        self.send_frame(frame_type, resp)
+
+    def send_event(self, event_name: str, content: dict[str, Any], xid: int | None = None) -> None:
+        if xid is None:
+            self.server_xid += 1
+            xid = self.server_xid
+        msg = {
+            "_i": event_name,
+            "_t": 1,
+            "_c": content,
+            "_x": int(xid),
+        }
+        frame_type = COMPANION_FRAME_E_OPACK if self.cipher is not None else COMPANION_FRAME_U_OPACK
+        self.send_frame(frame_type, msg)
+
+    def send_media_capabilities(self, xid: int | None = None) -> None:
+        self.send_event("MediaControlStatus", {"MediaControlFlags": 0x0100}, xid=xid)
+        self.send_event("_iMC", {"_mcF": 0x0100}, xid=xid)
+
+    def send_power_state(self, xid: int | None = None) -> None:
+        active_state = 3 if int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1)) == 1 else 1
+        self.send_event("SystemStatus", {"state": active_state}, xid=xid)
+        self.send_event("TVSystemStatus", {"state": active_state}, xid=xid)
+
+    def build_rti_event_dict(self, prompt: str | None = None) -> dict[str, Any]:
+        active_prompt = prompt or (
+            "Speak or type a voice command for R2D2 TV"
+            if self.voice_mode_active
+            else "Type text or speak a command for R2D2 TV"
+        )
+        rti_bytes = build_rti_payload(
+            self.rti_uuid,
+            current_text=self.current_text,
+            title="R2D2 TV Voice & Keyboard" if self.voice_mode_active else "R2D2 Apple TV",
+            prompt=active_prompt,
+        )
+        return {
+            "_tiV": 1,
+            "_tiD": rti_bytes,
+            "_tiE": True,
+            "TextInputVersion": 1,
+            "TextInputData": rti_bytes,
+        }
+
+    def push_rti_started(self, prompt: str | None = None) -> None:
+        ev = self.build_rti_event_dict(prompt=prompt)
+        try:
+            self.send_event("_tiStarted", ev)
+        except Exception:
+            pass
+
+    def handle_frame(self, frame_type: int, raw_payload: bytes) -> None:
+        if frame_type == COMPANION_FRAME_E_OPACK:
+            if self.cipher is None:
+                return
+            header = bytes([frame_type]) + len(raw_payload).to_bytes(3, "big")
+            plaintext = self.cipher.decrypt(raw_payload, header)
+            msg, _ = opack_unpack(plaintext)
+        elif frame_type in (
+            COMPANION_FRAME_PS_START,
+            COMPANION_FRAME_PS_NEXT,
+            COMPANION_FRAME_PV_START,
+            COMPANION_FRAME_PV_NEXT,
+            COMPANION_FRAME_U_OPACK,
+        ):
+            msg, _ = opack_unpack(raw_payload)
+        else:
+            return
+
+        if not isinstance(msg, dict):
+            return
+
+        if frame_type in (COMPANION_FRAME_PS_START, COMPANION_FRAME_PS_NEXT):
+            self._handle_pair_setup(msg)
+        elif frame_type in (COMPANION_FRAME_PV_START, COMPANION_FRAME_PV_NEXT):
+            self._handle_pair_verify(msg)
+        else:
+            self._handle_opack_message(msg, encrypted=(frame_type == COMPANION_FRAME_E_OPACK))
+
+    def _handle_pair_setup(self, msg: dict[str, Any]) -> None:
+        pd = msg.get("_pd")
+        if not isinstance(pd, (bytes, bytearray)):
+            content = msg.get("_c")
+            if isinstance(content, dict):
+                pd = content.get("_pd")
+        if not isinstance(pd, (bytes, bytearray)):
+            return
+        tlv = tlv8_decode(bytes(pd))
+        state = tlv.get(TLV_STATE, b"\x00")[0]
+        flags_bytes = tlv.get(TLV_FLAGS, b"")
+        flags_val = int.from_bytes(flags_bytes, "little") if flags_bytes else 0
+
+        if state == 1:
+            pin_to_use = "3939" if (flags_val & 0x10) else self.pin
+            priv_b = int.from_bytes(self.pairing_state.ltsk_seed, "big")
+            self.srp = CompanionSrpServer(pin=pin_to_use, private_b=priv_b)
+            self.verify_ctx["transient"] = bool(flags_val & 0x10)
+            resp_tlv = tlv8_encode(
+                [
+                    (TLV_STATE, b"\x02"),
+                    (TLV_SALT, self.srp.salt),
+                    (TLV_PUBLIC_KEY, self.srp.public_key_bytes),
+                    (27, b"\x01"),
+                ]
+            )
+            self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": resp_tlv, "_pwTy": 1})
+            return
+
+        if state == 3:
+            if self.srp is None:
+                err_tlv = tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))])
+                self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": err_tlv})
+                return
+            client_pub = tlv.get(TLV_PUBLIC_KEY, b"")
+            client_proof = tlv.get(TLV_PROOF, b"")
+            server_proof = self.srp.verify_client_proof(client_pub, client_proof)
+            if server_proof is None:
+                alt_pin = "3939" if self.srp.pin != "3939" else self.pin
+                alt_srp = CompanionSrpServer(pin=alt_pin, salt=self.srp.salt, private_b=self.srp.b)
+                server_proof = alt_srp.verify_client_proof(client_pub, client_proof)
+                if server_proof is not None:
+                    self.srp = alt_srp
+            if server_proof is None or self.srp.K is None:
+                err_tlv = tlv8_encode([(TLV_STATE, b"\x04"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))])
+                self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": err_tlv})
+                return
+            resp_tlv = tlv8_encode([(TLV_STATE, b"\x04"), (TLV_PROOF, server_proof)])
+            self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": resp_tlv})
+            if self.verify_ctx.get("transient"):
+                self.cipher = CompanionCipher(self.srp.K)
+            return
+
+        if state == 5:
+            if self.srp is None or self.srp.K is None:
+                err_tlv = tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ERROR, bytes([TLV_ERROR_UNKNOWN]))])
+                self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": err_tlv})
+                return
+            enc_data = tlv.get(TLV_ENCRYPTED_DATA, b"")
+            session_key = hkdf_sha512(
+                self.srp.K, b"Pair-Setup-Encrypt-Salt", b"Pair-Setup-Encrypt-Info", 32
+            )
+            try:
+                sub_bytes = chacha20_poly1305_decrypt(session_key, b"\x00\x00\x00\x00PS-Msg05", enc_data)
+            except Exception:
+                err_tlv = tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))])
+                self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": err_tlv})
+                return
+            sub_tlv = tlv8_decode(sub_bytes)
+            ios_id = sub_tlv.get(TLV_IDENTIFIER, b"")
+            ios_ltpk = sub_tlv.get(TLV_PUBLIC_KEY, b"")
+            if ios_id and len(ios_ltpk) == 32:
+                self.pairing_state.pairings[ios_id.decode("utf-8", errors="replace")] = {
+                    "public_key": ios_ltpk.hex(),
+                    "permissions": 1,
+                }
+                self.pairing_state.save()
+
+            acc_x = hkdf_sha512(
+                self.srp.K,
+                b"Pair-Setup-Accessory-Sign-Salt",
+                b"Pair-Setup-Accessory-Sign-Info",
+                32,
+            )
+            unique_id_bytes = self.pairing_state.server_identifier.encode("utf-8")
+            acc_sig = ed25519_sign(self.pairing_state.ltsk_seed, acc_x + unique_id_bytes + self.pairing_state.ltpk)
+            custom_info = opack_pack(
+                {
+                    "altIRK": self.ALT_IRK,
+                    "accountID": str(uuid.uuid4()).upper(),
+                    "model": "AppleTV14,1",
+                    "wifiMAC": self.pairing_state.atv_mac_bytes,
+                    "name": "R2D2 Apple TV",
+                    "mac": self.pairing_state.atv_mac_bytes,
+                }
+            )
+            resp_sub = tlv8_encode(
+                [
+                    (TLV_IDENTIFIER, unique_id_bytes),
+                    (TLV_PUBLIC_KEY, self.pairing_state.ltpk),
+                    (TLV_SIGNATURE, acc_sig),
+                    (17, custom_info),
+                ]
+            )
+            resp_enc = chacha20_poly1305_encrypt(session_key, b"\x00\x00\x00\x00PS-Msg06", resp_sub)
+            resp_tlv = tlv8_encode([(TLV_STATE, b"\x06"), (TLV_ENCRYPTED_DATA, resp_enc)])
+            self.send_frame(COMPANION_FRAME_PS_NEXT, {"_pd": resp_tlv})
+
+    def _handle_pair_verify(self, msg: dict[str, Any]) -> None:
+        pd = msg.get("_pd")
+        if not isinstance(pd, (bytes, bytearray)):
+            content = msg.get("_c")
+            if isinstance(content, dict):
+                pd = content.get("_pd")
+        if not isinstance(pd, (bytes, bytearray)):
+            return
+        tlv = tlv8_decode(bytes(pd))
+        state = tlv.get(TLV_STATE, b"\x00")[0]
+
+        if state == 1:
+            client_curve_pub = tlv.get(TLV_PUBLIC_KEY, b"")
+            if len(client_curve_pub) != 32:
+                err_tlv = tlv8_encode([(TLV_STATE, b"\x02"), (TLV_ERROR, bytes([TLV_ERROR_AUTHENTICATION]))])
+                self.send_frame(COMPANION_FRAME_PV_NEXT, {"_pd": err_tlv})
+                return
+            acc_curve_priv, acc_curve_pub = x25519_keypair(self.pairing_state.ltsk_seed)
+            shared_secret = x25519_scalarmult(acc_curve_priv, client_curve_pub)
+            unique_id_bytes = self.pairing_state.server_identifier.encode("utf-8")
+            acc_info = acc_curve_pub + unique_id_bytes + client_curve_pub
+            acc_sig = ed25519_sign(self.pairing_state.ltsk_seed, acc_info)
+            sub_tlv = tlv8_encode([(TLV_IDENTIFIER, unique_id_bytes), (TLV_SIGNATURE, acc_sig)])
+            session_key = hkdf_sha512(
+                shared_secret, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32
+            )
+            enc_sub = chacha20_poly1305_encrypt(session_key, b"\x00\x00\x00\x00PV-Msg02", sub_tlv)
+            self.verify_ctx["shared_secret"] = shared_secret
+            self.verify_ctx["session_key"] = session_key
+            self.verify_ctx["acc_curve_pub"] = acc_curve_pub
+            self.verify_ctx["client_curve_pub"] = client_curve_pub
+            self.cipher = CompanionCipher(shared_secret)
+            resp_tlv = tlv8_encode(
+                [
+                    (TLV_STATE, b"\x02"),
+                    (TLV_PUBLIC_KEY, acc_curve_pub),
+                    (TLV_ENCRYPTED_DATA, enc_sub),
+                ]
+            )
+            self.send_frame(COMPANION_FRAME_PV_NEXT, {"_pd": resp_tlv})
+            return
+
+        if state == 3:
+            resp_tlv = tlv8_encode([(TLV_STATE, b"\x04")])
+            self.send_frame(COMPANION_FRAME_PV_NEXT, {"_pd": resp_tlv})
+
+    def _handle_opack_message(self, msg: dict[str, Any], encrypted: bool) -> None:
+        msg_type = int(msg.get("_t", 0) or 0)
+        # iOS 26/27 sends `_systemInfo` with the identifier in `model` if `_i` is omitted
+        msg_id = str(msg.get("_i") or msg.get("model") or "")
+        xid = msg.get("_x")
+        content = msg.get("_c") if isinstance(msg.get("_c"), dict) else {}
+
+        if msg_id in ("_systemInfo", "SystemInfo"):
+            self.send_response(msg_id, xid, {}, 0, encrypted=encrypted)
+            self.send_power_state(None)
+            return
+
+        if msg_id == "_interest":
+            reg_events = content.get("_regEvents")
+            if isinstance(reg_events, list):
+                for ev_name in reg_events:
+                    if not isinstance(ev_name, str):
+                        continue
+                    if ev_name == "MediaControlStatus":
+                        self.send_event("MediaControlStatus", {"MediaControlFlags": 0x0100}, xid=xid)
+                    elif ev_name == "_iMC":
+                        self.send_event("_iMC", {"_mcF": 0x0100}, xid=xid)
+                    elif ev_name == "NowPlayingInfo":
+                        self.send_event("NowPlayingInfo", {}, xid=xid)
+                    elif ev_name in ("SystemStatus", "TVSystemStatus"):
+                        active_state = (
+                            3 if int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1)) == 1 else 1
+                        )
+                        self.send_event(ev_name, {"state": active_state}, xid=xid)
+                    elif ev_name == "SiriStatus":
+                        self.send_event("SiriStatus", {"SiriStatus": 1}, xid=xid)
+            return
+
+        if msg_type == 2 or xid is not None and msg_type != 1:
+            resp_content, res_type = self._dispatch_request(msg_id, content, xid)
+            self.send_response(msg_id, xid, resp_content, res_type, encrypted=encrypted)
+            if msg_id == "TVRCSessionStart":
+                self.send_media_capabilities(xid)
+                self.send_power_state(xid)
+                self.send_event("SiriStatus", {"SiriStatus": 1}, xid=xid)
+                self.push_rti_started()
+            elif msg_id in ("_siriStart", "SiriStart"):
+                self.voice_mode_active = True
+                self.push_rti_started(prompt="Speak or type a voice command for R2D2 TV")
+        elif msg_type == 1:
+            self._dispatch_event(msg_id, content, xid)
+
+    def _dispatch_request(
+        self, msg_id: str, content: dict[str, Any], xid: int | None
+    ) -> tuple[dict[str, Any], int]:
+        if msg_id == "_sessionStart":
+            return {"_sid": self.remote_session_id}, 0
+        if msg_id in ("_sessionStop", "TVRCSessionStop"):
+            return {}, 0
+        if msg_id == "TVRCSessionStart":
+            version = str(content.get("ProtocolVersionKey") or "1.2")
+            active_state = 3 if int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1)) == 1 else 1
+            return {
+                "ProtocolVersionKey": version,
+                "SiriStatus": 1,
+                "state": active_state,
+                "SupportedActions": {"GuideSupportedKey": True},
+                "GuideSupportedKey": True,
+                "MediaControlFlags": 0x0100,
+                "_mcF": 0x0100,
+            }, 0
+        if msg_id == "_touchStart":
+            return {"_i": 1}, 0
+        if msg_id in ("_touchStop", "_touchMove"):
+            return {}, 0
+        if msg_id in ("FetchAttentionState", "TVSystemStatus", "SystemStatus"):
+            active_state = 3 if int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1)) == 1 else 1
+            return {"state": active_state}, 0
+        if msg_id in ("FetchSiriStatus", "SiriStatus"):
+            return {"SiriStatus": 1}, 0
+        if msg_id in ("FetchSiriRemoteInfo", "FetchCurrentNowPlayingInfoEvent"):
+            return {}, 0
+        if msg_id == "FetchLaunchableApplicationsEvent":
+            return {
+                "local.owner.applibrary": "R2D2 Home",
+                "youtube.leanback.v4": "YouTube",
+                "netflix": "Netflix",
+                "com.disney.disneyplus-prod": "Disney+",
+                "amazon": "Prime Video",
+                "com.apple.appletv": "Apple TV",
+                "com.wbd.stream": "Max",
+                "cdp-30": "Plex",
+            }, 2
+        if msg_id == "_launchApp":
+            bundle_id = str(content.get("_bundleID") or "").strip()
+            if bundle_id:
+                self.accessory.controller.launch_app(bundle_id)
+            return {}, 0
+        if msg_id in ("FetchSupportedActionsEvent", "SupportedActions"):
+            return {"SupportedActions": {"GuideSupportedKey": True}, "GuideSupportedKey": True}, 0
+        if msg_id in ("FetchMediaControlStatus", "MediaControlStatus", "_iMC"):
+            return {"MediaControlFlags": 0x0100, "_mcF": 0x0100, "_iMC": 0x0100}, 0
+        if msg_id in ("_tiStart", "TextInputStart"):
+            return self.build_rti_event_dict(), 0
+        if msg_id in ("_tiStop", "TextInputStop"):
+            self.voice_mode_active = False
+            return {}, 0
+        if msg_id in ("_siriStart", "SiriStart"):
+            self.voice_mode_active = True
+            return {"_pttEligible": True}, 0
+        if msg_id in ("_siriStop", "SiriStop"):
+            self.voice_mode_active = False
+            return {}, 0
+        if msg_id == "_hidC":
+            self._handle_hid_command(content, xid)
+            return {}, 0
+        if msg_id == "_hidT":
+            self._handle_touch_event(content)
+            return {}, 0
+        if msg_id in ("MediaControlCommand", "_mcc"):
+            return self._handle_media_control_command(content), 0
+        if msg_id in ("_tiC", "TextInputChanged"):
+            self._handle_rti_change(content)
+            return {}, 0
+        return {}, 0
+
+    def _dispatch_event(self, msg_id: str, content: dict[str, Any], xid: int | None) -> None:
+        if msg_id == "_hidC":
+            self._handle_hid_command(content, xid)
+        elif msg_id == "_hidT":
+            self._handle_touch_event(content)
+        elif msg_id in ("MediaControlCommand", "_mcc"):
+            self._handle_media_control_command(content)
+        elif msg_id in ("_tiC", "TextInputChanged"):
+            self._handle_rti_change(content)
+        elif msg_id in ("_siriStart", "SiriStart"):
+            self.voice_mode_active = True
+            self.push_rti_started(prompt="Speak or type a voice command for R2D2 TV")
+        elif msg_id in ("_siriStop", "SiriStop"):
+            self.voice_mode_active = False
+
+    def _emit_hap_changes(self, changes: list[tuple[int, int, Any]]) -> None:
+        if changes and callable(self.broadcast_cb):
+            try:
+                self.broadcast_cb(changes)
+            except Exception:
+                pass
+
+    def _handle_hid_command(self, content: dict[str, Any], xid: int | None = None) -> None:
+        btn_state = content.get("_hBtS")
+        cmd = content.get("_hidC")
+        if cmd is None:
+            return
+        cmd_id = int(cmd)
+        # Siri / Voice button (`_hidC = 10` or `20`): trigger RTI keyboard/dictation prompt
+        if cmd_id in (10, 20):
+            if btn_state in (1, 2, True, None):
+                self.voice_mode_active = True
+                self.push_rti_started(prompt="Tap Mic on keyboard to speak to R2D2 TV")
+            return
+
+        if btn_state == 0:
+            return
+        now = time.monotonic()
+        last_cmd, last_ts = self._last_hid_fire
+        # Deduplicate `_hBtS=1` (down) followed immediately by `_hBtS=2` (up)
+        if last_cmd == cmd_id and (now - last_ts) < 0.22:
+            return
+        self._last_hid_fire = (cmd_id, now)
+
+        changes: list[tuple[int, int, Any]] = []
+        if cmd_id == 1:  # Up
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_ARROW_UP
+            )
+        elif cmd_id == 2:  # Down
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_ARROW_DOWN
+            )
+        elif cmd_id == 3:  # Left
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_ARROW_LEFT
+            )
+        elif cmd_id == 4:  # Right
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_ARROW_RIGHT
+            )
+        elif cmd_id == 5:  # Menu / Back
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_BACK
+            )
+        elif cmd_id == 6:  # Select / Click
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_SELECT
+            )
+        elif cmd_id == 7:  # Home / TV Button -> launch R2D2 Home (`local.owner.applibrary`)
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_ACTIVE_IDENTIFIER, 1
+            )
+        elif cmd_id == 8:  # Volume Up
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_SPEAKER_VOLUME_SELECTOR, 0
+            )
+            self.send_media_capabilities(xid)
+        elif cmd_id == 9:  # Volume Down
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_SPEAKER_VOLUME_SELECTOR, 1
+            )
+            self.send_media_capabilities(xid)
+        elif cmd_id == 14:  # Play / Pause
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_PLAY_PAUSE
+            )
+        elif cmd_id in (15, 16, 17):  # Channel Up/Down / Guide -> R2D2 Home
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_ACTIVE_IDENTIFIER, 1
+            )
+        elif cmd_id in (18, 24):  # iOS 26/27 Mute toggle
+            cur_muted = bool(self.accessory._values.get(self.accessory.IID_SPEAKER_MUTE, False))
+            new_muted = not cur_muted
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_SPEAKER_MUTE, new_muted
+            )
+            self.send_event(
+                "MediaControlStatus",
+                {"MediaControlFlags": 0x0100, "Muted": new_muted},
+                xid=xid,
+            )
+            self.send_event("_iMC", {"_mcF": 0x0100}, xid=xid)
+        elif cmd_id in (11, 12, 13, 19):  # Power / Sleep / Wake (iOS 26/27 uses 19 for Power)
+            cur_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
+            if cmd_id == 12:
+                target_active = 0
+            elif cmd_id == 13:
+                target_active = 1
+            else:
+                target_active = 0 if cur_active == 1 else 1
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_ACTIVE, target_active
+            )
+            self.send_power_state(xid)
+        self._emit_hap_changes(changes)
+
+    def _handle_touch_event(self, content: dict[str, Any]) -> None:
+        phase = int(content.get("_tPh", 0) or 0)
+        x = float(content.get("_cx", 0.0) or 0.0)
+        y = float(content.get("_cy", 0.0) or 0.0)
+        if phase == 1:
+            self._touch_origin = (x, y)
+            return
+        if phase == 4 and self._touch_origin is not None:
+            sx, sy = self._touch_origin
+            self._touch_origin = None
+            dx = x - sx
+            dy = y - sy
+            dist = max(abs(dx), abs(dy))
+            if dist < 60.0:
+                _, changes = self.accessory.put_characteristic(
+                    self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_SELECT
+                )
+                self._emit_hap_changes(changes)
+                return
+            if dist < 150.0:
+                return
+            if abs(dx) > abs(dy):
+                hap_key = HAP_REMOTE_KEY_ARROW_RIGHT if dx > 0 else HAP_REMOTE_KEY_ARROW_LEFT
+            else:
+                hap_key = HAP_REMOTE_KEY_ARROW_DOWN if dy > 0 else HAP_REMOTE_KEY_ARROW_UP
+            _, changes = self.accessory.put_characteristic(self.accessory.IID_TV_REMOTE_KEY, hap_key)
+            self._emit_hap_changes(changes)
+
+    def _handle_media_control_command(self, content: dict[str, Any]) -> dict[str, Any]:
+        mcc = int(content.get("MediaControlCommand") or content.get("_mcc") or 0)
+        changes: list[tuple[int, int, Any]] = []
+        resp: dict[str, Any] = {}
+        if mcc in (1, 2, 3, 4):  # Play / Pause / Next / Prev
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_PLAY_PAUSE
+            )
+        elif mcc == 5:  # GetVolume
+            vol = int(self.accessory._values.get(self.accessory.IID_SPEAKER_VOLUME, 20))
+            muted = bool(self.accessory._values.get(self.accessory.IID_SPEAKER_MUTE, False))
+            resp = {"_vol": 0.0 if muted else max(0.0, min(1.0, vol / 100.0))}
+        elif mcc in (6, 10):  # SetVolume
+            vol_f = float(content.get("_vol", 0.2) or 0.2)
+            _, changes = self.accessory.put_characteristic(
+                self.accessory.IID_SPEAKER_VOLUME, int(round(max(0.0, min(1.0, vol_f)) * 100))
+            )
+        elif mcc == 12:  # GetCaptionSettings
+            resp = {"_cse": False}
+        self._emit_hap_changes(changes)
+        return resp
+
+    def _handle_rti_change(self, content: dict[str, Any]) -> None:
+        rti_bytes = content.get("_tiD") or content.get("TextInputData")
+        if not isinstance(rti_bytes, (bytes, bytearray)):
+            return
+        ops = parse_rti_text_operations(bytes(rti_bytes))
+        del_count = int(ops.get("deletion_count") or 0)
+        ins_text = str(ops.get("insertion_text") or "")
+
+        if del_count > 0 and not ins_text:
+            for _ in range(min(del_count, 20)):
+                self.accessory.controller.send_key_name("backspace")
+            self.current_text = self.current_text[:-del_count] if del_count <= len(self.current_text) else ""
+            return
+
+        if not ins_text:
+            return
+
+        if ins_text in ("\n", "\r", "\r\n"):
+            phrase = self.current_text.strip()
+            self.current_text = ""
+            if phrase and (self.voice_mode_active or is_voice_command_phrase(phrase)):
+                self.voice_mode_active = False
+                self.accessory.controller.execute_voice_command(phrase)
+            else:
+                self.accessory.controller.send_key_name("enter")
+            return
+
+        submit_now = ins_text.endswith("\n") or ins_text.endswith("\r")
+        clean_ins = ins_text.rstrip("\r\n")
+        if not clean_ins:
+            return
+
+        # Multi-word dictation or explicit voice mode / voice command phrase
+        if (self.voice_mode_active or is_voice_command_phrase(clean_ins)) and (
+            submit_now or " " in clean_ins or len(clean_ins) > 3
+        ):
+            self.voice_mode_active = False
+            self.current_text = ""
+            self.accessory.controller.execute_voice_command(clean_ins)
+            return
+
+        self.current_text += clean_ins
+        self.accessory.controller.send_text(clean_ins, submit=submit_now, replace=False)
+        if submit_now:
+            self.current_text = ""
+
+
 # --- Terminal QR Code & Setup Card Renderer ---
 
 
-def render_setup_banner(pairing_state: HapPairingState, port: int) -> str:
+def render_setup_banner(
+    pairing_state: HapPairingState,
+    port: int,
+    companion_port: int = DEFAULT_COMPANION_PORT,
+    companion_pin: str = DEFAULT_COMPANION_PIN,
+) -> str:
     lines = [
         "==============================================================",
-        "  R2D2 TV — Apple HomeKit & Direct iPhone Remote",
+        "  R2D2 TV — Apple TV Remote (iOS Control Center + HomeKit)",
         "==============================================================",
         f"  Accessory Name : R2D2 TV",
         f"  Category       : Television (ci={DEFAULT_CATEGORY_TELEVISION})",
         f"  Device ID      : {pairing_state.device_id}",
         f"  HAP TCP Port   : {port}",
+        f"  Companion Port : {companion_port} (_companion-link._tcp)",
+        f"  Companion PIN  : {companion_pin} (4-digit Apple TV Remote PIN)",
         f"  iPhone Web App : http://{SPARK_IP}:{port}/iphone",
         f"  Setup Code     : {pairing_state.setup_code}",
         f"  Setup URI      : {pairing_state.setup_uri}",
@@ -1891,8 +3375,8 @@ def render_iphone_manifest_json() -> str:
 def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
     setup_code = pairing_state.setup_code
     setup_uri = pairing_state.setup_uri
-    direct_url = f"http://{SPARK_IP}:{port}/iphone"
-    return f"""<!DOCTYPE html>
+    _ = port
+    template = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1905,7 +3389,7 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
 <link rel="apple-touch-icon" href="/apple-touch-icon.svg">
 <title>R2D2 TV Remote</title>
 <style>
-  :root {{
+  :root {
     --bg: #0b0f19;
     --panel: #151c2c;
     --panel-active: #22304a;
@@ -1916,9 +3400,9 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
     --success: #30d158;
     --text: #f5f7fa;
     --muted: #8e9bb0;
-  }}
-  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }}
-  body {{
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
+  body {
     margin: 0;
     padding: env(safe-area-inset-top, 14px) 16px env(safe-area-inset-bottom, 20px);
     background: radial-gradient(circle at 50% 0%, #17233b 0%, var(--bg) 65%);
@@ -1928,85 +3412,109 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
     display: flex;
     flex-direction: column;
     align-items: center;
-  }}
-  .shell {{ width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 12px; }}
-  .topbar {{
+  }
+  .shell { width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 12px; }
+  .topbar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 14px; background: var(--panel); border: 1px solid var(--border);
     border-radius: 20px;
-  }}
-  .title-wrap {{ display: flex; flex-direction: column; gap: 2px; }}
-  .title {{ font-size: 16px; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }}
-  .dot {{ width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); }}
-  .dot.off {{ background: var(--muted); box-shadow: none; }}
-  .subtitle {{ font-size: 12px; color: var(--muted); }}
-  .top-actions {{ display: flex; gap: 8px; }}
-  .btn {{
+  }
+  .title-wrap { display: flex; flex-direction: column; gap: 2px; }
+  .title { font-size: 16px; font-weight: 700; letter-spacing: 0.2px; display: flex; align-items: center; gap: 8px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--success); box-shadow: 0 0 8px var(--success); }
+  .dot.off { background: var(--muted); box-shadow: none; }
+  .subtitle { font-size: 12px; color: var(--muted); }
+  .top-actions { display: flex; gap: 8px; }
+  .btn {
     appearance: none; border: 1px solid var(--border); background: var(--panel);
     color: var(--text); border-radius: 16px; font-size: 14px; font-weight: 600;
     padding: 12px 16px; cursor: pointer; display: flex; align-items: center;
     justify-content: center; gap: 6px; transition: transform 0.08s ease, background 0.12s ease;
-  }}
-  .btn:active {{ transform: scale(0.95); background: var(--panel-active); }}
-  .btn-circle {{ width: 44px; height: 44px; border-radius: 50%; padding: 0; font-size: 17px; }}
-  .btn-power.on {{ border-color: rgba(48, 209, 88, 0.45); color: var(--success); }}
-  .btn-power.off {{ border-color: rgba(255, 69, 58, 0.45); color: var(--danger); }}
-  .btn-home {{
+  }
+  .btn:active { transform: scale(0.95); background: var(--panel-active); }
+  .btn-circle { width: 44px; height: 44px; border-radius: 50%; padding: 0; font-size: 17px; }
+  .btn-power.on { border-color: rgba(48, 209, 88, 0.45); color: var(--success); }
+  .btn-power.off { border-color: rgba(255, 69, 58, 0.45); color: var(--danger); }
+  .btn-home {
     background: linear-gradient(135deg, rgba(90, 200, 250, 0.24), rgba(90, 200, 250, 0.08));
     border-color: rgba(90, 200, 250, 0.5);
     color: #fff;
-  }}
-  .touchpad {{
+  }
+  .touchpad {
     position: relative; width: 100%; height: 220px; border-radius: 30px;
     background: linear-gradient(180deg, #1a2438 0%, #111826 100%);
     border: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 10px 28px rgba(0, 0, 0, 0.4);
     display: flex; align-items: center; justify-content: center; touch-action: none; overflow: hidden;
-  }}
-  .dpad-btn {{
+  }
+  .dpad-btn {
     position: absolute; background: transparent; border: none; color: var(--muted);
     font-size: 18px; width: 56px; height: 56px; display: flex; align-items: center;
     justify-content: center; cursor: pointer; z-index: 2; border-radius: 50%;
-  }}
-  .dpad-btn:active {{ background: rgba(255,255,255,0.08); color: #fff; }}
-  .dpad-up {{ top: 6px; left: calc(50% - 28px); }}
-  .dpad-down {{ bottom: 6px; left: calc(50% - 28px); }}
-  .dpad-left {{ left: 6px; top: calc(50% - 28px); }}
-  .dpad-right {{ right: 6px; top: calc(50% - 28px); }}
-  .dpad-center {{
+  }
+  .dpad-btn:active { background: rgba(255,255,255,0.08); color: #fff; }
+  .dpad-up { top: 6px; left: calc(50% - 28px); }
+  .dpad-down { bottom: 6px; left: calc(50% - 28px); }
+  .dpad-left { left: 6px; top: calc(50% - 28px); }
+  .dpad-right { right: 6px; top: calc(50% - 28px); }
+  .dpad-center {
     width: 88px; height: 88px; border-radius: 50%;
     border: 1px solid rgba(255, 255, 255, 0.14);
     background: rgba(255, 255, 255, 0.03);
     color: var(--text); font-size: 13px; font-weight: 600; letter-spacing: 0.4px;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
     gap: 2px; cursor: pointer; z-index: 2;
-  }}
-  .dpad-center:active {{ background: rgba(90, 200, 250, 0.18); transform: scale(0.95); }}
-  .pad-hint {{ font-size: 10px; color: var(--muted); font-weight: 400; }}
-  .row-3 {{ display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 10px; }}
-  .row-4 {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }}
-  .section-label {{
+  }
+  .dpad-center:active { background: rgba(90, 200, 250, 0.18); transform: scale(0.95); }
+  .pad-hint { font-size: 10px; color: var(--muted); font-weight: 400; }
+  .row-3 { display: grid; grid-template-columns: 1fr 1.25fr 1fr; gap: 10px; }
+  .row-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .section-label {
     font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px;
     color: var(--muted); margin: 4px 4px 0;
-  }}
-  .apps-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
-  .app-tile {{
+  }
+  .apps-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .app-tile {
     padding: 11px 8px; border-radius: 14px; font-size: 12px; font-weight: 600;
     text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }}
-  .app-tile.active {{
+  }
+  .app-tile.active {
     border-color: var(--accent); background: var(--accent-glow); color: #fff;
-  }}
-  .setup-card {{
+  }
+  .setup-card {
     margin-top: 4px; padding: 14px; border-radius: 18px; background: var(--panel);
     border: 1px solid var(--border); font-size: 12px; color: var(--muted); line-height: 1.45;
-  }}
-  .setup-card strong {{ color: var(--text); }}
-  .code-pill {{
+  }
+  .setup-card strong { color: var(--text); }
+  .code-pill {
     display: inline-block; padding: 3px 8px; border-radius: 8px;
     background: rgba(255,255,255,0.08); color: var(--accent); font-family: ui-monospace, monospace;
     font-weight: 700; font-size: 13px;
-  }}
+  }
+  .input-card {
+    display: flex; flex-direction: column; gap: 8px; padding: 11px 12px;
+    border-radius: 18px; background: var(--panel); border: 1px solid var(--border);
+  }
+  .input-row { display: flex; gap: 6px; align-items: center; }
+  .remote-input {
+    flex: 1; min-width: 0; appearance: none; border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(11, 15, 25, 0.72); color: var(--text); border-radius: 12px;
+    padding: 10px 12px; font-size: 15px; outline: none;
+    user-select: text; -webkit-user-select: text;
+  }
+  .remote-input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
+  .btn-compact { padding: 10px 12px; border-radius: 12px; font-size: 13px; white-space: nowrap; }
+  .btn-mic {
+    background: linear-gradient(135deg, rgba(255, 69, 58, 0.24), rgba(90, 200, 250, 0.18));
+    border-color: rgba(90, 200, 250, 0.5); color: #fff;
+  }
+  .btn-mic.listening {
+    background: rgba(255, 69, 58, 0.35); border-color: var(--danger);
+    box-shadow: 0 0 12px rgba(255, 69, 58, 0.55);
+  }
+  .voice-feedback {
+    font-size: 12px; color: var(--accent); min-height: 15px; padding: 0 2px;
+  }
 </style>
 </head>
 <body>
@@ -2017,8 +3525,8 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
       <div id="statusSub" class="subtitle">R2D2 Home</div>
     </div>
     <div class="top-actions">
-      <button class="btn btn-circle" id="muteBtn" onclick="sendAction({{action:'mute',mode:'toggle'}})" title="Mute">🔇</button>
-      <button class="btn btn-circle btn-power on" id="powerBtn" onclick="sendAction({{action:'power',mode:'toggle'}})" title="Power">⏻</button>
+      <button class="btn btn-circle" id="muteBtn" onclick="sendAction({action:'mute',mode:'toggle'})" title="Mute">🔇</button>
+      <button class="btn btn-circle btn-power on" id="powerBtn" onclick="sendAction({action:'power',mode:'toggle'})" title="Power">⏻</button>
     </div>
   </div>
 
@@ -2037,10 +3545,46 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
   </div>
 
   <div class="row-4">
-    <button class="btn" onclick="sendAction({{action:'volume_step',direction:'down'}})">🔉 Vol -</button>
-    <button class="btn" onclick="sendAction({{action:'volume_step',direction:'up'}})">🔊 Vol +</button>
+    <button class="btn" onclick="sendAction({action:'volume_step',direction:'down'})">🔉 Vol -</button>
+    <button class="btn" onclick="sendAction({action:'volume_step',direction:'up'})">🔊 Vol +</button>
     <button class="btn" onclick="sendKey('rewind')">⏪</button>
     <button class="btn" onclick="sendKey('fast_forward')">⏩</button>
+  </div>
+
+  <div class="input-card">
+    <div class="section-label" style="margin:0;">🎙️ Voice Command (Mic / Dictation)</div>
+    <div class="input-row">
+      <button class="btn btn-compact btn-mic" id="micBtn" onclick="startVoiceCapture()">🎙️ Speak</button>
+      <input
+        id="voiceInput"
+        class="remote-input"
+        type="text"
+        enterkeyhint="go"
+        autocomplete="off"
+        autocorrect="on"
+        placeholder="Tap 🎙️ or iOS 🎤 to speak command..."
+      />
+      <button class="btn btn-compact btn-home" onclick="submitVoiceInput()">Go</button>
+    </div>
+    <div id="voiceFeedback" class="voice-feedback">Say &ldquo;Open YouTube&rdquo;, &ldquo;Volume 25&rdquo;, &ldquo;Search Star Wars&rdquo;...</div>
+  </div>
+
+  <div class="input-card">
+    <div class="section-label" style="margin:0;">⌨️ Type on TV Keyboard</div>
+    <div class="input-row">
+      <input
+        id="kbInput"
+        class="remote-input"
+        type="text"
+        enterkeyhint="send"
+        autocomplete="off"
+        autocapitalize="none"
+        placeholder="Type text or search query on TV..."
+      />
+      <button class="btn btn-compact" onclick="submitKeyboard(false)" title="Type text">Type</button>
+      <button class="btn btn-compact btn-home" onclick="submitKeyboard(true)" title="Type and press Enter">⏎ Go</button>
+      <button class="btn btn-compact" onclick="sendKey('backspace')" title="Backspace">⌫</button>
+    </div>
   </div>
 
   <div class="section-label">Direct App Launch</div>
@@ -2048,7 +3592,7 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
 
   <div class="setup-card">
     <div><strong>Add Directly to iPhone Home Screen:</strong> Tap Safari <strong>Share ↑</strong> → <strong>Add to Home Screen</strong> for a full-screen iPhone remote with the dedicated <strong>⌂ R2D2 Home</strong> button.</div>
-    <div style="margin-top:8px;"><strong>Apple Home App Code:</strong> <span class="code-pill">{setup_code}</span> <span style="opacity:0.75;">({setup_uri})</span></div>
+    <div style="margin-top:8px;"><strong>Apple Home App Code:</strong> <span class="code-pill">__SETUP_CODE__</span> <span style="opacity:0.75;">(__SETUP_URI__)</span></div>
     <div style="margin-top:8px; display:flex; gap:8px; align-items:center;">
       <button class="btn" style="padding:8px 12px; font-size:12px; border-radius:12px;" onclick="openPairingWindow()">+ Pair Another iPhone in Apple Home</button>
       <span id="pairMsg" style="font-size:11px; color:var(--accent);"></span>
@@ -2056,52 +3600,186 @@ def render_iphone_remote_html(pairing_state: HapPairingState, port: int) -> str:
   </div>
 </div>
 <script>
-const apps = {json.dumps(list(DEFAULT_INPUT_SOURCES))};
+const apps = __APPS_JSON__;
 let currentAppId = 'local.owner.applibrary';
 
-function renderApps() {{
+function renderApps() {
   const grid = document.getElementById('appsGrid');
   grid.innerHTML = '';
-  apps.forEach(a => {{
+  apps.forEach(a => {
     const b = document.createElement('button');
     b.className = 'btn app-tile' + (a.app_id === currentAppId ? ' active' : '');
     b.textContent = a.name;
-    b.onclick = () => sendAction({{action: 'launch_app', appId: a.app_id}});
+    b.onclick = () => sendAction({action: 'launch_app', appId: a.app_id});
     grid.appendChild(b);
-  }});
-}}
+  });
+}
 
-async function sendAction(payload) {{
-  try {{
-    const res = await fetch('/api/remote', {{
+async function sendAction(payload) {
+  try {
+    const res = await fetch('/api/remote', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
-    }});
+    });
     const data = await res.json();
     if (data && data.status) applyStatus(data.status);
-  }} catch (_) {{}}
-}}
+  } catch (_) {}
+}
 
-function sendKey(k) {{
-  return sendAction({{action: 'key', key: k}});
-}}
+function sendKey(k) {
+  return sendAction({action: 'key', key: k});
+}
 
-async function openPairingWindow() {{
+async function submitKeyboard(submitEnter) {
+  const el = document.getElementById('kbInput');
+  const txt = el ? el.value : '';
+  if (!txt && !submitEnter) return;
+  try {
+    const res = await fetch('/api/text', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: txt, submit: Boolean(submitEnter)})
+    });
+    const data = await res.json();
+    if (data && data.status) applyStatus(data.status);
+    if (el) el.value = '';
+  } catch (_) {}
+}
+
+let voiceDictationTimer = null;
+let activeRecognizer = null;
+
+async function submitVoiceUtterance(utterance) {
+  const clean = (utterance || '').trim();
+  if (!clean) return;
+  const fb = document.getElementById('voiceFeedback');
+  const vin = document.getElementById('voiceInput');
+  if (fb) fb.textContent = 'Running: "' + clean + '"...';
+  try {
+    const res = await fetch('/api/voice', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({utterance: clean})
+    });
+    const data = await res.json();
+    if (data && data.status) applyStatus(data.status);
+    if (fb) {
+      fb.textContent = (data && data.spoken) ? ('✓ ' + data.spoken) : ('✓ Sent: ' + clean);
+    }
+    if (vin) vin.value = '';
+  } catch (_) {
+    if (fb) fb.textContent = 'Voice command failed';
+  }
+}
+
+function submitVoiceInput() {
+  if (voiceDictationTimer) {
+    clearTimeout(voiceDictationTimer);
+    voiceDictationTimer = null;
+  }
+  const vin = document.getElementById('voiceInput');
+  if (!vin) return;
+  submitVoiceUtterance(vin.value);
+}
+
+function startVoiceCapture() {
+  const btn = document.getElementById('micBtn');
+  const vin = document.getElementById('voiceInput');
+  const fb = document.getElementById('voiceFeedback');
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SR) {
+    try {
+      if (activeRecognizer) {
+        activeRecognizer.stop();
+        activeRecognizer = null;
+        if (btn) btn.classList.remove('listening');
+        return;
+      }
+      const rec = new SR();
+      activeRecognizer = rec;
+      rec.lang = 'en-US';
+      rec.interimResults = false;
+      rec.maxAlternatives = 1;
+      if (btn) btn.classList.add('listening');
+      if (fb) fb.textContent = 'Listening... speak now';
+      rec.onresult = (ev) => {
+        const transcript = ev.results && ev.results[0] && ev.results[0][0] ? ev.results[0][0].transcript : '';
+        if (vin) vin.value = transcript;
+        submitVoiceUtterance(transcript);
+      };
+      rec.onerror = () => {
+        if (btn) btn.classList.remove('listening');
+        activeRecognizer = null;
+        if (vin) {
+          vin.focus();
+          if (fb) fb.textContent = 'Tap 🎤 on your iPhone keyboard to dictate';
+        }
+      };
+      rec.onend = () => {
+        if (btn) btn.classList.remove('listening');
+        activeRecognizer = null;
+      };
+      rec.start();
+      return;
+    } catch (_) {
+      if (btn) btn.classList.remove('listening');
+      activeRecognizer = null;
+    }
+  }
+  if (vin) {
+    vin.focus();
+    if (fb) fb.textContent = 'Tap 🎤 on your iPhone keyboard — auto-sends when you finish speaking';
+  }
+}
+
+(function initKeyboardAndVoiceInputs() {
+  const kb = document.getElementById('kbInput');
+  if (kb) {
+    kb.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitKeyboard(true);
+      }
+    });
+  }
+  const vin = document.getElementById('voiceInput');
+  if (vin) {
+    vin.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitVoiceInput();
+      }
+    });
+    vin.addEventListener('input', () => {
+      if (voiceDictationTimer) clearTimeout(voiceDictationTimer);
+      const val = (vin.value || '').trim();
+      if (val.length >= 3) {
+        voiceDictationTimer = setTimeout(() => {
+          if ((vin.value || '').trim() === val) {
+            submitVoiceInput();
+          }
+        }, 1350);
+      }
+    });
+  }
+})();
+
+async function openPairingWindow() {
   const msg = document.getElementById('pairMsg');
   msg.textContent = 'Opening 3m pairing window...';
-  try {{
-    const res = await fetch('/api/pairing-window', {{method: 'POST'}});
+  try {
+    const res = await fetch('/api/pairing-window', {method: 'POST'});
     const data = await res.json();
-    if (data && data.ok) {{
+    if (data && data.ok) {
       msg.textContent = 'Ready in Apple Home (Code: ' + data.setupCode + ')';
-    }}
-  }} catch (_) {{
+    }
+  } catch (_) {
     msg.textContent = 'Failed to open window';
-  }}
-}}
+  }
+}
 
-function applyStatus(st) {{
+function applyStatus(st) {
   if (!st) return;
   const dot = document.getElementById('powerDot');
   const pbtn = document.getElementById('powerBtn');
@@ -2113,40 +3791,40 @@ function applyStatus(st) {{
   const match = apps.find(a => a.app_id === currentAppId);
   sub.textContent = (active ? (match ? match.name : currentAppId) : 'Standby') + (st.muted ? ' · Muted' : '');
   renderApps();
-}}
+}
 
-async function pollStatus() {{
-  try {{
+async function pollStatus() {
+  try {
     const res = await fetch('/api/status');
     const data = await res.json();
     applyStatus(data);
-  }} catch (_) {{}}
-}}
+  } catch (_) {}
+}
 
-(function initTouchpad() {{
+(function initTouchpad() {
   const pad = document.getElementById('touchpad');
   let startX = null, startY = null;
-  pad.addEventListener('touchstart', e => {{
+  pad.addEventListener('touchstart', e => {
     if (e.target !== pad) return;
     const t = e.touches[0];
     startX = t.clientX;
     startY = t.clientY;
-  }}, {{passive: true}});
-  pad.addEventListener('touchend', e => {{
+  }, {passive: true});
+  pad.addEventListener('touchend', e => {
     if (startX === null || startY === null) return;
     const t = e.changedTouches[0];
     const dx = t.clientX - startX;
     const dy = t.clientY - startY;
     startX = null; startY = null;
-    if (Math.abs(dx) < 24 && Math.abs(dy) < 24) {{
+    if (Math.abs(dx) < 24 && Math.abs(dy) < 24) {
       sendKey('select');
-    }} else if (Math.abs(dx) > Math.abs(dy)) {{
+    } else if (Math.abs(dx) > Math.abs(dy)) {
       sendKey(dx > 0 ? 'right' : 'left');
-    }} else {{
+    } else {
       sendKey(dy > 0 ? 'down' : 'up');
-    }}
-  }}, {{passive: true}});
-}})();
+    }
+  }, {passive: true});
+})();
 
 renderApps();
 pollStatus();
@@ -2155,13 +3833,18 @@ setInterval(pollStatus, 4000);
 </body>
 </html>
 """
+    return (
+        template.replace("__SETUP_CODE__", setup_code)
+        .replace("__SETUP_URI__", setup_uri)
+        .replace("__APPS_JSON__", json.dumps(list(DEFAULT_INPUT_SOURCES)))
+    )
 
 
 # --- Live HAP-IP Socket Server & Avahi mDNS Publisher ---
 
 
 class HomeKitTvServer:
-    """Multithreaded HAP-IP HTTP/1.1 + EVENT/1.0 server with encrypted session upgrading."""
+    """Multithreaded HAP-IP + Apple TV Companion Link (`_companion-link._tcp`) server."""
 
     def __init__(
         self,
@@ -2170,18 +3853,43 @@ class HomeKitTvServer:
         host: str = "0.0.0.0",
         port: int = DEFAULT_HAP_PORT,
         enable_mdns: bool = True,
+        companion_port: int | None = None,
+        mrp_port: int | None = None,
+        airplay_port: int | None = None,
+        companion_pin: str = DEFAULT_COMPANION_PIN,
     ) -> None:
         self.pairing_state = pairing_state
         self.accessory = accessory
         self.processor = HapProtocolProcessor(pairing_state, accessory)
         self.host = host
         self.port = port
+        self.companion_port = (
+            companion_port
+            if companion_port is not None
+            else (0 if port == 0 else DEFAULT_COMPANION_PORT)
+        )
+        self.mrp_port = (
+            mrp_port
+            if mrp_port is not None
+            else (0 if port == 0 else DEFAULT_MRP_PORT)
+        )
+        self.airplay_port = (
+            airplay_port
+            if airplay_port is not None
+            else (0 if port == 0 else DEFAULT_AIRPLAY_PORT)
+        )
+        self.companion_pin = companion_pin
         self.enable_mdns = enable_mdns
         self._sock: socket.socket | None = None
+        self._companion_sock: socket.socket | None = None
+        self._mrp_sock: socket.socket | None = None
+        self._airplay_sock: socket.socket | None = None
         self._stop_event = threading.Event()
         self._clients_lock = threading.Lock()
         self._subscribed_clients: dict[socket.socket, tuple[HapSessionCipher, set[tuple[int, int]]]] = {}
+        self._companion_sessions: set[CompanionSession] = set()
         self._avahi_proc: subprocess.Popen[bytes] | None = None
+        self._avahi_extra_procs: list[subprocess.Popen[bytes]] = []
         self._last_paired_flag: bool | None = None
 
     def _update_mdns_advertisement(self) -> None:
@@ -2192,11 +3900,15 @@ class HomeKitTvServer:
             return
         discoverable_unpaired = (not self.pairing_state.is_paired) or self.processor.is_pairing_window_open()
         paired = not discoverable_unpaired
-        if self._avahi_proc is not None and self._avahi_proc.poll() is None and self._last_paired_flag == paired:
+        if (
+            self._avahi_proc is not None
+            and self._avahi_proc.poll() is None
+            and self._last_paired_flag == paired
+        ):
             return
         self._stop_mdns()
         sf = "0" if paired else "1"
-        cmd = [
+        hap_cmd = [
             avahi_bin,
             "R2D2 TV",
             "_hap._tcp",
@@ -2213,11 +3925,13 @@ class HomeKitTvServer:
         ]
         try:
             self._avahi_proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                hap_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
+            self._avahi_extra_procs = []
             self._last_paired_flag = paired
         except Exception:
             self._avahi_proc = None
+            self._avahi_extra_procs = []
 
     def build_web_status(self) -> dict[str, Any]:
         active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
@@ -2304,6 +4018,91 @@ class HomeKitTvServer:
                 ).encode("utf-8"),
                 [],
             )
+        if method == "POST" and path_part == "/api/text":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                return (
+                    400,
+                    "application/json",
+                    json.dumps({"ok": False, "error": "invalid_json"}).encode("utf-8"),
+                    [],
+                )
+            text_val = str(payload.get("text") or "")
+            submit_flag = bool(payload.get("submit", False))
+            replace_flag = bool(payload.get("replace", False))
+            res = self.accessory.controller.send_text(text_val, submit=submit_flag, replace=replace_flag)
+            return (
+                200 if res.get("ok") else 502,
+                "application/json",
+                json.dumps(
+                    {
+                        "ok": bool(res.get("ok")),
+                        "result": res,
+                        "status": self.build_web_status(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                [],
+            )
+        if method == "POST" and path_part == "/api/voice":
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                return (
+                    400,
+                    "application/json",
+                    json.dumps({"ok": False, "error": "invalid_json"}).encode("utf-8"),
+                    [],
+                )
+            utterance = str(payload.get("utterance") or payload.get("text") or "").strip()
+            if not utterance:
+                return (
+                    400,
+                    "application/json",
+                    json.dumps({"ok": False, "error": "missing_utterance"}).encode("utf-8"),
+                    [],
+                )
+            res = self.accessory.controller.execute_voice_command(utterance)
+            changes: list[tuple[int, int, Any]] = []
+            intent = res.get("intent")
+            if intent == "power_on":
+                self.accessory._values[self.accessory.IID_TV_ACTIVE] = 1
+                changes.append((1, self.accessory.IID_TV_ACTIVE, 1))
+            elif intent == "power_off":
+                self.accessory._values[self.accessory.IID_TV_ACTIVE] = 0
+                changes.append((1, self.accessory.IID_TV_ACTIVE, 0))
+            elif intent in ("home", "launch_app") and res.get("appId"):
+                target_app = str(res["appId"])
+                self.accessory._values[self.accessory.IID_TV_ACTIVE] = 1
+                ident = self.accessory._app_to_identifier.get(target_app)
+                if ident is not None:
+                    self.accessory._values[self.accessory.IID_TV_ACTIVE_IDENTIFIER] = ident
+                    changes.append((1, self.accessory.IID_TV_ACTIVE_IDENTIFIER, ident))
+            elif intent == "set_volume" and isinstance(res.get("volume"), int):
+                self.accessory._values[self.accessory.IID_SPEAKER_VOLUME] = int(res["volume"])
+                changes.append((1, self.accessory.IID_SPEAKER_VOLUME, int(res["volume"])))
+            elif intent == "mute":
+                self.accessory._values[self.accessory.IID_SPEAKER_MUTE] = True
+                changes.append((1, self.accessory.IID_SPEAKER_MUTE, True))
+            elif intent == "unmute":
+                self.accessory._values[self.accessory.IID_SPEAKER_MUTE] = False
+                changes.append((1, self.accessory.IID_SPEAKER_MUTE, False))
+            return (
+                200 if res.get("ok") else 502,
+                "application/json",
+                json.dumps(
+                    {
+                        "ok": bool(res.get("ok")),
+                        "intent": res.get("intent", ""),
+                        "spoken": res.get("spoken", ""),
+                        "result": res,
+                        "status": self.build_web_status(),
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                changes,
+            )
         if method == "POST" and path_part == "/api/remote":
             try:
                 payload = json.loads(body.decode("utf-8")) if body else {}
@@ -2327,6 +4126,8 @@ class HomeKitTvServer:
                         _, changes = self.accessory.put_characteristic(
                             self.accessory.IID_TV_REMOTE_KEY, HAP_REMOTE_KEY_INFORMATION
                         )
+                    elif key_name in ("backspace", "delete", "enter", "space"):
+                        self.accessory.controller.send_key_name(key_name)
                     else:
                         key_map = {
                             "up": HAP_REMOTE_KEY_ARROW_UP,
@@ -2350,6 +4151,17 @@ class HomeKitTvServer:
                         _, changes = self.accessory.put_characteristic(
                             self.accessory.IID_TV_REMOTE_KEY, key_map[key_name]
                         )
+                elif action == "text":
+                    self.accessory.controller.send_text(
+                        str(payload.get("text") or ""),
+                        submit=bool(payload.get("submit", False)),
+                        replace=bool(payload.get("replace", False)),
+                    )
+                elif action == "voice":
+                    utterance = str(payload.get("utterance") or payload.get("text") or "").strip()
+                    self.accessory.controller.execute_voice_command(utterance)
+                elif action == "dismiss_notices":
+                    self.accessory.controller.dismiss_update_notices()
                 elif action == "power":
                     value = str(payload.get("value") or "toggle").strip().lower()
                     cur_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
@@ -2429,22 +4241,27 @@ class HomeKitTvServer:
         return None
 
     def _stop_mdns(self) -> None:
-        if self._avahi_proc is not None:
+        all_procs = ([self._avahi_proc] if self._avahi_proc is not None else []) + list(self._avahi_extra_procs)
+        self._avahi_proc = None
+        self._avahi_extra_procs = []
+        for proc in all_procs:
+            if proc is None:
+                continue
             try:
-                self._avahi_proc.terminate()
-                self._avahi_proc.wait(timeout=2.0)
+                proc.terminate()
+                proc.wait(timeout=1.5)
             except Exception:
                 try:
-                    self._avahi_proc.kill()
+                    proc.kill()
                 except Exception:
                     pass
-            self._avahi_proc = None
 
     def broadcast_events(self, changes: list[tuple[int, int, Any]], exclude_sock: socket.socket | None = None) -> None:
         if not changes:
             return
         with self._clients_lock:
             targets = list(self._subscribed_clients.items())
+            comp_sessions = list(self._companion_sessions)
         for sock, (cipher, subs) in targets:
             if sock is exclude_sock:
                 continue
@@ -2467,6 +4284,13 @@ class HomeKitTvServer:
             except Exception:
                 with self._clients_lock:
                     self._subscribed_clients.pop(sock, None)
+        for aid, iid, val in changes:
+            if aid == 1 and iid == self.accessory.IID_TV_ACTIVE:
+                for cs in comp_sessions:
+                    try:
+                        cs.send_power_state(None)
+                    except Exception:
+                        pass
 
     def _handle_client(self, conn: socket.socket) -> None:
         conn.settimeout(60.0)
@@ -2652,6 +4476,16 @@ class HomeKitTvServer:
             except Exception:
                 pass
 
+    def _bind_aux_socket(self, preferred_port: int) -> tuple[socket.socket, int]:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((self.host, preferred_port))
+        except OSError:
+            s.bind((self.host, 0))
+        s.listen(16)
+        return s, int(s.getsockname()[1])
+
     def start(self) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -2659,9 +4493,17 @@ class HomeKitTvServer:
         sock.listen(16)
         self.port = int(sock.getsockname()[1])
         self._sock = sock
+
+        self._companion_sock, self.companion_port = self._bind_aux_socket(self.companion_port)
+        self._mrp_sock, self.mrp_port = self._bind_aux_socket(self.mrp_port)
+        self._airplay_sock, self.airplay_port = self._bind_aux_socket(self.airplay_port)
+
         self._stop_event.clear()
         self._update_mdns_advertisement()
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        threading.Thread(target=self._companion_accept_loop, daemon=True).start()
+        threading.Thread(target=self._mrp_accept_loop, daemon=True).start()
+        threading.Thread(target=self._airplay_accept_loop, daemon=True).start()
         threading.Thread(target=self._poll_loop, daemon=True).start()
         return self.port
 
@@ -2676,6 +4518,120 @@ class HomeKitTvServer:
             except Exception:
                 if self._stop_event.is_set():
                     break
+
+    def _companion_accept_loop(self) -> None:
+        while not self._stop_event.is_set() and self._companion_sock is not None:
+            try:
+                rlist, _, _ = select.select([self._companion_sock], [], [], 0.5)
+                if not rlist:
+                    continue
+                conn, _ = self._companion_sock.accept()
+                threading.Thread(target=self._handle_companion_client, args=(conn,), daemon=True).start()
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+
+    def _handle_companion_client(self, conn: socket.socket) -> None:
+        conn.settimeout(60.0)
+        session = CompanionSession(
+            conn=conn,
+            pairing_state=self.pairing_state,
+            accessory=self.accessory,
+            broadcast_cb=self.broadcast_events,
+            pin=self.companion_pin,
+        )
+        with self._clients_lock:
+            self._companion_sessions.add(session)
+        buf = bytearray()
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    chunk = conn.recv(8192)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                while len(buf) >= 4:
+                    frame_type = buf[0]
+                    payload_len = int.from_bytes(buf[1:4], "big")
+                    total_len = 4 + payload_len
+                    if len(buf) < total_len:
+                        break
+                    raw_payload = bytes(buf[4:total_len])
+                    del buf[:total_len]
+                    session.handle_frame(frame_type, raw_payload)
+                    self._update_mdns_advertisement()
+        except Exception:
+            pass
+        finally:
+            with self._clients_lock:
+                self._companion_sessions.discard(session)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _mrp_accept_loop(self) -> None:
+        while not self._stop_event.is_set() and self._mrp_sock is not None:
+            try:
+                rlist, _, _ = select.select([self._mrp_sock], [], [], 0.5)
+                if not rlist:
+                    continue
+                conn, _ = self._mrp_sock.accept()
+                threading.Thread(target=self._handle_mrp_client, args=(conn,), daemon=True).start()
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+
+    def _handle_mrp_client(self, conn: socket.socket) -> None:
+        conn.settimeout(30.0)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    data = conn.recv(4096)
+                except socket.timeout:
+                    continue
+                if not data:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _airplay_accept_loop(self) -> None:
+        while not self._stop_event.is_set() and self._airplay_sock is not None:
+            try:
+                rlist, _, _ = select.select([self._airplay_sock], [], [], 0.5)
+                if not rlist:
+                    continue
+                conn, _ = self._airplay_sock.accept()
+                threading.Thread(target=self._handle_airplay_client, args=(conn,), daemon=True).start()
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+
+    def _handle_airplay_client(self, conn: socket.socket) -> None:
+        conn.settimeout(15.0)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    data = conn.recv(4096)
+                except socket.timeout:
+                    break
+                if not data:
+                    break
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _poll_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2693,12 +4649,14 @@ class HomeKitTvServer:
     def close(self) -> None:
         self._stop_event.set()
         self._stop_mdns()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except Exception:
-                pass
-            self._sock = None
+        for attr in ("_sock", "_companion_sock", "_mrp_sock", "_airplay_sock"):
+            s = getattr(self, attr, None)
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
         with self._clients_lock:
             for sock in list(self._subscribed_clients.keys()):
                 try:
@@ -2706,6 +4664,12 @@ class HomeKitTvServer:
                 except Exception:
                     pass
             self._subscribed_clients.clear()
+            for cs in list(self._companion_sessions):
+                try:
+                    cs.conn.close()
+                except Exception:
+                    pass
+            self._companion_sessions.clear()
 
 
 # --- CLI & Runtime Loader on Spark ---
@@ -2716,6 +4680,51 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
     voice_key = ""
     tv_macs: list[str] = []
     ssap_client_key = ""
+    tv_macs_file = base / "maintenance/tv_macs.json"
+
+    def _add_mac(val: Any) -> None:
+        if not isinstance(val, str):
+            return
+        cleaned = re.sub(r"[^0-9a-fA-F]", "", val.strip()).lower()
+        if len(cleaned) != 12 or cleaned in ("000000000000", "ffffffffffff"):
+            return
+        norm = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+        if norm not in tv_macs:
+            tv_macs.append(norm)
+
+    def _load_arp_macs() -> None:
+        try:
+            arp_path = Path("/proc/net/arp")
+            if arp_path.is_file():
+                for line in arp_path.read_text("utf-8").splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[0] == TV_IP:
+                        _add_mac(parts[3])
+        except Exception:
+            pass
+
+    def _persist_tv_macs() -> None:
+        if not tv_macs:
+            return
+        try:
+            tv_macs_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = tv_macs_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"schema": 1, "macs": tv_macs}, indent=2) + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(tv_macs_file)
+        except Exception:
+            pass
+
+    if tv_macs_file.is_file():
+        try:
+            mdata = json.loads(tv_macs_file.read_text("utf-8"))
+            if isinstance(mdata, dict) and isinstance(mdata.get("macs"), list):
+                for m in mdata["macs"]:
+                    _add_mac(m)
+        except Exception:
+            pass
+
+    _load_arp_macs()
 
     for vk_candidate in (base / "state/voice.key", base / "voice.key"):
         if vk_candidate.is_file():
@@ -2733,7 +4742,8 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
                 if not voice_key:
                     voice_key = str(enr.get("voice_key") or "").strip()
                 if isinstance(enr.get("tv_macs"), list):
-                    tv_macs.extend(str(m) for m in enr["tv_macs"] if m)
+                    for m in enr["tv_macs"]:
+                        _add_mac(m)
             except Exception:
                 pass
 
@@ -2762,6 +4772,7 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
                 agentctl_candidates.insert(0, cand)
 
     def read_agentctl_status() -> dict[str, Any]:
+        _load_arp_macs()
         agentctl_path = next((p for p in agentctl_candidates if p.is_file()), None)
         if agentctl_path is None:
             return {}
@@ -2789,20 +4800,26 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
                 else {}
             )
             tv_obj = result.get("tv") if isinstance(result.get("tv"), dict) else {}
-            for mac_list in (last_report.get("tvMacs"), tv_obj.get("tv_macs")):
+            before_cnt = len(tv_macs)
+            for mac_list in (resident.get("tvMacs"), last_report.get("tvMacs"), tv_obj.get("tv_macs")):
                 if isinstance(mac_list, list):
                     for m in mac_list:
-                        if isinstance(m, str) and m and m not in tv_macs:
-                            tv_macs.append(m)
+                        _add_mac(m)
+            if len(tv_macs) > before_cnt:
+                _persist_tv_macs()
             last_poll_at = resident.get("lastPollAt")
-            # Consider TV in standby if resident hasn't polled recently (>60s) when monotonic clock is available
             tv_power = str(
                 resident.get("tvPower")
                 or last_report.get("tvPower")
                 or tv_obj.get("tv_power")
                 or ""
             ).strip()
-            if isinstance(last_poll_at, (int, float)) and time.monotonic() - float(last_poll_at) > 45.0:
+            if (
+                not isinstance(last_poll_at, (int, float))
+                or float(last_poll_at) <= 0.0
+                or time.monotonic() - float(last_poll_at) > 15.0
+                or not tv_power
+            ):
                 tv_power = "standby"
             fg_app = str(
                 resident.get("foregroundAppId")
@@ -2817,12 +4834,41 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
         except Exception:
             return {}
 
+    def send_voice_utterance_to_agent(utterance: str) -> dict[str, Any]:
+        if not pair_sock.exists():
+            return {"ok": False, "error": "no_pair_socket"}
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(12.0)
+                s.connect(str(pair_sock))
+                req = json.dumps({"cmd": "voice-text", "utterance": utterance[:240]}) + "\n"
+                s.sendall(req.encode("utf-8"))
+                chunks: list[bytes] = []
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    if b"\n" in chunk:
+                        break
+                raw_resp = b"".join(chunks).decode("utf-8", errors="replace").strip()
+                parsed = json.loads(raw_resp or "{}")
+                if isinstance(parsed, dict) and parsed.get("ok"):
+                    res_obj = parsed.get("result") if isinstance(parsed.get("result"), dict) else parsed
+                    if isinstance(res_obj, dict) and res_obj.get("ok", True):
+                        return {"ok": True, **res_obj}
+                return {"ok": False, "error": str(parsed.get("error", "agent_failed"))}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     read_agentctl_status()
+    _persist_tv_macs()
     return {
         "voice_key": voice_key,
         "tv_macs": tv_macs,
         "ssap_client_key": ssap_client_key,
         "status_reader_fn": read_agentctl_status,
+        "voice_agent_fn": send_voice_utterance_to_agent,
         "state_path": base / "homekit-tv/state.json",
     }
 
@@ -2851,6 +4897,7 @@ def main(argv: list[str] | None = None) -> int:
         tv_macs=ctx["tv_macs"],
         ssap_client_key=ctx["ssap_client_key"],
         status_reader_fn=ctx["status_reader_fn"],
+        voice_agent_fn=ctx.get("voice_agent_fn"),
     )
     accessory = HomeKitTvAccessory(controller=controller)
     accessory.sync_from_tv_state()

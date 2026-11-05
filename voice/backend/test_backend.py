@@ -342,6 +342,7 @@ class WorkerTests(unittest.TestCase):
                              {'local_files_only': True, 'trust_remote_code': False})
             self.assertFalse(model.from_pretrained.call_args.kwargs['trust_remote_code'])
             self.assertTrue(model.from_pretrained.call_args.kwargs['local_files_only'])
+            self.assertTrue(model.from_pretrained.call_args.kwargs['disable_mmap'])
             with self.assertRaises(Refused): asr.load()
 
     def test_native_intent_cannot_load_without_cuda_or_from_symlink(self):
