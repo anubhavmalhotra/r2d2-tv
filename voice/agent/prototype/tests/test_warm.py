@@ -512,6 +512,17 @@ class PressPathAndSafety(WarmCase):
             self.assertNotIn(needle.encode(), blob)
         self.assertEqual(AuditLog.verify(e.audit_dir), len(self.audit_rows(e)))
 
+    def test_always_warm_policy_starts_immediately_and_stays_ready_when_tv_off(self):
+        e = self.env('P2', model=golden_model('P2'))
+        e.pool, e.power = FakePool(self.clock, warm_s=15), FakePowerSource(self.clock)
+        e.warm = WarmController(e.pool, e.power, clock=self.clock, audit=e.audit,
+                                killswitch=e.kill, always_warm=True)
+        self.assertEqual(e.warm.tick(), 'warming')
+        self.assertEqual(self.run_for(e, 15), 'ready')
+        e.power.set('off')
+        self.assertEqual(self.run_for(e, GRACE_S + UNKNOWN_HOLD_S, step=60), 'ready')
+        self.assertEqual(e.pool.calls, ['begin_warm'])
+
 
 if __name__ == '__main__':
     unittest.main()

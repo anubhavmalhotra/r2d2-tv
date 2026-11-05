@@ -44,11 +44,13 @@ class NativeQwenASR:
             self.processor_class, self.model_class = AutoProcessor, AutoModelForMultimodalLM
         if not self.torch.cuda.is_available():
             raise Refused('CUDA_UNAVAILABLE')
+        os.environ.setdefault('HF_DEACTIVATE_ASYNC_LOAD', '1')
         self.processor = self.processor_class.from_pretrained(
             self.path, local_files_only=True, trust_remote_code=False)
         self.model = self.model_class.from_pretrained(
             self.path, local_files_only=True, trust_remote_code=False,
-            dtype=self.torch.bfloat16, attn_implementation='sdpa').to('cuda:0').eval()
+            dtype=self.torch.bfloat16, attn_implementation='sdpa',
+            disable_mmap=True).to('cuda:0').eval()
 
     def transcribe(self, pcm, *, rate, timeout_s):
         if (self.model is None or type(pcm) not in (bytes, bytearray) or
@@ -112,11 +114,13 @@ class NativeQwenIntent:
             self.tokenizer_class, self.model_class = AutoTokenizer, AutoModelForCausalLM
         if not self.torch.cuda.is_available():
             raise Refused('CUDA_UNAVAILABLE')
+        os.environ.setdefault('HF_DEACTIVATE_ASYNC_LOAD', '1')
         self.tokenizer = self.tokenizer_class.from_pretrained(
             self.path, local_files_only=True, trust_remote_code=False)
         self.model = self.model_class.from_pretrained(
             self.path, local_files_only=True, trust_remote_code=False,
-            dtype=self.torch.bfloat16, attn_implementation='sdpa').to('cuda:0').eval()
+            dtype=self.torch.bfloat16, attn_implementation='sdpa',
+            disable_mmap=True).to('cuda:0').eval()
 
     def interpret(self, transcript, *, timeout_s):
         if (self.model is None or not bounded_text(transcript, 1024, 4096) or

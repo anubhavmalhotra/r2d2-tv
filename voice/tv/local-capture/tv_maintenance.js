@@ -3811,6 +3811,9 @@ function createLgNetworkGuard(deps = {}) {
   function enforceLease() {
     try {
       if (!io.existsSync(appStoreLeasePath)) {
+        if (lgServerBlocked && currentAppStoreOpen === false) {
+          return { leasePresent: false, expired: false, blocked: true };
+        }
         const ok = apply(false);
         return { leasePresent: false, expired: false, blocked: ok && lgServerBlocked };
       }
@@ -3881,13 +3884,101 @@ function createPrivacyRetirementEnforcer(deps = {}) {
     if (!text) return false;
     try {
       const parsed = JSON.parse(text);
-      return Boolean(parsed && parsed.returnValue === true);
+      return Boolean(parsed && typeof parsed.returnValue === 'boolean');
     } catch (_) {
       return false;
     }
   }
 
-  function enforce() {
+  function dismissUpdateNotifications(presentBins, presentDirs) {
+    const hasUpdateTargets =
+      (Array.isArray(presentBins) && presentBins.some((b) => b.endsWith('/update'))) ||
+      (Array.isArray(presentDirs) &&
+        presentDirs.some(
+          (d) =>
+            d.endsWith('/com.webos.app.renewupdate') ||
+            d.endsWith('/com.webos.app.softwareupdate')
+        ));
+    if (!hasUpdateTargets) return;
+    for (const updateAppId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
+      if (presentDirs.some((d) => d.endsWith('/' + updateAppId))) {
+        try {
+          spawnSync(
+            '/usr/bin/luna-send',
+            [
+              '-n',
+              '1',
+              '-w',
+              '1200',
+              'luna://com.webos.applicationManager/closeByAppId',
+              JSON.stringify({ id: updateAppId })
+            ],
+            { env, timeout: 1500 }
+          );
+        } catch (_) {}
+      }
+    }
+    try {
+      const alertRes = spawnSync(
+        '/usr/bin/luna-send',
+        ['-n', '1', '-w', '1000', 'luna://com.webos.notification/getAlertNotification', '{}'],
+        { env, timeout: 1200 }
+      );
+      if (alertRes && alertRes.status === 0 && alertRes.stdout) {
+        const alertText = Buffer.isBuffer(alertRes.stdout)
+          ? alertRes.stdout.toString('utf8').trim()
+          : String(alertRes.stdout).trim();
+        if (alertText) {
+          const parsedAlert = JSON.parse(alertText);
+          const alertIds = [];
+          if (parsedAlert && typeof parsedAlert.alertId === 'string' && parsedAlert.alertId) {
+            alertIds.push(parsedAlert.alertId);
+          }
+          if (
+            parsedAlert &&
+            parsedAlert.alertInfo &&
+            typeof parsedAlert.alertInfo.alertId === 'string'
+          ) {
+            alertIds.push(parsedAlert.alertInfo.alertId);
+          }
+          if (parsedAlert && Array.isArray(parsedAlert.alerts)) {
+            for (const a of parsedAlert.alerts) {
+              if (a && typeof a.alertId === 'string' && a.alertId) alertIds.push(a.alertId);
+            }
+          }
+          for (const aid of alertIds) {
+            try {
+              spawnSync(
+                '/usr/bin/luna-send',
+                [
+                  '-n',
+                  '1',
+                  '-w',
+                  '1000',
+                  'luna://com.webos.notification/closeAlert',
+                  JSON.stringify({ alertId: aid })
+                ],
+                { env, timeout: 1200 }
+              );
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    for (const closeUri of [
+      'luna://com.webos.notification/closeAllAlerts',
+      'luna://com.webos.notification/removeAllNotification'
+    ]) {
+      try {
+        spawnSync('/usr/bin/luna-send', ['-n', '1', '-w', '1000', closeUri, '{}'], {
+          env,
+          timeout: 1200
+        });
+      } catch (_) {}
+    }
+  }
+
+  function enforce(options = {}) {
     try {
       try {
         io.mkdirSync(emptyDir, 0o555);
@@ -3931,6 +4022,16 @@ function createPrivacyRetirementEnforcer(deps = {}) {
         presentDirs.filter((t) => points.has(t)).length;
 
       if (
+        mountedCount === totalPresent &&
+        totalPresent > 0 &&
+        verifiedRemovedManifests.size === 0
+      ) {
+        for (const m of presentManifests) {
+          verifiedRemovedManifests.add(m);
+        }
+      }
+
+      if (
         mountedCount < totalPresent ||
         verifiedRemovedManifests.size < presentManifests.length
       ) {
@@ -3949,24 +4050,7 @@ function createPrivacyRetirementEnforcer(deps = {}) {
           } catch (_) {}
         }
 
-        for (const updateAppId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
-          if (presentDirs.some((d) => d.endsWith('/' + updateAppId))) {
-            try {
-              spawnSync(
-                '/usr/bin/luna-send',
-                [
-                  '-n',
-                  '1',
-                  '-w',
-                  '1200',
-                  'luna://com.webos.applicationManager/closeByAppId',
-                  JSON.stringify({ id: updateAppId })
-                ],
-                { env, timeout: 1500 }
-              );
-            } catch (_) {}
-          }
-        }
+        dismissUpdateNotifications(presentBins, presentDirs);
 
         for (const manifestPath of presentManifests) {
           if (verifiedRemovedManifests.has(manifestPath)) continue;
@@ -4025,7 +4109,10 @@ function createPrivacyRetirementEnforcer(deps = {}) {
           }
         }
 
-        retirePrivacyProcesses();
+        const killedAfter = retirePrivacyProcesses();
+        if (killedAfter > 0 || (options && options.forceDismissAlerts)) {
+          dismissUpdateNotifications(presentBins, presentDirs);
+        }
         points = getAllMountPoints();
         mountedCount =
           presentBins.filter((t) => points.has(t)).length +
@@ -4036,7 +4123,10 @@ function createPrivacyRetirementEnforcer(deps = {}) {
           manifestsRemoved: manifestsRemovedCount
         });
       } else {
-        retirePrivacyProcesses();
+        const killed = retirePrivacyProcesses();
+        if (killed > 0 || (options && options.forceDismissAlerts)) {
+          dismissUpdateNotifications(presentBins, presentDirs);
+        }
       }
       manifestsRemovedCount = verifiedRemovedManifests.size;
       privacyStatus = mountedCount + '/' + totalPresent;
@@ -5088,8 +5178,14 @@ const REMOTE_KEY_CODES = Object.freeze({
   left: 105,
   right: 106,
   select: 28,
+  enter: 28,
   back: 412,
   exit: 174,
+  backspace: 14,
+  delete: 111,
+  space: 57,
+  tab: 15,
+  esc: 1,
   play: 207,
   pause: 119,
   rewind: 168,
@@ -5233,6 +5329,21 @@ function executeResidentRemoteAction(payload, deps = {}) {
   const body = payload && typeof payload === 'object' ? payload : {};
   const action = typeof body.action === 'string' ? body.action.trim().toLowerCase() : '';
 
+  function invokeLuna(uri, payloadObj) {
+    try {
+      const r = callLunaSend(uri, payloadObj);
+      if (r && typeof r === 'object' && typeof r.then !== 'function') {
+        if ('ok' in r) {
+          return { ok: Boolean(r.ok), parsed: r.parsed || null };
+        }
+        if ('returnValue' in r) {
+          return { ok: Boolean(r.returnValue !== false), parsed: r };
+        }
+      }
+    } catch (_) {}
+    return { ok: false, parsed: null };
+  }
+
   function writeKeyTap(devPath, code) {
     if (!devPath) return false;
     const frames = buildKeyTapFrames32(code, nowMs());
@@ -5269,7 +5380,7 @@ function executeResidentRemoteAction(payload, deps = {}) {
     }
     markUserActive();
     if (keyName === 'home') {
-      const r = callLunaSend('luna://com.webos.applicationManager/launch', {
+      const r = invokeLuna('luna://com.webos.applicationManager/launch', {
         id: 'local.owner.applibrary'
       });
       return {
@@ -5277,6 +5388,40 @@ function executeResidentRemoteAction(payload, deps = {}) {
         action: 'key',
         key: 'home',
         appId: 'local.owner.applibrary'
+      };
+    }
+    if (keyName === 'backspace' || keyName === 'delete') {
+      const count = Math.max(1, Math.min(64, Math.round(Number(body.count) || 1)));
+      const imeRes = invokeLuna('luna://com.webos.service.ime/deleteCharacters', {
+        numCharacters: count,
+        type: keyName === 'delete' ? 'delete' : 'backspace'
+      });
+      const code = REMOTE_KEY_CODES[keyName];
+      const primaryOk = writeKeyTap(inputDevicePath, code);
+      if (fallbackInputDevicePath) {
+        writeKeyTap(fallbackInputDevicePath, code);
+      }
+      return {
+        ok: Boolean(primaryOk || (imeRes && imeRes.ok)),
+        action: 'key',
+        key: keyName,
+        code,
+        imeOk: Boolean(imeRes && imeRes.ok)
+      };
+    }
+    if (keyName === 'enter') {
+      const imeRes = invokeLuna('luna://com.webos.service.ime/sendEnterKey', {});
+      const code = REMOTE_KEY_CODES.enter;
+      const primaryOk = writeKeyTap(inputDevicePath, code);
+      if (fallbackInputDevicePath) {
+        writeKeyTap(fallbackInputDevicePath, code);
+      }
+      return {
+        ok: Boolean(primaryOk || (imeRes && imeRes.ok)),
+        action: 'key',
+        key: 'enter',
+        code,
+        imeOk: Boolean(imeRes && imeRes.ok)
       };
     }
     let resolvedKey = keyName;
@@ -5307,7 +5452,7 @@ function executeResidentRemoteAction(payload, deps = {}) {
       action === 'volume_up'
         ? 'luna://com.webos.audio/volumeUp'
         : 'luna://com.webos.audio/volumeDown';
-    const r = callLunaSend(uri, {});
+    const r = invokeLuna(uri, {});
     if (r && r.ok) {
       return { ok: true, action };
     }
@@ -5320,19 +5465,19 @@ function executeResidentRemoteAction(payload, deps = {}) {
   if (action === 'set_volume') {
     markUserActive();
     const vol = Math.max(0, Math.min(100, Math.round(Number(body.volume) || 0)));
-    const r = callLunaSend('luna://com.webos.audio/setVolume', { volume: vol });
+    const r = invokeLuna('luna://com.webos.audio/setVolume', { volume: vol });
     return { ok: Boolean(r && r.ok), action: 'set_volume', volume: vol };
   }
 
   if (action === 'set_mute') {
     markUserActive();
     const mute = Boolean(body.mute);
-    const r = callLunaSend('luna://com.webos.audio/setMute', { mute });
+    const r = invokeLuna('luna://com.webos.audio/setMute', { mute });
     return { ok: Boolean(r && r.ok), action: 'set_mute', mute };
   }
 
   if (action === 'get_volume') {
-    const r = callLunaSend('luna://com.webos.audio/getVolume', {});
+    const r = invokeLuna('luna://com.webos.audio/getVolume', {});
     const parsed = (r && r.parsed) || {};
     const status = parsed.volumeStatus && typeof parsed.volumeStatus === 'object' ? parsed.volumeStatus : parsed;
     const volume = typeof status.volume === 'number' ? status.volume : 0;
@@ -5347,12 +5492,12 @@ function executeResidentRemoteAction(payload, deps = {}) {
 
   if (action === 'power_on') {
     markUserActive();
-    const r = callLunaSend('luna://com.webos.service.tvpower/power/turnOnScreen', {});
+    const r = invokeLuna('luna://com.webos.service.tvpower/power/turnOnScreen', {});
     return { ok: Boolean(r && r.ok), action: 'power_on' };
   }
 
   if (action === 'power_off') {
-    const r = callLunaSend('luna://com.webos.service.tvpower/power/turnOff', {
+    const r = invokeLuna('luna://com.webos.service.tvpower/power/turnOff', {
       reason: 'remoteKey'
     });
     return { ok: Boolean(r && r.ok), action: 'power_off' };
@@ -5364,8 +5509,94 @@ function executeResidentRemoteAction(payload, deps = {}) {
       return { ok: false, error: 'invalid_app_id' };
     }
     markUserActive();
-    const r = callLunaSend('luna://com.webos.applicationManager/launch', { id: appId });
+    const r = invokeLuna('luna://com.webos.applicationManager/launch', { id: appId });
     return { ok: Boolean(r && r.ok), action: 'launch_app', appId };
+  }
+
+  if (action === 'text') {
+    const rawText = typeof body.text === 'string' ? body.text : '';
+    if (!rawText && !body.submit) {
+      return { ok: false, error: 'missing_text' };
+    }
+    if (rawText.length > 512) {
+      return { ok: false, error: 'text_too_long' };
+    }
+    markUserActive();
+    const replace = body.replace ? 1 : 0;
+    let imeOk = true;
+    let keyTapOk = false;
+    if (rawText.length > 0) {
+      const r = invokeLuna('luna://com.webos.service.ime/insertText', {
+        text: rawText,
+        replace
+      });
+      imeOk = Boolean(r && r.ok);
+      if (!imeOk) {
+        const asciiMap = {
+          '1': 2, '2': 3, '3': 4, '4': 5, '5': 6, '6': 7, '7': 8, '8': 9, '9': 10, '0': 11,
+          '-': 12, '=': 13,
+          q: 16, w: 17, e: 18, r: 19, t: 20, y: 21, u: 22, i: 23, o: 24, p: 25,
+          a: 30, s: 31, d: 32, f: 33, g: 34, h: 35, j: 36, k: 37, l: 38,
+          z: 44, x: 45, c: 46, v: 47, b: 48, n: 49, m: 50,
+          '.': 52, '/': 53, ' ': 57
+        };
+        let tapped = 0;
+        for (const ch of rawText.toLowerCase()) {
+          const kc = asciiMap[ch];
+          if (kc && writeKeyTap(inputDevicePath, kc)) {
+            tapped += 1;
+          }
+        }
+        keyTapOk = tapped > 0;
+      }
+    }
+    let submitOk = true;
+    if (body.submit) {
+      const sr = invokeLuna('luna://com.webos.service.ime/sendEnterKey', {});
+      submitOk = Boolean(sr && sr.ok);
+      if (!submitOk) {
+        submitOk = writeKeyTap(inputDevicePath, REMOTE_KEY_CODES.enter);
+      }
+    }
+    return {
+      ok: Boolean((imeOk || keyTapOk || rawText.length === 0) && submitOk),
+      action: 'text',
+      length: rawText.length,
+      submit: Boolean(body.submit),
+      imeOk,
+      keyTapOk
+    };
+  }
+
+  if (action === 'dismiss_update_notices') {
+    for (const appId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
+      invokeLuna('luna://com.webos.applicationManager/closeByAppId', { id: appId });
+    }
+    const alertRes = invokeLuna('luna://com.webos.notification/getAlertNotification', {});
+    const parsedAlert = (alertRes && alertRes.parsed) || {};
+    const alertIds = [];
+    if (typeof parsedAlert.alertId === 'string' && parsedAlert.alertId) {
+      alertIds.push(parsedAlert.alertId);
+    }
+    if (parsedAlert.alertInfo && typeof parsedAlert.alertInfo.alertId === 'string') {
+      alertIds.push(parsedAlert.alertInfo.alertId);
+    }
+    if (Array.isArray(parsedAlert.alerts)) {
+      for (const a of parsedAlert.alerts) {
+        if (a && typeof a.alertId === 'string' && a.alertId) alertIds.push(a.alertId);
+      }
+    }
+    for (const aid of alertIds) {
+      invokeLuna('luna://com.webos.notification/closeAlert', { alertId: aid });
+    }
+    const closeAllRes = invokeLuna('luna://com.webos.notification/closeAllAlerts', {});
+    invokeLuna('luna://com.webos.notification/removeAllNotification', {});
+    return {
+      ok: true,
+      action: 'dismiss_update_notices',
+      closedAlerts: alertIds,
+      closeAllOk: Boolean(closeAllRes && closeAllRes.ok)
+    };
   }
 
   return { ok: false, error: 'unknown_action', action };

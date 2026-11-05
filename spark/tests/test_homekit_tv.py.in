@@ -92,8 +92,8 @@ class HomeKitTvTests(unittest.TestCase):
         db = acc.to_hap_accessories_dict()
         self.assertEqual(len(db["accessories"]), 1)
         services = db["accessories"][0]["services"]
-        # 1 AccessoryInformation + 1 Television + 1 TelevisionSpeaker + 12 InputSources = 15 services
-        self.assertEqual(len(services), 15)
+        # 1 AccessoryInformation + 1 Television + 1 TelevisionSpeaker + 17 InputSources = 20 services
+        self.assertEqual(len(services), 20)
         tv_svc = next(s for s in services if s["iid"] == acc.IID_TV_SERVICE)
         self.assertTrue(tv_svc["primary"])
         self.assertIn(acc.IID_SPEAKER_SERVICE, tv_svc["linked"])
@@ -382,6 +382,365 @@ class HomeKitTvTests(unittest.TestCase):
             assert res_vol is not None
             self.assertEqual(res_vol[0], 200)
             self.assertEqual(http_calls[-1][4], {"action": "volume_up"})
+
+    def test_wake_tv_from_iphone_when_tv_is_off(self) -> None:
+        synth_mac = ":".join(("02", "11", "22", "33", "44", "55"))
+        wol_calls = []
+
+        def offline_http_post(host, port, path, headers, body, timeout):
+            raise ConnectionRefusedError("TV is off")
+
+        def offline_ssap(uri, payload):
+            return {"ok": False, "error": "TV is off"}
+
+        def fake_wol(macs):
+            wol_calls.append(list(macs))
+            return len(macs)
+
+        ctrl = homekit_tv.TvRemoteController(
+            tv_ip=homekit_tv.TV_IP,
+            voice_key="b" * 64,
+            tv_macs=[synth_mac],
+            ssap_client_key="test-key",
+            http_post_fn=offline_http_post,
+            ssap_request_fn=offline_ssap,
+            wol_sender_fn=fake_wol,
+        )
+        acc = homekit_tv.HomeKitTvAccessory(controller=ctrl)
+
+        # Even if iPhone had a stale Active=1 state and sent 0 when the user tapped Power,
+        # seeing the TV is unreachable triggers Wake-on-LAN and keeps Active=1
+        st, evs = acc.put_characteristic(acc.IID_TV_ACTIVE, 0)
+        self.assertEqual(st, 0)
+        self.assertEqual(wol_calls[-1], [synth_mac])
+        self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 1)
+        self.assertEqual(evs, [(1, acc.IID_TV_ACTIVE, 1)])
+
+        # Pressing Select on the iPhone Remote touchpad while TV is off also sends Wake-on-LAN
+        acc._values[acc.IID_TV_ACTIVE] = 0
+        st, evs = acc.put_characteristic(acc.IID_TV_REMOTE_KEY, homekit_tv.HAP_REMOTE_KEY_SELECT)
+        self.assertEqual(st, 0)
+        self.assertEqual(len(wol_calls), 2)
+        self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 1)
+        self.assertEqual(evs, [(1, acc.IID_TV_ACTIVE, 1)])
+
+    def test_keyboard_text_and_voice_commands_on_iphone_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "pairing.json"
+            pairing = homekit_tv.HapPairingState(
+                state_path=state_path,
+                device_id=":".join(("02", "11", "22", "33", "44", "55")),
+                setup_code="111-22-333",
+                setup_id="R2TV",
+                ltsk_seed=b"\x44" * 32,
+            )
+            http_calls = []
+            agent_calls = []
+
+            def fake_http_post(ip, port, path, headers, body, timeout_s):
+                parsed = json.loads(body)
+                http_calls.append((ip, port, path, dict(headers), parsed))
+                return 200, json.dumps({"ok": True, "action": parsed.get("action")})
+
+            def fake_voice_agent(utterance: str):
+                agent_calls.append(utterance)
+                return {"ok": True, "spoken": f"Agent handled: {utterance}"}
+
+            ctl = homekit_tv.TvRemoteController(
+                tv_ip=homekit_tv.TV_IP,
+                voice_key="b" * 64,
+                http_post_fn=fake_http_post,
+                voice_agent_fn=fake_voice_agent,
+            )
+            acc = homekit_tv.HomeKitTvAccessory(controller=ctl)
+            srv = homekit_tv.HomeKitTvServer(pairing, acc, enable_mdns=False)
+
+            res_html = srv.handle_web_remote_request("GET", "/iphone", b"")
+            self.assertIsNotNone(res_html)
+            assert res_html is not None
+            html_str = res_html[2].decode("utf-8")
+            self.assertIn("voiceInput", html_str)
+            self.assertIn("kbInput", html_str)
+            self.assertIn("startVoiceCapture", html_str)
+            self.assertIn("submitKeyboard", html_str)
+
+            # Keyboard typing via POST /api/text
+            res_txt = srv.handle_web_remote_request(
+                "POST",
+                "/api/text",
+                b'{"text":"Star Wars Andor","submit":true}',
+            )
+            self.assertIsNotNone(res_txt)
+            assert res_txt is not None
+            self.assertEqual(res_txt[0], 200)
+            self.assertEqual(
+                http_calls[-1][4],
+                {"action": "text", "text": "Star Wars Andor", "submit": True, "replace": False},
+            )
+
+            # Backspace via POST /api/remote
+            res_bs = srv.handle_web_remote_request(
+                "POST",
+                "/api/remote",
+                b'{"action":"key","key":"backspace"}',
+            )
+            self.assertIsNotNone(res_bs)
+            assert res_bs is not None
+            self.assertEqual(res_bs[0], 200)
+            self.assertEqual(http_calls[-1][4], {"action": "key", "key": "backspace"})
+
+            # Voice command: app launch ("Open YouTube")
+            res_v1 = srv.handle_web_remote_request(
+                "POST",
+                "/api/voice",
+                b'{"utterance":"Open YouTube"}',
+            )
+            self.assertIsNotNone(res_v1)
+            assert res_v1 is not None
+            self.assertEqual(res_v1[0], 200)
+            self.assertEqual(http_calls[-1][4], {"action": "launch_app", "appId": "youtube.leanback.v4"})
+            self.assertEqual(acc._values[acc.IID_TV_ACTIVE_IDENTIFIER], 4)
+
+            # Voice command: volume set ("Set volume to 35")
+            res_v2 = srv.handle_web_remote_request(
+                "POST",
+                "/api/voice",
+                b'{"utterance":"Set volume to 35"}',
+            )
+            self.assertIsNotNone(res_v2)
+            assert res_v2 is not None
+            self.assertEqual(res_v2[0], 200)
+            self.assertEqual(http_calls[-1][4], {"action": "set_volume", "volume": 35})
+            self.assertEqual(acc._values[acc.IID_SPEAKER_VOLUME], 35)
+
+            # Voice command: search query ("Search for Mandalorian")
+            res_v3 = srv.handle_web_remote_request(
+                "POST",
+                "/api/voice",
+                b'{"utterance":"Search for Mandalorian"}',
+            )
+            self.assertIsNotNone(res_v3)
+            assert res_v3 is not None
+            self.assertEqual(res_v3[0], 200)
+            self.assertEqual(
+                http_calls[-1][4],
+                {"action": "text", "text": "Mandalorian", "submit": True, "replace": False},
+            )
+
+            # Voice command: dismiss update dialog ("Dismiss update dialog")
+            res_v4 = srv.handle_web_remote_request(
+                "POST",
+                "/api/voice",
+                b'{"utterance":"Dismiss update dialog"}',
+            )
+            self.assertIsNotNone(res_v4)
+            assert res_v4 is not None
+            self.assertEqual(res_v4[0], 200)
+            self.assertEqual(http_calls[-2][4], {"action": "dismiss_update_notices"})
+            self.assertEqual(http_calls[-1][4], {"action": "key", "key": "exit"})
+
+            # Voice command: complex agent query delegated to Spark Voice Agent
+            res_v5 = srv.handle_web_remote_request(
+                "POST",
+                "/api/voice",
+                b'{"utterance":"Open browser and check the weather in San Francisco"}',
+            )
+            self.assertIsNotNone(res_v5)
+            assert res_v5 is not None
+            self.assertEqual(res_v5[0], 200)
+            self.assertEqual(agent_calls[-1], "Open browser and check the weather in San Francisco")
+
+    def test_companion_link_opack_rti_keyboard_and_siri_remote(self) -> None:
+        import plistlib
+        import uuid
+
+        sample = {
+            "_i": "_sessionStart",
+            "_t": 2,
+            "_x": 12345,
+            "_c": {
+                "name": "R2D2 TV",
+                "active": True,
+                "inactive": False,
+                "empty": None,
+                "small": 7,
+                "med": 512,
+                "raw": b"\x01\x02\x03\x04",
+                "items": ["alpha", "beta", "alpha"],
+                "uid": uuid.UUID("12345678-1234-5678-1234-567812345678"),
+            },
+        }
+        packed = homekit_tv.opack_pack(sample)
+        unpacked, rem = homekit_tv.opack_unpack(packed)
+        self.assertEqual(rem, b"")
+        self.assertEqual(unpacked["_i"], "_sessionStart")
+        self.assertEqual(unpacked["_c"]["items"], ["alpha", "beta", "alpha"])
+        self.assertEqual(unpacked["_c"]["uid"], uuid.UUID("12345678-1234-5678-1234-567812345678"))
+
+        # Verify RTI binary plist generation & parsing
+        session_uuid = str(uuid.uuid4()).upper()
+        rti_blob = homekit_tv.build_rti_payload(session_uuid, current_text="Hello")
+        pl = plistlib.loads(rti_blob)
+        self.assertEqual(pl["$archiver"], "RTIKeyedArchiver")
+        ops_init = homekit_tv.parse_rti_text_operations(rti_blob)
+        self.assertEqual(ops_init["context_before"], "Hello")
+
+        # Build synthetic client RTI input operation (insertionText + deletionCount)
+        uid = plistlib.UID
+        client_rti = plistlib.dumps(
+            {
+                "$archiver": "RTIKeyedArchiver",
+                "$version": 100000,
+                "$top": {"root": uid(1)},
+                "$objects": [
+                    "$null",
+                    {"insertionText": uid(2), "deletionCount": 0},
+                    "Open YouTube\n",
+                ],
+            },
+            fmt=plistlib.PlistFormat.FMT_BINARY,
+        )
+        parsed_ops = homekit_tv.parse_rti_text_operations(client_rti)
+        self.assertEqual(parsed_ops["insertion_text"], "Open YouTube\n")
+
+        # Verify CompanionSession Pair-Verify + Encrypted E_OPACK + RTI + Siri + HID
+        class FakeSocket:
+            def __init__(self) -> None:
+                self.sent_frames: list[tuple[int, bytes]] = []
+
+            def sendall(self, data: bytes) -> None:
+                ft = data[0]
+                ln = int.from_bytes(data[1:4], "big")
+                self.sent_frames.append((ft, data[4 : 4 + ln]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "pairing.json"
+            ios_seed = b"\x55" * 32
+            ios_ltpk = homekit_tv.ed25519_public_key(ios_seed)
+            pairing = homekit_tv.HapPairingState(
+                state_path=state_path,
+                device_id=":".join(("02", "11", "22", "33", "44", "55")),
+                setup_code="111-22-333",
+                setup_id="R2TV",
+                ltsk_seed=b"\x44" * 32,
+            )
+            pairing.pairings["ios-ctrl"] = {"public_key": ios_ltpk.hex(), "permissions": 1}
+
+            http_calls = []
+            agent_calls = []
+
+            def fake_http_post(ip, port, path, headers, body, timeout_s):
+                parsed = json.loads(body)
+                http_calls.append(parsed)
+                return 200, json.dumps({"ok": True})
+
+            ctl = homekit_tv.TvRemoteController(
+                tv_ip=homekit_tv.TV_IP,
+                voice_key="b" * 64,
+                http_post_fn=fake_http_post,
+                voice_agent_fn=lambda u: (agent_calls.append(u) or {"ok": True, "spoken": u}),
+            )
+            acc = homekit_tv.HomeKitTvAccessory(controller=ctl)
+            fake_sock = FakeSocket()
+            comp = homekit_tv.CompanionSession(fake_sock, pairing, acc)  # type: ignore[arg-type]
+
+            # Pair-Setup M1 -> M2 (transient flag 0x10)
+            ps1_tlv = homekit_tv.tlv8_encode(
+                [(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_METHOD, b"\x00"), (homekit_tv.TLV_FLAGS, b"\x10")]
+            )
+            comp.handle_frame(homekit_tv.COMPANION_FRAME_PS_START, homekit_tv.opack_pack({"_pd": ps1_tlv}))
+            self.assertEqual(fake_sock.sent_frames[-1][0], homekit_tv.COMPANION_FRAME_PS_NEXT)
+            ps2_msg, _ = homekit_tv.opack_unpack(fake_sock.sent_frames[-1][1])
+            ps2_tlv = homekit_tv.tlv8_decode(ps2_msg["_pd"])
+            self.assertEqual(ps2_tlv[homekit_tv.TLV_STATE], b"\x02")
+            fake_sock.sent_frames.clear()
+
+            # Pair-Verify M1 -> M2
+            c_priv, c_pub = homekit_tv.x25519_keypair(b"\x88" * 32)
+            pv1_tlv = homekit_tv.tlv8_encode(
+                [(homekit_tv.TLV_STATE, b"\x01"), (homekit_tv.TLV_PUBLIC_KEY, c_pub)]
+            )
+            comp.handle_frame(homekit_tv.COMPANION_FRAME_PV_START, homekit_tv.opack_pack({"_pd": pv1_tlv}))
+            self.assertEqual(fake_sock.sent_frames[-1][0], homekit_tv.COMPANION_FRAME_PV_NEXT)
+            pv2_msg, _ = homekit_tv.opack_unpack(fake_sock.sent_frames[-1][1])
+            pv2_tlv = homekit_tv.tlv8_decode(pv2_msg["_pd"])
+            acc_curve_pub = pv2_tlv[homekit_tv.TLV_PUBLIC_KEY]
+            shared_sec = homekit_tv.x25519_scalarmult(c_priv, acc_curve_pub)
+            pv_session_key = homekit_tv.hkdf_sha512(
+                shared_sec, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32
+            )
+            ios_id_bytes = b"ios-ctrl"
+            pv3_sig = homekit_tv.ed25519_sign(ios_seed, c_pub + ios_id_bytes + acc_curve_pub)
+            pv3_sub = homekit_tv.tlv8_encode(
+                [(homekit_tv.TLV_IDENTIFIER, ios_id_bytes), (homekit_tv.TLV_SIGNATURE, pv3_sig)]
+            )
+            pv3_enc = homekit_tv.chacha20_poly1305_encrypt(
+                pv_session_key, b"\x00\x00\x00\x00PV-Msg03", pv3_sub
+            )
+            pv3_tlv = homekit_tv.tlv8_encode(
+                [(homekit_tv.TLV_STATE, b"\x03"), (homekit_tv.TLV_ENCRYPTED_DATA, pv3_enc)]
+            )
+            comp.handle_frame(homekit_tv.COMPANION_FRAME_PV_NEXT, homekit_tv.opack_pack({"_pd": pv3_tlv}))
+            self.assertIsNotNone(comp.cipher)
+
+            # Client cipher (mirrors CompanionCipher with swapped keys)
+            client_out_key = homekit_tv.hkdf_sha512(shared_sec, b"", b"ClientEncrypt-main", 32)
+            client_in_key = homekit_tv.hkdf_sha512(shared_sec, b"", b"ServerEncrypt-main", 32)
+            client_out_cnt = 0
+            client_in_cnt = 0
+
+            def send_encrypted(msg_dict):
+                nonlocal client_out_cnt
+                raw = homekit_tv.opack_pack(msg_dict)
+                hdr = bytes([homekit_tv.COMPANION_FRAME_E_OPACK]) + (len(raw) + 16).to_bytes(3, "big")
+                nonce = client_out_cnt.to_bytes(8, "little") + b"\x00\x00\x00\x00"
+                client_out_cnt += 1
+                ct = homekit_tv.chacha20_poly1305_encrypt(client_out_key, nonce, raw, hdr)
+                comp.handle_frame(homekit_tv.COMPANION_FRAME_E_OPACK, ct)
+
+            def recv_decrypted(frame_idx):
+                nonlocal client_in_cnt
+                ft, body = fake_sock.sent_frames[frame_idx]
+                self.assertEqual(ft, homekit_tv.COMPANION_FRAME_E_OPACK)
+                hdr = bytes([ft]) + len(body).to_bytes(3, "big")
+                nonce = client_in_cnt.to_bytes(8, "little") + b"\x00\x00\x00\x00"
+                client_in_cnt += 1
+                pt = homekit_tv.chacha20_poly1305_decrypt(client_in_key, nonce, body, hdr)
+                dec, _ = homekit_tv.opack_unpack(pt)
+                return dec
+
+            before_idx = len(fake_sock.sent_frames)
+            send_encrypted({"_i": "TVRCSessionStart", "_t": 2, "_x": 101, "_c": {}})
+            resp_tvrc = recv_decrypted(before_idx)
+            self.assertEqual(resp_tvrc["_t"], 3)
+            self.assertEqual(resp_tvrc["_c"]["ProtocolVersionKey"], "1.2")
+            # Also pushed MediaControlStatus, _iMC, SystemStatus, TVSystemStatus, SiriStatus, and _tiStarted events!
+            ev_mcs = recv_decrypted(before_idx + 1)
+            ev_imc = recv_decrypted(before_idx + 2)
+            ev_sys = recv_decrypted(before_idx + 3)
+            ev_tvsys = recv_decrypted(before_idx + 4)
+            ev_siri = recv_decrypted(before_idx + 5)
+            ev_ti = recv_decrypted(before_idx + 6)
+            self.assertEqual(ev_mcs["_i"], "MediaControlStatus")
+            self.assertEqual(ev_imc["_i"], "_iMC")
+            self.assertEqual(ev_sys["_i"], "SystemStatus")
+            self.assertEqual(ev_tvsys["_i"], "TVSystemStatus")
+            self.assertEqual(ev_siri["_i"], "SiriStatus")
+            self.assertEqual(ev_ti["_i"], "_tiStarted")
+            self.assertIn("_tiD", ev_ti["_c"])
+
+            # Verify Apple TV distinct identity fields
+            self.assertEqual(len(pairing.atv_unique_id), 32)
+            self.assertNotIn("-", pairing.atv_unique_id)
+            self.assertNotEqual(pairing.atv_device_id, pairing.device_id)
+
+            # Press Home button via Companion HID (`_hidC = 7`)
+            send_encrypted({"_i": "_hidC", "_t": 1, "_x": 102, "_c": {"_hidC": 7, "_hBtS": 1}})
+            self.assertEqual(http_calls[-1], {"action": "launch_app", "appId": homekit_tv.APP_LIBRARY_ID})
+
+            # Send dictated/typed voice command via Companion RTI (`_tiC`)
+            send_encrypted({"_i": "_tiC", "_t": 1, "_x": 103, "_c": {"_tiD": client_rti, "_tiV": 1}})
+            self.assertEqual(http_calls[-1], {"action": "launch_app", "appId": "youtube.leanback.v4"})
 
 
 if __name__ == "__main__":

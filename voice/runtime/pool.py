@@ -837,7 +837,7 @@ class _HookPool:
 
 class WarmHook:
     def __init__(self, pool, source, *, clock, audit, killswitch=None, tick_s=1.0,
-                 spawn_thread=None):
+                 spawn_thread=None, always_warm=False):
         if not _number(tick_s) or not 0 < tick_s <= 60:
             raise ValueError('WARM_TICK')
         self.pool, self.source = pool, source
@@ -845,10 +845,16 @@ class WarmHook:
         stop_events = getattr(pool, '_stop_events', None)
         if type(stop_events) is list:
             stop_events.append(self.stopping)
+        warm_kwargs = {
+            'clock': clock,
+            'audit': audit,
+            'killswitch': killswitch if killswitch is not None else _NoPause(),
+        }
+        if always_warm:
+            warm_kwargs['always_warm'] = True
         self.controller = warm.WarmController(
             _HookPool(pool, self.stopping), _HookSource(source, self.stopping),
-            clock=clock, audit=audit,
-            killswitch=killswitch if killswitch is not None else _NoPause())
+            **warm_kwargs)
         self.tick_s = tick_s
         self.spawn_thread = spawn_thread if spawn_thread is not None else _daemon
         self.lock = threading.Lock()

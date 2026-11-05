@@ -151,13 +151,16 @@ def power_from_reply(reply):
 
 
 class WarmController:
-    def __init__(self, pool, source, *, clock, audit, killswitch):
+    def __init__(self, pool, source, *, clock, audit, killswitch, always_warm=False):
         if not all(callable(getattr(pool, name, None)) for name in ('begin_warm', 'poll', 'unload')):
             raise ValueError('WARM_POOL')
         if not callable(getattr(source, 'current', None)):
             raise ValueError('WARM_SOURCE')
+        if type(always_warm) is not bool:
+            raise ValueError('WARM_POLICY')
         self.pool, self.source, self.clock = pool, source, clock
         self.audit, self.killswitch = audit, killswitch
+        self.always_warm = always_warm
         self.lock = threading.Lock()      # state, timers, tickets; never held across a pool call
         self.ticking = threading.Lock()   # one tick() at a time
         self.state = 'unloaded'
@@ -262,14 +265,14 @@ class WarmController:
 
     # -- states ----------------------------------------------------------------------
     def _in_unloaded(self, now):
-        if self._fresh_active():
+        if self.always_warm or self._fresh_active():
             self._begin_warm(now, 'POWER_ACTIVE')
 
     def _in_warming(self, now):
         status = self._poll()
         if status == 'ready':
             self.failures, self.retry_at = 0, None
-            if self.known == 'inactive':
+            if not self.always_warm and self.known == 'inactive':
                 self.grace_until = self.inactive_since + GRACE_S
                 self._row('grace', 'WARM_DONE')
             else:
@@ -282,6 +285,8 @@ class WarmController:
     def _in_ready(self, now):
         if self._poll() != 'ready':
             self._begin_unload('POOL_FAILED')
+        elif self.always_warm:
+            return
         elif self.unknown_since is not None:
             if now - self.unknown_since >= UNKNOWN_HOLD_S:
                 self._begin_unload('UNKNOWN_HOLD_EXPIRED')
@@ -320,7 +325,7 @@ class WarmController:
             if not self.clean:
                 self._fail(now, 'UNLOAD_UNVERIFIED')
                 return
-        if self._fresh_active():
+        if self.always_warm or self._fresh_active():
             self._begin_warm(now, 'RETRY')
 
     # -- actions ----------------------------------------------------------------------
