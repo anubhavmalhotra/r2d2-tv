@@ -11,13 +11,13 @@ def prove(page,extension_id):
     page.protection_attempted=True
     if not _id(page.context) or not _id(page.target) or not _id(page.session):raise ProofError('PROTECTION_OWNER')
     original=(page.context,page.target,page.session)
-    page.assert_alive();page.deadline=time.monotonic()+8
+    page.assert_alive();page.deadline=time.monotonic()+16
     def navigate(url):
         value=page._call('Page.navigate',{'url':url},True)
         if 'errorText'in value or value.get('isDownload')is True or not _id(value.get('frameId')):
             raise ProofError('PROTECTION_NAVIGATION')
     def wait_for(expression,expected):
-        for _ in range(20):
+        for _ in range(180):
             page._remaining()
             try:value=page._evaluate(expression)
             except ProofError as exc:

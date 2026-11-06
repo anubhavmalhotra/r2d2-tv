@@ -2408,20 +2408,45 @@ let groups = 0;
     assert.strictEqual(kGuard.apply(false), true);
     assert.strictEqual(kGuard.isBlocked(), true);
 
-    // PrivacyRetirementEnforcer runtime-masks update.service and closes renewupdate/softwareupdate dialogs
+    // PrivacyRetirementEnforcer runtime-masks update.service, writes cold-boot suppression markers, and closes renewupdate/softwareupdate dialogs
     const sysCalls = [];
     const mountedSet = new Set();
+    const writtenSuppressionFiles = new Map();
+    const unlinkedSuppressionFiles = [];
+    const existingSet = new Set([
+      '/usr/sbin/update',
+      '/usr/palm/applications/com.webos.app.renewupdate',
+      '/usr/palm/applications/com.webos.app.softwareupdate',
+      '/usr/share/luna-service2/manifests.d/update.manifest.json',
+      '/mnt/lg/cmn_data/update',
+      '/mnt/lg/cmn_data/update/.nsuServerTypeOrigin',
+      '/mnt/lg/cmn_data/swupdate',
+      '/mnt/lg/user/nudge',
+      '/mnt/lg/user/nudge/nu_r2r_notify.json',
+      '/var/luna-service2/manifests.d',
+      '/var/luna-service2/manifests.d/update.manifest.json',
+      '/var/luna-service2/manifests.d/nudge.manifest.json'
+    ]);
+    writtenSuppressionFiles.set(
+      '/mnt/lg/user/nudge/nu_r2r_notify.json',
+      JSON.stringify({ isActive: true, count: 5 }) + '\n'
+    );
+    let settingsAccept = false;
+    let fakeNowMs = 100000;
     const pEnforcer = maint.createPrivacyRetirementEnforcer({
+      nowMs: () => fakeNowMs,
       fs: {
         mkdirSync() {},
         chmodSync() {},
-        existsSync: (p) =>
-          [
-            '/usr/sbin/update',
-            '/usr/palm/applications/com.webos.app.renewupdate',
-            '/usr/palm/applications/com.webos.app.softwareupdate',
-            '/usr/share/luna-service2/manifests.d/update.manifest.json'
-          ].includes(p)
+        existsSync: (p) => existingSet.has(p) || writtenSuppressionFiles.has(p),
+        readFileSync: (p) => writtenSuppressionFiles.get(p) || '',
+        writeFileSync: (p, data) => {
+          writtenSuppressionFiles.set(p, String(data));
+        },
+        unlinkSync: (p) => {
+          unlinkedSuppressionFiles.push(p);
+          existingSet.delete(p);
+        }
       },
       getAllMountPoints: () => mountedSet,
       retirePrivacyProcesses: () => 0,
@@ -2437,6 +2462,15 @@ let groups = 0;
         if (cmd === '/bin/mount' && args.includes('bind')) {
           mountedSet.add(args[args.length - 1]);
         }
+        if (
+          cmd === '/usr/bin/luna-send' &&
+          args.includes('luna://com.webos.settingsservice/setSystemSettings')
+        ) {
+          return {
+            status: 0,
+            stdout: Buffer.from(JSON.stringify({ returnValue: settingsAccept }), 'utf8')
+          };
+        }
         return {
           status: 0,
           stdout: Buffer.from(JSON.stringify({ returnValue: true }), 'utf8')
@@ -2445,6 +2479,17 @@ let groups = 0;
     });
     const enfRes = pEnforcer.enforce();
     assert.strictEqual(enfRes.ok, true);
+    assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.disagreeAutoUpdate'));
+    assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.nsuServerTypeTest'));
+    assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.nsuServerTypeNetwork'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin'));
+    assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/swupdate/.notifiedPlatformUpgrade'));
+    assert.strictEqual(
+      writtenSuppressionFiles.get('/mnt/lg/user/nudge/nu_r2r_notify.json'),
+      JSON.stringify({ isActive: false, count: 0 }) + '\n'
+    );
+    assert(unlinkedSuppressionFiles.includes('/var/luna-service2/manifests.d/update.manifest.json'));
+    assert(unlinkedSuppressionFiles.includes('/var/luna-service2/manifests.d/nudge.manifest.json'));
     assert(
       sysCalls.some(
         (c) =>
@@ -2474,8 +2519,130 @@ let groups = 0;
       sysCalls.some(
         (c) =>
           c[0] === '/usr/bin/luna-send' &&
+          c.includes('-a') &&
+          c.includes('com.webos.service.battest') &&
           c.includes('luna://com.webos.notification/closeAllAlerts')
       )
+    );
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/usr/bin/luna-send' &&
+          c.includes('-a') &&
+          c.includes('com.webos.service.battest') &&
+          c.includes('luna://com.webos.notification/closeToast') &&
+          c.some((a) => a.includes('com.webos.service.update'))
+      )
+    );
+    assert(
+      sysCalls.some(
+        (c) =>
+          c[0] === '/usr/bin/luna-send' &&
+          c.includes('-a') &&
+          c.includes('com.webos.service.battest') &&
+          c.includes('luna://com.webos.notification/removeNotification') &&
+          c.some((a) => a.includes('com.webos.service.update'))
+      )
+    );
+    const settingsCallsAfterReject = sysCalls.filter(
+      (c) =>
+        c[0] === '/usr/bin/luna-send' &&
+        c.includes('luna://com.webos.settingsservice/setSystemSettings')
+    );
+    assert.strictEqual(settingsCallsAfterReject.length, 1);
+    assert(
+      settingsCallsAfterReject.some(
+        (c) => c.some((a) => a.includes('swUpdateNotice') && a.includes('swUpdateEnable'))
+      )
+    );
+    assert(!sysCalls.some((c) => c.some((a) => a.includes('enableToastPopup'))));
+    // Because returnValue was false on the first call, a subsequent ordinary enforce() must retry setSystemSettings
+    settingsAccept = true;
+    pEnforcer.enforce();
+    const settingsCallsAfterAccept = sysCalls.filter(
+      (c) =>
+        c[0] === '/usr/bin/luna-send' &&
+        c.includes('luna://com.webos.settingsservice/setSystemSettings')
+    );
+    assert.strictEqual(settingsCallsAfterAccept.length, 2);
+    // Once returnValue === true is observed, updateSettingsPersisted is cached and not repeated
+    fakeNowMs += 31000;
+    pEnforcer.enforce({ forceDismissAlerts: true });
+    const settingsCallsAfterCached = sysCalls.filter(
+      (c) =>
+        c[0] === '/usr/bin/luna-send' &&
+        c.includes('luna://com.webos.settingsservice/setSystemSettings')
+    );
+    assert.strictEqual(settingsCallsAfterCached.length, 2);
+
+    // Verify cooldown applies to failed dismissal retries and persistUpdateSettings runs even if closeAllAlerts fails
+    let retryNowMs = 10000;
+    let failAlerts = true;
+    let failRemoveNotif = true;
+    const retryCalls = [];
+    const retryMounted = new Set();
+    const retryEnforcer = maint.createPrivacyRetirementEnforcer({
+      nowMs: () => retryNowMs,
+      systemdServices: ['update.service'],
+      ls2Manifests: ['/var/luna-service2/manifests.d/update.manifest.json'],
+      binTargets: ['/usr/sbin/update'],
+      dirTargets: ['/usr/palm/applications/com.webos.app.renewupdate'],
+      getAllMountPoints: () => new Set(retryMounted),
+      retirePrivacyProcesses: () => 0,
+      fs: {
+        mkdirSync: () => {},
+        chmodSync: () => {},
+        existsSync: () => true,
+        readFileSync: () => '1\n',
+        writeFileSync: () => {},
+        unlinkSync: () => {}
+      },
+      spawnSync: (cmd, args) => {
+        retryCalls.push([cmd, ...(args || [])]);
+        if (cmd === '/bin/mount' && args && args[1] === 'bind') {
+          retryMounted.add(args[3]);
+        }
+        const joined = (args || []).join(' ');
+        if (joined.includes('closeAllAlerts') && failAlerts) {
+          return { status: 0, stdout: Buffer.from(JSON.stringify({ returnValue: false }), 'utf8') };
+        }
+        if (joined.includes('removeNotification') && failRemoveNotif) {
+          return { status: 0, stdout: Buffer.from(JSON.stringify({ returnValue: false }), 'utf8') };
+        }
+        return { status: 0, stdout: Buffer.from(JSON.stringify({ returnValue: true }), 'utf8') };
+      }
+    });
+    for (let i = 0; i < 4; i += 1) {
+      retryEnforcer.enforce();
+      retryNowMs += 100;
+    }
+    // Even though closeAllAlerts failed on i=0, setSystemSettings succeeded and closeAllAlerts was throttled by the 30s cooldown
+    assert.strictEqual(
+      retryCalls.filter((c) => c.includes('luna://com.webos.settingsservice/setSystemSettings')).length,
+      1
+    );
+    assert.strictEqual(
+      retryCalls.filter((c) => c.includes('luna://com.webos.notification/closeAllAlerts')).length,
+      1
+    );
+    // Advance past 30s cooldown: closeAllAlerts succeeds this time, removeNotification still fails
+    retryNowMs += 30000;
+    failAlerts = false;
+    for (let i = 0; i < 3; i += 1) {
+      retryEnforcer.enforce();
+      retryNowMs += 100;
+    }
+    assert.strictEqual(
+      retryCalls.filter((c) => c.includes('luna://com.webos.notification/closeAllAlerts')).length,
+      2
+    );
+    // Advance past 30s cooldown again: removeNotification recovers, and closeAllAlerts is not repeated since alertsClosedOnce is true
+    retryNowMs += 30000;
+    failRemoveNotif = false;
+    retryEnforcer.enforce();
+    assert.strictEqual(
+      retryCalls.filter((c) => c.includes('luna://com.webos.notification/closeAllAlerts')).length,
+      2
     );
 
     // App-only updates: selectUpdatableApps excludes renewupdate & softwareupdate while allowing streaming apps
@@ -2572,8 +2739,8 @@ let groups = 0;
       fs: fakeFs,
       inputDevicePath: '/dev/input/event2',
       fallbackInputDevicePath: '/dev/input/event0',
-      callLunaSend: (uri, payload) => {
-        lunaCalls.push({ uri, payload });
+      callLunaSend: (uri, payload, timeoutMs, callerAppId) => {
+        lunaCalls.push({ uri, payload, callerAppId });
         if (uri === 'luna://com.webos.audio/getVolume') {
           return { ok: true, parsed: { volumeStatus: { volume: 18, muteStatus: false } } };
         }
@@ -2681,8 +2848,31 @@ let groups = 0;
     );
     assert.strictEqual(resDismiss.ok, true);
     assert(
-      lunaCalls.some((c) => c.uri === 'luna://com.webos.notification/closeAllAlerts')
+      lunaCalls.some(
+        (c) =>
+          c.uri === 'luna://com.webos.notification/closeAllAlerts' &&
+          c.callerAppId === 'com.webos.service.battest'
+      )
     );
+    assert(
+      lunaCalls.some(
+        (c) =>
+          c.uri === 'luna://com.webos.notification/closeToast' &&
+          c.callerAppId === 'com.webos.service.battest'
+      )
+    );
+    const resDismissFail = maint.executeResidentRemoteAction(
+      { action: 'dismiss_update_notices' },
+      {
+        ...actionDeps,
+        callLunaSend: (uri) =>
+          uri.endsWith('/closeToast')
+            ? { ok: true, parsed: { returnValue: false, errorText: 'Unknown Source' } }
+            : { ok: true, parsed: { returnValue: true } }
+      }
+    );
+    assert.strictEqual(resDismissFail.ok, false);
+    assert.strictEqual(resDismissFail.toastDismissOk, false);
     groups++;
   }
 

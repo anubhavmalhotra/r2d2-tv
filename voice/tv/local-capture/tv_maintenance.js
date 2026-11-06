@@ -3870,11 +3870,16 @@ function createPrivacyRetirementEnforcer(deps = {}) {
   const ls2Manifests = deps.ls2Manifests || [];
   const binTargets = deps.binTargets || [];
   const dirTargets = deps.dirTargets || [];
+  const nowMs = typeof deps.nowMs === 'function' ? deps.nowMs : () => Date.now();
   const log = deps.log || (() => {});
 
   const verifiedRemovedManifests = new Set();
   let privacyStatus = 'init';
   let manifestsRemovedCount = 0;
+  let updateSettingsPersisted = false;
+  let alertsClosedOnce = false;
+  let updateNotificationsDismissed = false;
+  let lastDismissMs = 0;
 
   function isManifestRemovalAccepted(res) {
     if (!res || res.status !== 0 || !res.stdout) return false;
@@ -3890,7 +3895,130 @@ function createPrivacyRetirementEnforcer(deps = {}) {
     }
   }
 
-  function dismissUpdateNotifications(presentBins, presentDirs) {
+  function isLunaReturnTrue(res) {
+    if (!res || res.status !== 0 || !res.stdout) return false;
+    const text = Buffer.isBuffer(res.stdout)
+      ? res.stdout.toString('utf8').trim()
+      : String(res.stdout).trim();
+    if (!text) return false;
+    try {
+      const parsed = JSON.parse(text);
+      return Boolean(parsed && parsed.returnValue === true);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function writeMarkerIfNeeded(markerPath, expectedContent) {
+    try {
+      let needsWrite = !io.existsSync(markerPath);
+      if (!needsWrite && typeof io.readFileSync === 'function') {
+        try {
+          const cur = String(io.readFileSync(markerPath, 'utf8'));
+          if (cur.trim() !== expectedContent.trim()) {
+            needsWrite = true;
+          }
+        } catch (_) {
+          needsWrite = true;
+        }
+      }
+      if (needsWrite) {
+        io.writeFileSync(markerPath, expectedContent, { mode: 0o644 });
+      }
+    } catch (_) {}
+  }
+
+  function persistColdBootUpdateSuppression() {
+    if (typeof io.writeFileSync !== 'function') return;
+    try {
+      if (io.existsSync('/mnt/lg/cmn_data/update')) {
+        for (const marker of [
+          '/mnt/lg/cmn_data/update/.disagreeAutoUpdate',
+          '/mnt/lg/cmn_data/update/.nsuServerTypeTest',
+          '/mnt/lg/cmn_data/update/.nsuServerTypeNetwork'
+        ]) {
+          writeMarkerIfNeeded(marker, '1\n');
+        }
+        if (typeof io.unlinkSync === 'function') {
+          try {
+            if (io.existsSync('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin')) {
+              io.unlinkSync('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin');
+            }
+          } catch (_) {}
+        }
+      }
+      if (io.existsSync('/mnt/lg/cmn_data/swupdate')) {
+        writeMarkerIfNeeded('/mnt/lg/cmn_data/swupdate/.notifiedPlatformUpgrade', '1\n');
+      }
+      if (io.existsSync('/mnt/lg/user/nudge')) {
+        try {
+          const nudgeNotifyPath = '/mnt/lg/user/nudge/nu_r2r_notify.json';
+          let needsNudgeWrite = !io.existsSync(nudgeNotifyPath);
+          if (!needsNudgeWrite && typeof io.readFileSync === 'function') {
+            try {
+              const parsed = JSON.parse(String(io.readFileSync(nudgeNotifyPath, 'utf8')));
+              if (!parsed || parsed.isActive !== false || parsed.count !== 0) {
+                needsNudgeWrite = true;
+              }
+            } catch (_) {
+              needsNudgeWrite = true;
+            }
+          }
+          if (needsNudgeWrite) {
+            io.writeFileSync(
+              nudgeNotifyPath,
+              JSON.stringify({ isActive: false, count: 0 }) + '\n',
+              { mode: 0o644 }
+            );
+          }
+        } catch (_) {}
+      }
+      if (typeof io.unlinkSync === 'function' && io.existsSync('/var/luna-service2/manifests.d')) {
+        for (const staleManifest of [
+          '/var/luna-service2/manifests.d/update.manifest.json',
+          '/var/luna-service2/manifests.d/nudge.manifest.json'
+        ]) {
+          try {
+            if (io.existsSync(staleManifest)) {
+              io.unlinkSync(staleManifest);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  function persistUpdateSettings() {
+    if (updateSettingsPersisted) return true;
+    let allSet = true;
+    for (const settingsPayload of [
+      { category: 'hotelMode', settings: { swUpdateEnable: 'off', swUpdateNotice: 'off' } }
+    ]) {
+      try {
+        const sRes = spawnSync(
+          '/usr/bin/luna-send',
+          [
+            '-n',
+            '1',
+            'luna://com.webos.settingsservice/setSystemSettings',
+            JSON.stringify(settingsPayload)
+          ],
+          { env, timeout: 500 }
+        );
+        if (!isLunaReturnTrue(sRes)) {
+          allSet = false;
+        }
+      } catch (_) {
+        allSet = false;
+      }
+    }
+    if (allSet) {
+      updateSettingsPersisted = true;
+    }
+    return updateSettingsPersisted;
+  }
+
+  function dismissUpdateNotifications(presentBins, presentDirs, dismissOpts = {}) {
     const hasUpdateTargets =
       (Array.isArray(presentBins) && presentBins.some((b) => b.endsWith('/update'))) ||
       (Array.isArray(presentDirs) &&
@@ -3899,7 +4027,10 @@ function createPrivacyRetirementEnforcer(deps = {}) {
             d.endsWith('/com.webos.app.renewupdate') ||
             d.endsWith('/com.webos.app.softwareupdate')
         ));
-    if (!hasUpdateTargets) return;
+    if (!hasUpdateTargets) return true;
+    lastDismissMs = nowMs();
+    persistColdBootUpdateSuppression();
+    persistUpdateSettings();
     for (const updateAppId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
       if (presentDirs.some((d) => d.endsWith('/' + updateAppId))) {
         try {
@@ -3908,74 +4039,69 @@ function createPrivacyRetirementEnforcer(deps = {}) {
             [
               '-n',
               '1',
-              '-w',
-              '1200',
               'luna://com.webos.applicationManager/closeByAppId',
               JSON.stringify({ id: updateAppId })
             ],
-            { env, timeout: 1500 }
+            { env, timeout: 500 }
           );
         } catch (_) {}
       }
     }
-    try {
-      const alertRes = spawnSync(
-        '/usr/bin/luna-send',
-        ['-n', '1', '-w', '1000', 'luna://com.webos.notification/getAlertNotification', '{}'],
-        { env, timeout: 1200 }
-      );
-      if (alertRes && alertRes.status === 0 && alertRes.stdout) {
-        const alertText = Buffer.isBuffer(alertRes.stdout)
-          ? alertRes.stdout.toString('utf8').trim()
-          : String(alertRes.stdout).trim();
-        if (alertText) {
-          const parsedAlert = JSON.parse(alertText);
-          const alertIds = [];
-          if (parsedAlert && typeof parsedAlert.alertId === 'string' && parsedAlert.alertId) {
-            alertIds.push(parsedAlert.alertId);
+    const forceCloseAllAlerts = Boolean(dismissOpts && dismissOpts.forceCloseAllAlerts);
+    if (!alertsClosedOnce || forceCloseAllAlerts) {
+      let alertCallOk = false;
+      try {
+        const closeAlertsRes = spawnSync(
+          '/usr/bin/luna-send',
+          [
+            '-n',
+            '1',
+            '-a',
+            'com.webos.service.battest',
+            'luna://com.webos.notification/closeAllAlerts',
+            '{}'
+          ],
+          { env, timeout: 450 }
+        );
+        if (isLunaReturnTrue(closeAlertsRes)) {
+          alertCallOk = true;
+          alertsClosedOnce = true;
+        }
+      } catch (_) {}
+      if (!alertCallOk) {
+        updateNotificationsDismissed = false;
+        return false;
+      }
+    }
+    let allNotificationsCleared = true;
+    for (const sourceId of ['com.webos.service.update', 'com.webos.service.nudge']) {
+      for (const uri of [
+        'luna://com.webos.notification/closeToast',
+        'luna://com.webos.notification/removeNotification'
+      ]) {
+        try {
+          const nRes = spawnSync(
+            '/usr/bin/luna-send',
+            [
+              '-n',
+              '1',
+              '-a',
+              'com.webos.service.battest',
+              uri,
+              JSON.stringify({ sourceId })
+            ],
+            { env, timeout: 450 }
+          );
+          if (!isLunaReturnTrue(nRes)) {
+            allNotificationsCleared = false;
           }
-          if (
-            parsedAlert &&
-            parsedAlert.alertInfo &&
-            typeof parsedAlert.alertInfo.alertId === 'string'
-          ) {
-            alertIds.push(parsedAlert.alertInfo.alertId);
-          }
-          if (parsedAlert && Array.isArray(parsedAlert.alerts)) {
-            for (const a of parsedAlert.alerts) {
-              if (a && typeof a.alertId === 'string' && a.alertId) alertIds.push(a.alertId);
-            }
-          }
-          for (const aid of alertIds) {
-            try {
-              spawnSync(
-                '/usr/bin/luna-send',
-                [
-                  '-n',
-                  '1',
-                  '-w',
-                  '1000',
-                  'luna://com.webos.notification/closeAlert',
-                  JSON.stringify({ alertId: aid })
-                ],
-                { env, timeout: 1200 }
-              );
-            } catch (_) {}
-          }
+        } catch (_) {
+          allNotificationsCleared = false;
         }
       }
-    } catch (_) {}
-    for (const closeUri of [
-      'luna://com.webos.notification/closeAllAlerts',
-      'luna://com.webos.notification/removeAllNotification'
-    ]) {
-      try {
-        spawnSync('/usr/bin/luna-send', ['-n', '1', '-w', '1000', closeUri, '{}'], {
-          env,
-          timeout: 1200
-        });
-      } catch (_) {}
     }
+    updateNotificationsDismissed = allNotificationsCleared;
+    return allNotificationsCleared;
   }
 
   function enforce(options = {}) {
@@ -4009,6 +4135,13 @@ function createPrivacyRetirementEnforcer(deps = {}) {
         }
       });
       const totalPresent = presentBins.length + presentDirs.length;
+      const hasUpdateTargets =
+        presentBins.some((b) => b.endsWith('/update')) ||
+        presentDirs.some(
+          (d) =>
+            d.endsWith('/com.webos.app.renewupdate') ||
+            d.endsWith('/com.webos.app.softwareupdate')
+        );
 
       for (const m of [...verifiedRemovedManifests]) {
         if (!presentManifests.includes(m)) {
@@ -4110,8 +4243,8 @@ function createPrivacyRetirementEnforcer(deps = {}) {
         }
 
         const killedAfter = retirePrivacyProcesses();
-        if (killedAfter > 0 || (options && options.forceDismissAlerts)) {
-          dismissUpdateNotifications(presentBins, presentDirs);
+        if (killedAfter > 0) {
+          dismissUpdateNotifications(presentBins, presentDirs, { forceCloseAllAlerts: true });
         }
         points = getAllMountPoints();
         mountedCount =
@@ -4124,8 +4257,19 @@ function createPrivacyRetirementEnforcer(deps = {}) {
         });
       } else {
         const killed = retirePrivacyProcesses();
-        if (killed > 0 || (options && options.forceDismissAlerts)) {
-          dismissUpdateNotifications(presentBins, presentDirs);
+        const cooldownElapsed = lastDismissMs === 0 || nowMs() - lastDismissMs >= 30000;
+        if (
+          killed > 0 ||
+          (cooldownElapsed &&
+            ((hasUpdateTargets && !updateNotificationsDismissed) ||
+              (options && options.forceDismissAlerts)))
+        ) {
+          dismissUpdateNotifications(presentBins, presentDirs, {
+            forceCloseAllAlerts: killed > 0 || Boolean(options && options.forceDismissAlerts)
+          });
+        }
+        if (hasUpdateTargets && !updateSettingsPersisted) {
+          persistUpdateSettings();
         }
       }
       manifestsRemovedCount = verifiedRemovedManifests.size;
@@ -5329,15 +5473,27 @@ function executeResidentRemoteAction(payload, deps = {}) {
   const body = payload && typeof payload === 'object' ? payload : {};
   const action = typeof body.action === 'string' ? body.action.trim().toLowerCase() : '';
 
-  function invokeLuna(uri, payloadObj) {
+  function invokeLuna(uri, payloadObj, callerAppId, timeoutMs) {
     try {
-      const r = callLunaSend(uri, payloadObj);
+      const tMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 2000;
+      const r =
+        callerAppId !== undefined
+          ? callLunaSend(uri, payloadObj, tMs, callerAppId)
+          : timeoutMs !== undefined
+            ? callLunaSend(uri, payloadObj, tMs)
+            : callLunaSend(uri, payloadObj);
       if (r && typeof r === 'object' && typeof r.then !== 'function') {
         if ('ok' in r) {
-          return { ok: Boolean(r.ok), parsed: r.parsed || null };
+          const parsed = r.parsed || null;
+          const rvOk =
+            !parsed ||
+            typeof parsed !== 'object' ||
+            !('returnValue' in parsed) ||
+            parsed.returnValue === true;
+          return { ok: Boolean(r.ok && rvOk), parsed };
         }
         if ('returnValue' in r) {
-          return { ok: Boolean(r.returnValue !== false), parsed: r };
+          return { ok: Boolean(r.returnValue === true), parsed: r };
         }
       }
     } catch (_) {}
@@ -5570,32 +5726,32 @@ function executeResidentRemoteAction(payload, deps = {}) {
 
   if (action === 'dismiss_update_notices') {
     for (const appId of ['com.webos.app.renewupdate', 'com.webos.app.softwareupdate']) {
-      invokeLuna('luna://com.webos.applicationManager/closeByAppId', { id: appId });
+      invokeLuna('luna://com.webos.applicationManager/closeByAppId', { id: appId }, undefined, 350);
     }
-    const alertRes = invokeLuna('luna://com.webos.notification/getAlertNotification', {});
-    const parsedAlert = (alertRes && alertRes.parsed) || {};
-    const alertIds = [];
-    if (typeof parsedAlert.alertId === 'string' && parsedAlert.alertId) {
-      alertIds.push(parsedAlert.alertId);
-    }
-    if (parsedAlert.alertInfo && typeof parsedAlert.alertInfo.alertId === 'string') {
-      alertIds.push(parsedAlert.alertInfo.alertId);
-    }
-    if (Array.isArray(parsedAlert.alerts)) {
-      for (const a of parsedAlert.alerts) {
-        if (a && typeof a.alertId === 'string' && a.alertId) alertIds.push(a.alertId);
+    const closeAllRes = invokeLuna(
+      'luna://com.webos.notification/closeAllAlerts',
+      {},
+      'com.webos.service.battest',
+      350
+    );
+    let toastDismissOk = true;
+    for (const sourceId of ['com.webos.service.update', 'com.webos.service.nudge']) {
+      const ctRes = invokeLuna(
+        'luna://com.webos.notification/closeToast',
+        { sourceId },
+        'com.webos.service.battest',
+        350
+      );
+      if (!ctRes || !ctRes.ok) {
+        toastDismissOk = false;
       }
     }
-    for (const aid of alertIds) {
-      invokeLuna('luna://com.webos.notification/closeAlert', { alertId: aid });
-    }
-    const closeAllRes = invokeLuna('luna://com.webos.notification/closeAllAlerts', {});
-    invokeLuna('luna://com.webos.notification/removeAllNotification', {});
+    const closeAllOk = Boolean(closeAllRes && closeAllRes.ok);
     return {
-      ok: true,
+      ok: Boolean(closeAllOk && toastDismissOk),
       action: 'dismiss_update_notices',
-      closedAlerts: alertIds,
-      closeAllOk: Boolean(closeAllRes && closeAllRes.ok)
+      closeAllOk,
+      toastDismissOk
     };
   }
 
