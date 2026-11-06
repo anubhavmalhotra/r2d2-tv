@@ -38,7 +38,8 @@
     }).catch(fail);
   }
   addEventListener('pagehide', stop);
-  document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); });
+  document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); else if (closed && !handed) location.reload(); });
+  document.addEventListener('webOSRelaunch', function () { if (closed && !handed) location.reload(); });
   function waitForIdle() {
     if (closed || handed) return;
     if (Date.now() > busyUntil) { fail(); return; }
