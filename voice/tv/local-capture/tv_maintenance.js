@@ -108,15 +108,21 @@ const LG_APPSTORE_DOMAINS = Object.freeze([
 const LG_PERMANENT_BLOCK_IPS = Object.freeze([
   '156.147.69.32',
   '15.165.189.166',
-  '52.79.67.32'
+  '52.79.67.32',
+  '3.38.232.211',
+  '3.34.246.122'
 ]);
 const LG_PERMANENT_BLOCK_IPV6S = Object.freeze([
   '::ffff:156.147.69.32',
   '::ffff:15.165.189.166',
   '::ffff:52.79.67.32',
+  '::ffff:3.38.232.211',
+  '::ffff:3.34.246.122',
   '64:ff9b::9c93:4520',
   '64:ff9b::fa5:bda6',
-  '64:ff9b::344f:4320'
+  '64:ff9b::344f:4320',
+  '64:ff9b::326:e8d3',
+  '64:ff9b::322:f67a'
 ]);
 
 function isValidIpv4(ip) {
@@ -3931,20 +3937,49 @@ function createPrivacyRetirementEnforcer(deps = {}) {
   function persistColdBootUpdateSuppression() {
     if (typeof io.writeFileSync !== 'function') return;
     try {
+      if (io.existsSync('/mnt/lg/cmn_data')) {
+        writeMarkerIfNeeded(
+          '/mnt/lg/cmn_data/debugVersionCheck',
+          'http://127.0.0.1:1/CheckSWAutoUpdate.laf\n'
+        );
+        writeMarkerIfNeeded('/mnt/lg/cmn_data/debugDownload', 'http://127.0.0.1:1/\n');
+        if (typeof io.unlinkSync === 'function') {
+          for (const staleUpdateFile of [
+            '/mnt/lg/cmn_data/.UpdateIsInprogress',
+            '/mnt/lg/cmn_data/.forceUpdateFlagFile',
+            '/mnt/lg/cmn_data/swupdate/Image_Update_Info.xml',
+            '/mnt/lg/cmn_data/swupdatefile.epk',
+            '/mnt/lg/cmn_data/usbupdatefile.epk',
+            '/mnt/lg/appstore/swupdatefile.epk',
+            '/mnt/lg/appstore/.update/usbupdatefile.epk'
+          ]) {
+            try {
+              if (io.existsSync(staleUpdateFile)) {
+                io.unlinkSync(staleUpdateFile);
+              }
+            } catch (_) {}
+          }
+        }
+      }
       if (io.existsSync('/mnt/lg/cmn_data/update')) {
         for (const marker of [
           '/mnt/lg/cmn_data/update/.disagreeAutoUpdate',
-          '/mnt/lg/cmn_data/update/.nsuServerTypeTest',
           '/mnt/lg/cmn_data/update/.nsuServerTypeNetwork'
         ]) {
           writeMarkerIfNeeded(marker, '1\n');
         }
         if (typeof io.unlinkSync === 'function') {
-          try {
-            if (io.existsSync('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin')) {
-              io.unlinkSync('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin');
-            }
-          } catch (_) {}
+          for (const liveServerMarker of [
+            '/mnt/lg/cmn_data/update/.nsuServerTypeOrigin',
+            '/mnt/lg/cmn_data/update/.nsuServerTypeTest',
+            '/mnt/lg/cmn_data/update/.nsuServerTypeSDP'
+          ]) {
+            try {
+              if (io.existsSync(liveServerMarker)) {
+                io.unlinkSync(liveServerMarker);
+              }
+            } catch (_) {}
+          }
         }
       }
       if (io.existsSync('/mnt/lg/cmn_data/swupdate')) {
