@@ -2402,6 +2402,8 @@ let groups = 0;
     assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::9c93:4520')));
     assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::fa5:bda6')));
     assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::344f:4320')));
+    assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::326:e8d3')));
+    assert(ip6RouteCalls.some((c) => c.includes('unreachable 64:ff9b::322:f67a')));
 
     // Even if ip -6 route returns non-zero when IPv6 routing is disabled, kernelTableMissing allows IPv4 iptables + /etc/hosts to succeed
     failIpRouteToo = true;
@@ -2418,8 +2420,16 @@ let groups = 0;
       '/usr/palm/applications/com.webos.app.renewupdate',
       '/usr/palm/applications/com.webos.app.softwareupdate',
       '/usr/share/luna-service2/manifests.d/update.manifest.json',
+      '/mnt/lg/cmn_data',
+      '/mnt/lg/cmn_data/.UpdateIsInprogress',
+      '/mnt/lg/cmn_data/.forceUpdateFlagFile',
+      '/mnt/lg/cmn_data/swupdate/Image_Update_Info.xml',
+      '/mnt/lg/cmn_data/swupdatefile.epk',
+      '/mnt/lg/appstore/swupdatefile.epk',
       '/mnt/lg/cmn_data/update',
       '/mnt/lg/cmn_data/update/.nsuServerTypeOrigin',
+      '/mnt/lg/cmn_data/update/.nsuServerTypeTest',
+      '/mnt/lg/cmn_data/update/.nsuServerTypeSDP',
       '/mnt/lg/cmn_data/swupdate',
       '/mnt/lg/user/nudge',
       '/mnt/lg/user/nudge/nu_r2r_notify.json',
@@ -2479,10 +2489,25 @@ let groups = 0;
     });
     const enfRes = pEnforcer.enforce();
     assert.strictEqual(enfRes.ok, true);
+    assert.strictEqual(
+      writtenSuppressionFiles.get('/mnt/lg/cmn_data/debugVersionCheck'),
+      'http://127.0.0.1:1/CheckSWAutoUpdate.laf\n'
+    );
+    assert.strictEqual(
+      writtenSuppressionFiles.get('/mnt/lg/cmn_data/debugDownload'),
+      'http://127.0.0.1:1/\n'
+    );
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/.UpdateIsInprogress'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/.forceUpdateFlagFile'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/swupdate/Image_Update_Info.xml'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/swupdatefile.epk'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/appstore/swupdatefile.epk'));
     assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.disagreeAutoUpdate'));
-    assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.nsuServerTypeTest'));
+    assert(!writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.nsuServerTypeTest'));
     assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/update/.nsuServerTypeNetwork'));
     assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/update/.nsuServerTypeOrigin'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/update/.nsuServerTypeTest'));
+    assert(unlinkedSuppressionFiles.includes('/mnt/lg/cmn_data/update/.nsuServerTypeSDP'));
     assert(writtenSuppressionFiles.has('/mnt/lg/cmn_data/swupdate/.notifiedPlatformUpgrade'));
     assert.strictEqual(
       writtenSuppressionFiles.get('/mnt/lg/user/nudge/nu_r2r_notify.json'),
