@@ -32,6 +32,33 @@ let groups = 0;
       );
     }
 
+    for (const d of [
+      'rainmaker.tubitv.com',
+      'rainmaker.production-public.tubi.io',
+      'ads.tubitv.com',
+      'pubads.g.doubleclick.net',
+      'm.fwmrm.net',
+      'vid.springserve.com',
+      'rtr.innovid.com',
+      'match.adsrvr.org',
+      'amazon-adsystem.com',
+      'aax-us-east.amazon-adsystem.com',
+      's.amazon-adsystem.com',
+      'fls-na.amazon.com',
+      'unagi-na.amazon.com',
+      'device-metrics-us.amazon.com'
+    ]) {
+      assert(maint.LG_PERMANENT_BLOCK_DOMAINS.includes(d), 'Missing ad/telemetry domain: ' + d);
+      assert(fullBlock.includes('0.0.0.0 ' + d), 'Missing IPv4 sinkhole for ' + d);
+      assert(fullBlock.includes(':: ' + d), 'Missing IPv6 sinkhole for ' + d);
+    }
+    for (const mustNotBlock of ['imasdk.googleapis.com', 'static.doubleclick.net', 's0.2mdn.net', 'mas-ext.amazon.com']) {
+      assert(
+        !maint.LG_PERMANENT_BLOCK_DOMAINS.includes(mustNotBlock),
+        'Must not sinkhole SDK/entitlement host: ' + mustNotBlock
+      );
+    }
+
     const stripped = maint.stripManagedHostsBlock(fullBlock);
     assert.strictEqual(stripped, baseHosts);
     groups++;
@@ -2898,6 +2925,14 @@ let groups = 0;
     );
     assert.strictEqual(resDismissFail.ok, false);
     assert.strictEqual(resDismissFail.toastDismissOk, false);
+
+    const refreshed = maint.refreshDeviceIdentityWindow(
+      { schema: 1, kind: 'r2d2-tv-device-identity', enrolledAt: 1000, expiresAt: 2000 },
+      1800000000
+    );
+    assert.strictEqual(refreshed.enrolledAt, 1800000000 - 60);
+    assert.strictEqual(refreshed.expiresAt, 1800000000 - 60 + 30 * 86400);
+    assert.strictEqual(maint.refreshDeviceIdentityWindow(null), null);
     groups++;
   }
 

@@ -88,7 +88,57 @@ const LG_PERMANENT_BLOCK_DOMAINS = Object.freeze([
   'nlp.lge.com',
   'thinq.lge.com',
   'api.thinq.com',
-  'yumenetworks.com'
+  'yumenetworks.com',
+  'rainmaker.tubitv.com',
+  'rainmaker.production-public.tubi.io',
+  'ads.tubitv.com',
+  'ad-delivery.tubitv.com',
+  'analytics-ingestion.production-public.tubi.io',
+  'telemetry.tubitv.com',
+  'pubads.g.doubleclick.net',
+  'securepubads.g.doubleclick.net',
+  'ad.doubleclick.net',
+  'pagead2.googlesyndication.com',
+  'm.fwmrm.net',
+  'v.fwmrm.net',
+  'g1.v.fwmrm.net',
+  'vid.springserve.com',
+  'ads.springserve.com',
+  'search.spotxchange.com',
+  'sync.search.spotxchange.com',
+  'ads.stickyadstv.com',
+  'rtr.innovid.com',
+  's.innovid.com',
+  'dts.innovid.com',
+  'match.adsrvr.org',
+  'insight.adsrvr.org',
+  'ads.pubmatic.com',
+  'hbopenbid.pubmatic.com',
+  'fastlane.rubiconproject.com',
+  'ads.tremorhub.com',
+  'ad.auditude.com',
+  'c.evidon.com',
+  'sb.scorecardresearch.com',
+  'b.scorecardresearch.com',
+  'amazon-adsystem.com',
+  'aax.amazon-adsystem.com',
+  'aax-us-east.amazon-adsystem.com',
+  'aax-us-pdx.amazon-adsystem.com',
+  'aax-eu.amazon-adsystem.com',
+  'aax-fe.amazon-adsystem.com',
+  's.amazon-adsystem.com',
+  'c.amazon-adsystem.com',
+  'mads.amazon-adsystem.com',
+  'rcm-na.amazon-adsystem.com',
+  'aan.amazon.com',
+  'mads.amazon.com',
+  'fls-na.amazon.com',
+  'fls-eu.amazon.com',
+  'fls-fe.amazon.com',
+  'unagi-na.amazon.com',
+  'unagi.amazon.com',
+  'device-metrics-us.amazon.com',
+  'device-metrics-us-2.amazon.com'
 ]);
 
 const LG_APPSTORE_DOMAINS = Object.freeze([
@@ -5934,6 +5984,26 @@ function createResidentRemoteServer(deps = {}) {
   };
 }
 
+function refreshDeviceIdentityWindow(record, nowSec, rotateSec = 30 * 86400) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return null;
+  }
+  const ts =
+    typeof nowSec === 'number' && Number.isFinite(nowSec) && nowSec > 0
+      ? Math.floor(nowSec)
+      : Math.floor(Date.now() / 1000);
+  const span =
+    typeof rotateSec === 'number' && Number.isInteger(rotateSec) && rotateSec > 60
+      ? rotateSec
+      : 30 * 86400;
+  const enrolledAt = Math.max(1, ts - 60);
+  return {
+    ...record,
+    enrolledAt,
+    expiresAt: enrolledAt + span
+  };
+}
+
 module.exports = {
   BLOCK_BEGIN,
   BLOCK_END,
@@ -5992,5 +6062,6 @@ module.exports = {
   verifyRemoteControlRequest,
   executeResidentRemoteAction,
   isAllowedRemoteClientAddress,
-  createResidentRemoteServer
+  createResidentRemoteServer,
+  refreshDeviceIdentityWindow
 };
