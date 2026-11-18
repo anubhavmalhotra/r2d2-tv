@@ -90,11 +90,21 @@ const LG_PERMANENT_BLOCK_DOMAINS = Object.freeze([
   'api.thinq.com',
   'yumenetworks.com',
   'rainmaker.tubitv.com',
+  'rainmaker4.tubitv.com',
   'rainmaker.production-public.tubi.io',
+  'rainmaker4.production-public.tubi.io',
+  'lb4.production-public.tubi.io',
   'ads.tubitv.com',
+  'ads.production-public.tubi.io',
+  'ads.adrise.tv',
   'ad-delivery.tubitv.com',
+  'tus-http.production-public.tubi.io',
   'analytics-ingestion.production-public.tubi.io',
+  'analytics-ingestion-production.tubitv.com',
+  'analytics-ingestion-v3.main-production-custom.production.k8s.tubi.io',
   'telemetry.tubitv.com',
+  'a-fds.youborafds01.com',
+  'tpc.googlesyndication.com',
   'pubads.g.doubleclick.net',
   'securepubads.g.doubleclick.net',
   'ad.doubleclick.net',
@@ -3569,6 +3579,34 @@ function createLgNetworkGuard(deps = {}) {
     }
   }
 
+  function reloadWebAppMgrNetworkService(expectedHostsText) {
+    try {
+      if (io.existsSync('/var/palm/jail') && typeof io.readdirSync === 'function') {
+        for (const jailName of io.readdirSync('/var/palm/jail')) {
+          const jailHosts = '/var/palm/jail/' + jailName + '/etc/hosts';
+          try {
+            if (io.existsSync(jailHosts) && fileSha(jailHosts) !== sha256Hex(expectedHostsText)) {
+              writeAtomic(jailHosts, Buffer.from(expectedHostsText, 'utf8'), 0o644);
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    try {
+      if (io.existsSync('/proc') && typeof io.readdirSync === 'function') {
+        for (const entry of io.readdirSync('/proc')) {
+          if (!/^[1-9][0-9]*$/.test(entry)) continue;
+          try {
+            const cmd = io.readFileSync('/proc/' + entry + '/cmdline', 'utf8');
+            if (cmd.includes('WebAppMgr') && cmd.includes('network.mojom.NetworkService')) {
+              spawnSync('/bin/kill', ['-TERM', String(entry)], { env, timeout: 1000 });
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
   function mountHostsForState(baseHosts, allowOpen) {
     const expectedHostsText = renderBlockedHosts(baseHosts, { allowAppStore: allowOpen });
     const expectedHostsSha = sha256Hex(expectedHostsText);
@@ -3599,6 +3637,7 @@ function createLgNetworkGuard(deps = {}) {
       if (!bindRes || bindRes.status !== 0 || !roRes || roRes.status !== 0) {
         return false;
       }
+      reloadWebAppMgrNetworkService(expectedHostsText);
     }
 
     return getMountedTargets().has('/etc/hosts') && fileSha('/etc/hosts') === expectedHostsSha;
