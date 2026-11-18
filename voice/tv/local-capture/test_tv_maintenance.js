@@ -34,8 +34,16 @@ let groups = 0;
 
     for (const d of [
       'rainmaker.tubitv.com',
+      'rainmaker4.tubitv.com',
       'rainmaker.production-public.tubi.io',
+      'rainmaker4.production-public.tubi.io',
+      'lb4.production-public.tubi.io',
       'ads.tubitv.com',
+      'ads.production-public.tubi.io',
+      'ads.adrise.tv',
+      'tus-http.production-public.tubi.io',
+      'analytics-ingestion-production.tubitv.com',
+      'analytics-ingestion-v3.main-production-custom.production.k8s.tubi.io',
       'pubads.g.doubleclick.net',
       'm.fwmrm.net',
       'vid.springserve.com',
