@@ -3393,11 +3393,18 @@ async function runUpdateWorkflow(deps) {
     const finalWakeOwnedOk =
       typeof deps.isWakeOwned === 'function' ? Boolean(deps.isWakeOwned()) : postWakeOwnedOk;
     if (finalWakeOwnedOk && !userActivityDetected && !foregroundObservationFailed && beforeStandbyOk) {
-      const standbyRes = await callLunaSend(
+      let standbyRes = await callLunaSend(
         'luna://com.webos.service.tvpower/power/turnOff',
         { reason: 'remoteKey' },
         3000
       );
+      if (!(standbyRes && standbyRes.returnValue === true)) {
+        standbyRes = await callLunaSend(
+          'luna://com.webos.service.tvpower/power/powerOff',
+          { reason: 'remoteKey' },
+          3000
+        );
+      }
       returnedToStandby = Boolean(standbyRes && standbyRes.returnValue === true);
     }
   }
@@ -5772,15 +5779,44 @@ function executeResidentRemoteAction(payload, deps = {}) {
 
   if (action === 'power_on') {
     markUserActive();
-    const r = invokeLuna('luna://com.webos.service.tvpower/power/turnOnScreen', {});
+    let r = invokeLuna('luna://com.webos.service.tvpower/power/turnOnScreen', {});
+    if (!(r && r.ok)) {
+      r = invokeLuna('luna://com.webos.service.tvpower/power/turnOnScreen', {
+        standbyMode: 'active'
+      });
+    }
     return { ok: Boolean(r && r.ok), action: 'power_on' };
   }
 
   if (action === 'power_off') {
-    const r = invokeLuna('luna://com.webos.service.tvpower/power/turnOff', {
+    const curPower = String(getTvPower() || '').trim().toLowerCase();
+    if (curPower === 'standby' || curPower === 'off' || curPower === 'suspend') {
+      return { ok: true, action: 'power_off', alreadyStandby: true };
+    }
+    const rPowerOff = invokeLuna('luna://com.webos.service.tvpower/power/powerOff', {
       reason: 'remoteKey'
     });
-    return { ok: Boolean(r && r.ok), action: 'power_off' };
+    if (rPowerOff && rPowerOff.ok) {
+      return { ok: true, action: 'power_off', method: 'luna_powerOff' };
+    }
+    const rTurnOff = invokeLuna('luna://com.webos.service.tvpower/power/turnOff', {
+      reason: 'remoteKey'
+    });
+    if (rTurnOff && rTurnOff.ok) {
+      return { ok: true, action: 'power_off', method: 'luna_turnOff' };
+    }
+    const powerCode = REMOTE_KEY_CODES.power;
+    let tapOk = writeKeyTap(inputDevicePath, powerCode);
+    if (!tapOk && fallbackInputDevicePath) {
+      tapOk = writeKeyTap(fallbackInputDevicePath, powerCode);
+    }
+    return {
+      ok: Boolean(tapOk),
+      action: 'power_off',
+      method: 'hid_power_key',
+      fallbackHid: true,
+      code: powerCode
+    };
   }
 
   if (action === 'launch_app') {

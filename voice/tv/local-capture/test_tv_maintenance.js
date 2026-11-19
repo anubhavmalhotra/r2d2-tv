@@ -2941,6 +2941,87 @@ let groups = 0;
     assert.strictEqual(refreshed.enrolledAt, 1800000000 - 60);
     assert.strictEqual(refreshed.expiresAt, 1800000000 - 60 + 30 * 86400);
     assert.strictEqual(maint.refreshDeviceIdentityWindow(null), null);
+
+    // power_off falls back from Luna powerOff -> turnOff -> HID KEY_POWER (116) on webOS 23
+    {
+      const pwrLuna = [];
+      const pwrHid = [];
+      const resHidFallback = maint.executeResidentRemoteAction(
+        { action: 'power_off' },
+        {
+          ...actionDeps,
+          fs: {
+            openSync: (p) => p,
+            writeSync: (devPath, buf) => {
+              pwrHid.push({ devPath, code: buf.readUInt16LE(10), val: buf.readInt32LE(12) });
+              return buf.length;
+            },
+            closeSync: () => {}
+          },
+          callLunaSend: (uri, payload) => {
+            pwrLuna.push({ uri, payload });
+            return { ok: false, parsed: { returnValue: false, errorText: 'Unknown method' } };
+          },
+          getTvPower: () => 'active'
+        }
+      );
+      assert.strictEqual(resHidFallback.ok, true);
+      assert.strictEqual(resHidFallback.method, 'hid_power_key');
+      assert.strictEqual(resHidFallback.fallbackHid, true);
+      assert.strictEqual(resHidFallback.code, 116);
+      assert.deepStrictEqual(
+        pwrLuna.map((c) => c.uri),
+        ['luna://com.webos.service.tvpower/power/powerOff', 'luna://com.webos.service.tvpower/power/turnOff']
+      );
+      assert.strictEqual(pwrHid.length, 2);
+      assert.strictEqual(pwrHid[0].devPath, '/dev/input/event2');
+      assert.strictEqual(pwrHid[0].code, 116);
+      assert.strictEqual(pwrHid[0].val, 1);
+      assert.strictEqual(pwrHid[1].code, 116);
+      assert.strictEqual(pwrHid[1].val, 0);
+
+      // power_off when TV is already in standby must NOT press toggle KEY_POWER
+      const standbyHid = [];
+      const resAlreadyOff = maint.executeResidentRemoteAction(
+        { action: 'power_off' },
+        {
+          ...actionDeps,
+          fs: {
+            openSync: (p) => p,
+            writeSync: (devPath, buf) => {
+              standbyHid.push(devPath);
+              return buf.length;
+            },
+            closeSync: () => {}
+          },
+          callLunaSend: () => {
+            throw new Error('should not call luna when already standby');
+          },
+          getTvPower: () => 'standby'
+        }
+      );
+      assert.strictEqual(resAlreadyOff.ok, true);
+      assert.strictEqual(resAlreadyOff.alreadyStandby, true);
+      assert.strictEqual(standbyHid.length, 0);
+
+      // power_on retries turnOnScreen with standbyMode: 'active' if {} fails
+      const onPayloads = [];
+      const resOnRetry = maint.executeResidentRemoteAction(
+        { action: 'power_on' },
+        {
+          ...actionDeps,
+          callLunaSend: (uri, payload) => {
+            onPayloads.push({ uri, payload });
+            return payload && payload.standbyMode === 'active'
+              ? { ok: true, parsed: { returnValue: true } }
+              : { ok: false, parsed: { returnValue: false } };
+          }
+        }
+      );
+      assert.strictEqual(resOnRetry.ok, true);
+      assert.strictEqual(onPayloads.length, 2);
+      assert.deepStrictEqual(onPayloads[1].payload, { standbyMode: 'active' });
+    }
     groups++;
   }
 
