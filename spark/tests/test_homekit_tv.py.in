@@ -742,6 +742,126 @@ class HomeKitTvTests(unittest.TestCase):
             send_encrypted({"_i": "_tiC", "_t": 1, "_x": 103, "_c": {"_tiD": client_rti, "_tiV": 1}})
             self.assertEqual(http_calls[-1], {"action": "launch_app", "appId": "youtube.leanback.v4"})
 
+    def test_power_off_fallback_sleep_grace_and_dynamic_wol_macs(self) -> None:
+        synth_mac_1 = ":".join(("02", "11", "22", "33", "44", "55"))
+        synth_mac_2 = ":".join(("02", "66", "77", "88", "99", "aa"))
+        http_calls: list[dict] = []
+        wol_calls: list[list[str]] = []
+
+        # 1. Reachable TV returns HTTP 400 for power_off (e.g. older webOS 23 resident),
+        #    falls back to {"action": "key", "key": "power"} and MUST NOT call wake_tv()!
+        def fallback_http_post(host, port, path, headers, body, timeout):
+            parsed = json.loads(body)
+            http_calls.append(parsed)
+            if parsed.get("action") == "power_off":
+                return 400, json.dumps({"ok": False, "action": "power_off"})
+            if parsed.get("action") == "status":
+                return 200, json.dumps({"ok": True, "tvPower": "active", "fgAppId": "local.owner.applibrary"})
+            if parsed.get("action") == "key" and parsed.get("key") == "power":
+                return 200, json.dumps({"ok": True, "action": "key", "key": "power", "code": 116})
+            return 200, json.dumps({"ok": True})
+
+        dynamic_macs = [synth_mac_1]
+        ctrl = homekit_tv.TvRemoteController(
+            tv_ip=homekit_tv.TV_IP,
+            voice_key="b" * 64,
+            tv_macs=list(dynamic_macs),
+            tv_macs_provider=lambda: list(dynamic_macs),
+            ssap_client_key="test-key",
+            http_post_fn=fallback_http_post,
+            ssap_request_fn=lambda uri, pl: {"ok": False, "reachable": True, "error": "401 insufficient permissions"},
+            wol_sender_fn=lambda macs: (wol_calls.append(list(macs)) or len(macs)),
+            status_reader_fn=lambda: {"tvPower": "active", "fgAppId": "local.owner.applibrary"},
+        )
+        acc = homekit_tv.HomeKitTvAccessory(controller=ctrl)
+
+        st, evs = acc.put_characteristic(acc.IID_TV_ACTIVE, 0)
+        self.assertEqual(st, 0)
+        self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 0)
+        self.assertEqual(evs, [(1, acc.IID_TV_ACTIVE, 0)])
+        self.assertEqual(wol_calls, [])
+        self.assertEqual(
+            [c.get("action") for c in http_calls],
+            ["power_off", "status", "key"],
+        )
+        self.assertEqual(http_calls[-1], {"action": "key", "key": "power"})
+
+        # Stale "active" poll immediately after turning off must NOT flip Active back to 1 during sleep grace
+        stale_changes = acc.sync_from_tv_state()
+        self.assertEqual(stale_changes, [])
+        self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 0)
+
+        # Dynamically discovered second MAC is included when waking the TV back up
+        dynamic_macs.append(synth_mac_2)
+        st_on, evs_on = acc.put_characteristic(acc.IID_TV_ACTIVE, 1)
+        self.assertEqual(st_on, 0)
+        self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 1)
+        self.assertEqual(evs_on, [(1, acc.IID_TV_ACTIVE, 1)])
+        self.assertEqual(wol_calls[-1], [synth_mac_1, synth_mac_2])
+
+        # 2. If reachable TV rejects power_off AND key:power AND SSAP returns 401, do NOT wake TV
+        wol_calls.clear()
+        ctrl_reject = homekit_tv.TvRemoteController(
+            tv_ip=homekit_tv.TV_IP,
+            voice_key="b" * 64,
+            tv_macs=[synth_mac_1],
+            ssap_client_key="test-key",
+            http_post_fn=lambda h, p, path, hdrs, body, t: (400, json.dumps({"ok": False})),
+            ssap_request_fn=lambda uri, pl: {"ok": False, "reachable": True, "error": "401"},
+            wol_sender_fn=lambda macs: (wol_calls.append(list(macs)) or len(macs)),
+        )
+        acc_reject = homekit_tv.HomeKitTvAccessory(controller=ctrl_reject)
+        st_r, _ = acc_reject.put_characteristic(acc_reject.IID_TV_ACTIVE, 0)
+        self.assertEqual(st_r, 0)
+        self.assertEqual(wol_calls, [])
+        self.assertEqual(acc_reject._values[acc_reject.IID_TV_ACTIVE], 1)
+
+        # 3. send_wol_magic_packets binds source_ip cleanly and sends packets
+        bound_addrs = []
+        sent_pkts = []
+
+        class FakeUdpSock:
+            def setsockopt(self, *args):
+                pass
+
+            def bind(self, addr):
+                bound_addrs.append(addr)
+
+            def sendto(self, pkt, target):
+                sent_pkts.append((len(pkt), target))
+
+            def close(self):
+                pass
+
+        cnt = homekit_tv.send_wol_magic_packets(
+            [synth_mac_1],
+            broadcast_ips=("255.255.255.255",),
+            ports=(9,),
+            sock_factory=FakeUdpSock,
+            source_ip="192.0.2.10",
+        )
+        self.assertEqual(cnt, 1)
+        self.assertEqual(bound_addrs, [("192.0.2.10", 0)])
+        self.assertEqual(sent_pkts, [(102, ("255.255.255.255", 9))])
+
+        # 4. Web /api/remote accepts mode="off" / mode="on" as well as value
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pairing = homekit_tv.HapPairingState(
+                state_path=Path(tmpdir) / "state.json",
+                device_id=synth_mac_1,
+                setup_code="111-22-333",
+                setup_id="R2TV",
+                ltsk_seed=b"\x44" * 32,
+            )
+            srv = homekit_tv.HomeKitTvServer(pairing, acc, enable_mdns=False)
+            res_web_off = srv.handle_web_remote_request(
+                "POST", "/api/remote", b'{"action":"power","mode":"off"}'
+            )
+            self.assertIsNotNone(res_web_off)
+            assert res_web_off is not None
+            self.assertEqual(res_web_off[0], 200)
+            self.assertEqual(acc._values[acc.IID_TV_ACTIVE], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

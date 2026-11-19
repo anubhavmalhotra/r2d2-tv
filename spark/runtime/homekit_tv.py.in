@@ -645,6 +645,7 @@ def send_wol_magic_packets(
     broadcast_ips: tuple[str, ...] = ("255.255.255.255",),
     ports: tuple[int, ...] = (9, 7),
     sock_factory: Callable[..., Any] | None = None,
+    source_ip: str = "",
 ) -> int:
     sent = 0
     packets = []
@@ -662,6 +663,12 @@ def send_wol_magic_packets(
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         except Exception:
             pass
+        clean_src = str(source_ip or "").strip()
+        if clean_src and re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", clean_src):
+            try:
+                sock.bind((clean_src, 0))
+            except Exception:
+                pass
         for pkt in packets:
             for ip in broadcast_ips:
                 for port in ports:
@@ -702,11 +709,13 @@ class TvRemoteController:
         status_reader_fn: Callable[[], dict[str, Any]] | None = None,
         voice_agent_fn: Callable[[str], dict[str, Any]] | None = None,
         now_ms_fn: Callable[[], int] | None = None,
+        tv_macs_provider: Callable[[], list[str]] | None = None,
     ) -> None:
         self.tv_ip = tv_ip
         self.remote_port = remote_port
         self.voice_key = voice_key
         self.tv_macs = list(tv_macs or [])
+        self._tv_macs_provider = tv_macs_provider
         self.ssap_client_key = ssap_client_key
         self._http_post_fn = http_post_fn or self._default_http_post
         self._ssap_request_fn = ssap_request_fn or self._default_ssap_request
@@ -716,6 +725,16 @@ class TvRemoteController:
         self._now_ms_fn = now_ms_fn or (lambda: int(time.time() * 1000))
         self._play_paused = False
         self._last_back_ms = 0
+
+    def _current_tv_macs(self) -> list[str]:
+        if self._tv_macs_provider is not None:
+            try:
+                for m in self._tv_macs_provider() or ():
+                    if isinstance(m, str) and m and m not in self.tv_macs:
+                        self.tv_macs.append(m)
+            except Exception:
+                pass
+        return list(self.tv_macs)
 
     def _default_http_post(
         self, host: str, port: int, path: str, headers: dict[str, str], body: str, timeout: float
@@ -743,7 +762,7 @@ class TvRemoteController:
         for attempt in range(3):
             if attempt > 0:
                 time.sleep(0.04)
-            total += send_wol_magic_packets(macs, broadcast_ips=targets)
+            total += send_wol_magic_packets(macs, broadcast_ips=targets, source_ip=SPARK_IP)
         return total
 
     def _default_ssap_request(self, uri: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -836,10 +855,14 @@ class TvRemoteController:
                 )
                 reply = recv_ws_json()
                 pl = reply.get("payload") if isinstance(reply, dict) else {}
-                return {
+                out: dict[str, Any] = {
                     "ok": bool(reply.get("type") == "response" and (not isinstance(pl, dict) or pl.get("returnValue", True))),
                     "payload": pl if isinstance(pl, dict) else {},
+                    "reachable": True,
                 }
+                if isinstance(reply, dict) and reply.get("error"):
+                    out["error"] = str(reply.get("error"))
+                return out
 
     def call_resident_remote(self, action_payload: dict[str, Any], timeout: float = 2.2) -> dict[str, Any]:
         if not self.voice_key or len(self.voice_key) != 64:
@@ -893,7 +916,7 @@ class TvRemoteController:
             sres = self._ssap_request_fn("ssap://media.controls/fastForward", {})
         if sres.get("ok"):
             return sres
-        if self.tv_macs and key_name in ("select", "home", "back", "play_pause"):
+        if self._current_tv_macs() and key_name in ("select", "home", "back", "play_pause"):
             return self.wake_tv()
         return sres or res
 
@@ -907,7 +930,7 @@ class TvRemoteController:
             sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": "local.owner.applibrary"})
             if sres.get("ok"):
                 return sres
-        if self.tv_macs:
+        if self._current_tv_macs():
             return self.wake_tv()
         return sres or res
 
@@ -934,9 +957,10 @@ class TvRemoteController:
 
     def wake_tv(self) -> dict[str, Any]:
         wol_sent = 0
-        if self.tv_macs:
-            wol_sent = self._wol_sender_fn(self.tv_macs)
-        res = self.call_resident_remote({"action": "power_on"}, timeout=0.6)
+        macs = self._current_tv_macs()
+        if macs:
+            wol_sent = self._wol_sender_fn(macs)
+        res = self.call_resident_remote({"action": "power_on"}, timeout=1.0)
         ssap_ok = False
         if not res.get("ok"):
             sres = self._ssap_request_fn("ssap://com.webos.service.tvpower/power/turnOnScreen", {})
@@ -951,17 +975,36 @@ class TvRemoteController:
     def set_power(self, active: bool) -> dict[str, Any]:
         if active:
             return self.wake_tv()
-        res = self.call_resident_remote({"action": "power_off"}, timeout=0.6)
+        res = self.call_resident_remote({"action": "power_off"}, timeout=1.5)
         if res.get("ok"):
             return res
+        resident_reachable = isinstance(res.get("status"), int)
+        if resident_reachable:
+            st = self.call_resident_remote({"action": "status"}, timeout=1.0)
+            if st.get("ok") and str(st.get("tvPower") or "").strip().lower() in ("standby", "off", "suspend"):
+                return {"ok": True, "action": "power_off", "alreadyStandby": True}
+            key_res = self.call_resident_remote({"action": "key", "key": "power"}, timeout=1.5)
+            if key_res.get("ok"):
+                return {
+                    "ok": True,
+                    "action": "power_off",
+                    "fallbackKey": "power",
+                    "result": key_res,
+                }
         sres = self._ssap_request_fn("ssap://system/turnOff", {})
         if sres.get("ok"):
             return sres
-        if self.tv_macs:
+        ssap_reachable = bool(isinstance(sres, dict) and sres.get("reachable"))
+        if not resident_reachable and not ssap_reachable and self._current_tv_macs():
             woke = self.wake_tv()
             woke["wokeFromStaleOff"] = True
             return woke
-        return sres
+        return {
+            "ok": False,
+            "action": "power_off",
+            "reachable": bool(resident_reachable or ssap_reachable),
+            "error": str(res.get("error") or (sres.get("error") if isinstance(sres, dict) else "") or "power_off_failed"),
+        }
 
     def launch_app(self, app_id: str) -> dict[str, Any]:
         candidates = (
@@ -979,7 +1022,7 @@ class TvRemoteController:
             sres = self._ssap_request_fn("ssap://system.launcher/launch", {"id": cand})
             if sres.get("ok"):
                 return sres
-        if self.tv_macs:
+        if self._current_tv_macs():
             return self.wake_tv()
         return sres or res
 
@@ -1332,6 +1375,7 @@ class HomeKitTvAccessory:
             self._values[base_iid + 6] = 0
             self._values[base_iid + 7] = int(src["identifier"])
         self._wake_grace_until: float = 0.0
+        self._sleep_grace_until: float = 0.0
 
     def sync_from_tv_state(self, state: dict[str, Any] | None = None) -> list[tuple[int, int, Any]]:
         st = state if state is not None else self.controller.poll_tv_state()
@@ -1340,9 +1384,13 @@ class HomeKitTvAccessory:
         changed: list[tuple[int, int, Any]] = []
         tv_power = str(st.get("tvPower") or "").strip().lower()
         if tv_power in ("active", "on"):
-            new_active = 1
-            self._wake_grace_until = 0.0
+            if state is None and time.monotonic() < self._sleep_grace_until:
+                new_active = 0
+            else:
+                new_active = 1
+                self._wake_grace_until = 0.0
         elif tv_power in ("standby", "off", "suspend", "unreachable"):
+            self._sleep_grace_until = 0.0
             if state is None and time.monotonic() < self._wake_grace_until:
                 new_active = 1
             else:
@@ -1376,18 +1424,24 @@ class HomeKitTvAccessory:
         if iid == self.IID_TV_REMOTE_KEY:
             res = self.controller.send_remote_key(int(value))
             if isinstance(res, dict) and res.get("action") == "power_on":
-                self._wake_grace_until = time.monotonic() + 25.0
+                self._wake_grace_until = time.monotonic() + 35.0
+                self._sleep_grace_until = 0.0
                 if self._values.get(self.IID_TV_ACTIVE) != 1:
                     self._values[self.IID_TV_ACTIVE] = 1
                     events.append((1, self.IID_TV_ACTIVE, 1))
+            elif isinstance(res, dict) and res.get("ok"):
+                self._sleep_grace_until = 0.0
             return 0, events
         if iid == self.IID_TV_POWER_MODE:
             res = self.controller.send_power_mode_selection(int(value))
             if isinstance(res, dict) and res.get("action") == "power_on":
-                self._wake_grace_until = time.monotonic() + 25.0
+                self._wake_grace_until = time.monotonic() + 35.0
+                self._sleep_grace_until = 0.0
                 if self._values.get(self.IID_TV_ACTIVE) != 1:
                     self._values[self.IID_TV_ACTIVE] = 1
                     events.append((1, self.IID_TV_ACTIVE, 1))
+            elif isinstance(res, dict) and res.get("ok"):
+                self._sleep_grace_until = 0.0
             return 0, events
         if iid == self.IID_SPEAKER_VOLUME_SELECTOR:
             decrement = int(value) == 1
@@ -1420,9 +1474,15 @@ class HomeKitTvAccessory:
             res = self.controller.set_power(active=bool(act))
             if act == 1 or (isinstance(res, dict) and res.get("action") == "power_on"):
                 act = 1
-                self._wake_grace_until = time.monotonic() + 25.0
+                self._wake_grace_until = time.monotonic() + 35.0
+                self._sleep_grace_until = 0.0
+            elif isinstance(res, dict) and not res.get("ok") and res.get("reachable"):
+                act = 1
+                self._wake_grace_until = 0.0
+                self._sleep_grace_until = 0.0
             else:
                 self._wake_grace_until = 0.0
+                self._sleep_grace_until = time.monotonic() + 35.0
             self._values[self.IID_TV_ACTIVE] = act
             events.append((1, self.IID_TV_ACTIVE, act))
             return 0, events
@@ -1434,10 +1494,13 @@ class HomeKitTvAccessory:
             self._values[self.IID_TV_ACTIVE_IDENTIFIER] = ident
             res = self.controller.launch_app(app_id)
             if isinstance(res, dict) and res.get("action") == "power_on":
-                self._wake_grace_until = time.monotonic() + 25.0
+                self._wake_grace_until = time.monotonic() + 35.0
+                self._sleep_grace_until = 0.0
                 if self._values.get(self.IID_TV_ACTIVE) != 1:
                     self._values[self.IID_TV_ACTIVE] = 1
                     events.append((1, self.IID_TV_ACTIVE, 1))
+            elif isinstance(res, dict) and res.get("ok"):
+                self._sleep_grace_until = 0.0
             events.append((1, self.IID_TV_ACTIVE_IDENTIFIER, ident))
             return 0, events
         if iid == self.IID_TV_CONFIGURED_NAME:
@@ -3202,6 +3265,11 @@ class CompanionSession:
             )
             self.send_event("_iMC", {"_mcF": 0x0100}, xid=xid)
         elif cmd_id in (11, 12, 13, 19):  # Power / Sleep / Wake (iOS 26/27 uses 19 for Power)
+            if cmd_id not in (12, 13):
+                try:
+                    self.accessory.sync_from_tv_state()
+                except Exception:
+                    pass
             cur_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
             if cmd_id == 12:
                 target_active = 0
@@ -3211,6 +3279,11 @@ class CompanionSession:
                 target_active = 0 if cur_active == 1 else 1
             _, changes = self.accessory.put_characteristic(
                 self.accessory.IID_TV_ACTIVE, target_active
+            )
+            final_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, target_active))
+            print(
+                f"[homekit-tv] companion power cmd={cmd_id} target={target_active} -> active={final_active}",
+                flush=True,
             )
             self.send_power_state(xid)
         self._emit_hap_changes(changes)
@@ -4163,7 +4236,12 @@ class HomeKitTvServer:
                 elif action == "dismiss_notices":
                     self.accessory.controller.dismiss_update_notices()
                 elif action == "power":
-                    value = str(payload.get("value") or "toggle").strip().lower()
+                    value = str(payload.get("value") or payload.get("mode") or "toggle").strip().lower()
+                    if value not in ("on", "off"):
+                        try:
+                            self.accessory.sync_from_tv_state()
+                        except Exception:
+                            pass
                     cur_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, 1))
                     if value == "on":
                         target_active = 1
@@ -4173,6 +4251,11 @@ class HomeKitTvServer:
                         target_active = 0 if cur_active == 1 else 1
                     _, changes = self.accessory.put_characteristic(
                         self.accessory.IID_TV_ACTIVE, target_active
+                    )
+                    final_active = int(self.accessory._values.get(self.accessory.IID_TV_ACTIVE, target_active))
+                    print(
+                        f"[homekit-tv] web power req={value} target={target_active} -> active={final_active}",
+                        flush=True,
                     )
                 elif action == "volume_step":
                     direction = str(payload.get("direction") or "up").strip().lower()
@@ -4187,7 +4270,7 @@ class HomeKitTvServer:
                         self.accessory.IID_SPEAKER_VOLUME, vol
                     )
                 elif action == "mute":
-                    val = payload.get("value", "toggle")
+                    val = payload.get("value") if "value" in payload else payload.get("mode", "toggle")
                     cur_muted = bool(self.accessory._values.get(self.accessory.IID_SPEAKER_MUTE, False))
                     if val == "toggle":
                         target_mute = not cur_muted
@@ -4408,6 +4491,7 @@ class HomeKitTvServer:
                         req_chars = req_json.get("characteristics", [])
                         status_list = []
                         any_err = False
+                        any_write_resp = False
                         for ch in req_chars:
                             aid_i = int(ch.get("aid", 1))
                             iid_i = int(ch.get("iid", 0))
@@ -4422,11 +4506,29 @@ class HomeKitTvServer:
                             if "value" in ch:
                                 st_code, evs = self.accessory.put_characteristic(iid_i, ch["value"])
                                 pending_events.extend(evs)
+                                if iid_i == self.accessory.IID_TV_ACTIVE:
+                                    final_act = self.accessory._values.get(self.accessory.IID_TV_ACTIVE)
+                                    print(
+                                        f"[homekit-tv] hap PUT Active req={ch['value']!r} -> active={final_act} status={st_code}",
+                                        flush=True,
+                                    )
                             if st_code != 0:
                                 any_err = True
-                            status_list.append({"aid": aid_i, "iid": iid_i, "status": st_code})
+                            entry: dict[str, Any] = {"aid": aid_i, "iid": iid_i, "status": st_code}
+                            if ch.get("r") and st_code == 0:
+                                any_write_resp = True
+                                get_st, cur_val = self.accessory.get_characteristic(iid_i)
+                                if get_st == 0:
+                                    entry["value"] = cur_val
+                            status_list.append(entry)
                         if any_err:
                             status = 207
+                            ctype = "application/hap+json"
+                            resp_body = json.dumps(
+                                {"characteristics": status_list}, separators=(",", ":")
+                            ).encode("utf-8")
+                        elif any_write_resp:
+                            status = 200
                             ctype = "application/hap+json"
                             resp_body = json.dumps(
                                 {"characteristics": status_list}, separators=(",", ":")
@@ -4771,27 +4873,58 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
             if cand.is_file():
                 agentctl_candidates.insert(0, cand)
 
+    def _read_pair_sock_status() -> dict[str, Any] | None:
+        if not pair_sock.exists():
+            return None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(str(pair_sock))
+                s.sendall(b'{"cmd":"status"}\n')
+                chunks: list[bytes] = []
+                total_bytes = 0
+                while total_bytes < 4 * 1024 * 1024:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total_bytes += len(chunk)
+                    if b"\n" in chunk:
+                        break
+                raw_resp = b"".join(chunks).decode("utf-8", errors="replace").strip()
+                parsed = json.loads(raw_resp or "{}")
+                if isinstance(parsed, dict) and parsed.get("ok"):
+                    return parsed
+        except Exception:
+            pass
+        return None
+
     def read_agentctl_status() -> dict[str, Any]:
         _load_arp_macs()
-        agentctl_path = next((p for p in agentctl_candidates if p.is_file()), None)
-        if agentctl_path is None:
-            return {}
-        try:
-            cmd = [sys.executable, "-B", str(agentctl_path)]
-            if pair_sock.exists():
-                cmd.extend(["--socket", str(pair_sock)])
-            cmd.append("status")
-            proc = subprocess.run(
-                cmd,
-                cwd=str(agentctl_path.parent),
-                capture_output=True,
-                text=True,
-                timeout=2.5,
-                check=False,
-            )
-            if proc.returncode != 0:
+        parsed = _read_pair_sock_status()
+        if parsed is None:
+            agentctl_path = next((p for p in agentctl_candidates if p.is_file()), None)
+            if agentctl_path is None:
                 return {}
-            parsed = json.loads(proc.stdout or "{}")
+            try:
+                cmd = [sys.executable, "-B", str(agentctl_path)]
+                if pair_sock.exists():
+                    cmd.extend(["--socket", str(pair_sock)])
+                cmd.append("status")
+                proc = subprocess.run(
+                    cmd,
+                    cwd=str(agentctl_path.parent),
+                    capture_output=True,
+                    text=True,
+                    timeout=2.5,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    return {}
+                parsed = json.loads(proc.stdout or "{}")
+            except Exception:
+                return {}
+        try:
             result = parsed.get("result") if isinstance(parsed.get("result"), dict) else parsed
             resident = result.get("resident") if isinstance(result.get("resident"), dict) else {}
             last_report = (
@@ -4866,6 +4999,7 @@ def load_spark_runtime_context(agent_data_dir: Path | None = None) -> dict[str, 
     return {
         "voice_key": voice_key,
         "tv_macs": tv_macs,
+        "tv_macs_provider": lambda: list(tv_macs),
         "ssap_client_key": ssap_client_key,
         "status_reader_fn": read_agentctl_status,
         "voice_agent_fn": send_voice_utterance_to_agent,
@@ -4895,6 +5029,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_port=DEFAULT_REMOTE_PORT,
         voice_key=ctx["voice_key"],
         tv_macs=ctx["tv_macs"],
+        tv_macs_provider=ctx.get("tv_macs_provider"),
         ssap_client_key=ctx["ssap_client_key"],
         status_reader_fn=ctx["status_reader_fn"],
         voice_agent_fn=ctx.get("voice_agent_fn"),
