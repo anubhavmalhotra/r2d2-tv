@@ -94,7 +94,7 @@ class DeepLinkSmuggling(Case):
             {'key': 'apple_tv', 'app_id': APP_IDS['apple_tv'], 'kind': 'title', 'text': 'x' * 161},
             {'key': 'apple_tv', 'app_id': APP_IDS['apple_tv'], 'kind': 'title', 'text': 7},
             {'key': 'apple_tv', 'app_id': APP_IDS['netflix'], 'kind': 'title', 'text': 'x'},
-            {'key': 'netflix', 'app_id': APP_IDS['netflix'], 'kind': 'title', 'text': 'x'},
+            {'key': 'disney_plus', 'app_id': APP_IDS['disney_plus'], 'kind': 'title', 'text': 'x'},
             {'key': 'apple_tv', 'app_id': BROWSER_ID, 'kind': 'title', 'text': 'x'},
         ]
         for params in bad_params:

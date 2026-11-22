@@ -62,6 +62,8 @@ _CODES = {
     **dict.fromkeys(('UNSUPPORTED_COMMAND', 'TOOL_SCHEMA', 'ASR_OUTPUT_INVALID', 'TOOL_DISABLED',
                      'TV_TOOL_UNAVAILABLE', 'DEEPLINK_UNQUALIFIED',
                      'CONFIRMATION_SURFACE_UNAVAILABLE'), _CANNOT),
+    'TITLE_NOT_FOUND': ('I couldn’t find that title.', 'Nothing was changed.', 'nothing',
+                        'Could not find that title'),
     'NEGATED_COMMAND': ('OK, I won’t.', '', 'nothing', 'OK, nothing done'),
     'AUDIO_EMPTY_OR_SHORT': _HEARD, 'NO_SPEECH': _HEARD,
     'OWNER_KEY_RELEASED': ('Hold the mic a little longer.', 'Keep holding until you finish speaking.',

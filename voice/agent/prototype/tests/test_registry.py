@@ -40,7 +40,7 @@ class RegistryShape(Case):
     def test_tv_back_route_is_excluded_and_confirm_rules(self):
         back_tv = [r for r in REGISTRY['control.back'].routes if r.executor == 'tv']
         self.assertEqual([r.phase for r in back_tv], [None])
-        self.assertEqual(REGISTRY['tv.open_content'].confirm, 'always')
+        self.assertEqual(REGISTRY['tv.open_content'].confirm, 'policy')
         self.assertEqual(REGISTRY['tv.volume'].confirm, 'policy')
 
     def test_outcome_vocabulary_is_closed(self):

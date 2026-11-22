@@ -331,12 +331,56 @@ class TVGateway:
         finally:
             doc = None
 
-    def launch_content(self, key, kind, text, op_id, *, gate=None):
+    def content_match_policy(self, key, kind, text):
+        """Return ('direct'|'confirm', display_title_or_None, pinned_target_or_None) for P5.
+
+        When a qualified builder is installed, raises Refused('TITLE_NOT_FOUND') or
+        Refused('DEEPLINK_UNQUALIFIED') immediately so callers fail fast without displaying
+        a pointless confirmation card. When no qualified builder is installed, fails safe to
+        ('confirm', None, None).
+        """
+        builder = self.deeplinks.get(key)
+        if builder is None or getattr(builder, 'qualified', False) is not True:
+            return 'confirm', None, None
+        classify_pinned = getattr(builder, 'classify_match_pinned', None)
+        classify = getattr(builder, 'classify_match', None)
+        if not callable(classify_pinned) and not callable(classify):
+            return 'confirm', None, None
+        try:
+            if callable(classify_pinned):
+                mode, display, pinned = classify_pinned(kind, text)
+            else:
+                mode, display = classify(kind, text)
+                pinned = None
+        except Refused as err:
+            if err.code in ('TITLE_NOT_FOUND', 'DEEPLINK_UNQUALIFIED'):
+                raise
+            return 'confirm', None, None
+        except Exception:
+            return 'confirm', None, None
+        return (
+            'direct' if mode == 'direct' else 'confirm',
+            display if type(display) is str else None,
+            pinned if (type(pinned) is str and 0 < len(pinned) <= 1024 and pinned.isascii() and pinned.isprintable()) else None,
+        )
+
+    def launch_content(self, key, kind, text, op_id, *, gate=None, pinned_target=None):
         builder = self.deeplinks.get(key)
         if builder is None or getattr(builder, 'qualified', False) is not True:
             raise Refused('DEEPLINK_UNQUALIFIED')
+        if pinned_target is not None:
+            if type(pinned_target) is not str or (getattr(builder, 'title_only', True) and kind != 'title'):
+                raise Refused('DEEPLINK_UNQUALIFIED')
+            params = {'contentTarget': pinned_target}
+            if not (_flat_params(params) and builder.validate(params) is True):
+                raise Refused('DEEPLINK_UNQUALIFIED')
+            return self._send('launch', {'id': APP_IDS[key], 'params': params}, op_id, gate=gate)
         try:
             params = builder.build(kind, text)
+        except Refused as err:
+            if err.code == 'TITLE_NOT_FOUND':
+                raise
+            raise Refused('DEEPLINK_UNQUALIFIED') from None
         except Exception:
             raise Refused('DEEPLINK_UNQUALIFIED') from None
         return self._send('launch', {'id': APP_IDS[key], 'params': params}, op_id, gate=gate)
@@ -386,6 +430,11 @@ class TVExecutor:
         except Exception:
             return None
 
+    def content_match_policy(self, plan):
+        if plan.action != 'open_content' or not self._valid(plan):
+            return 'confirm', None, None
+        return self.gateway.content_match_policy(plan.param('key'), plan.param('kind'), plan.param('text'))
+
     def toast(self, code):
         self.toast_seq += 1
         try:
@@ -396,14 +445,30 @@ class TVExecutor:
 
     def _valid(self, plan):
         params = dict(plan.params)
-        if plan.executor != 'tv' or plan.action not in self._PARAMS or set(params) != self._PARAMS[plan.action]:
+        if plan.executor != 'tv' or plan.action not in self._PARAMS:
             return False
         if plan.action == 'open_content':
+            allowed_keys = self._PARAMS['open_content']
+            extra = set(params) - allowed_keys
+            if not allowed_keys.issubset(params) or not extra.issubset({'pinned_target'}):
+                return False
             # Layer-3 re-check of every open_content param, not only the app pair
             # (executors re-validate plans).
-            return (type(params['key']) is str and params['key'] in OPEN_CONTENT_APPS and
-                    APP_IDS.get(params['key']) == params['app_id'] and
-                    params['kind'] in ('search', 'title') and bounded_text(params['text'], 160, 640))
+            base_ok = (type(params['key']) is str and params['key'] in OPEN_CONTENT_APPS and
+                       APP_IDS.get(params['key']) == params['app_id'] and
+                       params['kind'] in ('search', 'title') and bounded_text(params['text'], 160, 640))
+            if not base_ok:
+                return False
+            if 'pinned_target' in params:
+                pt = params['pinned_target']
+                if not (type(pt) is str and 0 < len(pt) <= 1024 and pt.isascii() and pt.isprintable()):
+                    return False
+                builder = self.gateway.deeplinks.get(params['key'])
+                return (builder is not None and getattr(builder, 'qualified', False) is True and
+                        builder.validate({'contentTarget': pt}) is True)
+            return True
+        if set(params) != self._PARAMS[plan.action]:
+            return False
         if plan.action == 'launch_app':
             return type(params['key']) is str and APP_IDS.get(params['key']) == params['app_id']
         if plan.action == 'home':
@@ -454,7 +519,11 @@ class TVExecutor:
             if action == 'launch_app':
                 status, _ = gw.launch_app(plan.param('key'), ids[0], gate=gate)
             elif action == 'open_content':
-                status, _ = gw.launch_content(plan.param('key'), plan.param('kind'), plan.param('text'), ids[0], gate=gate)
+                pinned = dict(plan.params).get('pinned_target')
+                status, _ = gw.launch_content(
+                    plan.param('key'), plan.param('kind'), plan.param('text'), ids[0],
+                    gate=gate, pinned_target=pinned,
+                )
             elif action == 'home':
                 status, _ = gw.home(ids[0], gate=gate)
             elif action == 'mute':

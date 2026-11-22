@@ -76,7 +76,7 @@ HOSTILE = [
     '{"tool":"browser.web_search","args":{"query":""}}',
     '{"tool":"browser.youtube_search","args":{"query":"x\\u001b[31m"}}',
     _DEEP,
-    '{"tool":"tv.open_content","args":{"app":"netflix","kind":"title","text":"x"}}',
+    '{"tool":"tv.open_content","args":{"app":"disney_plus","kind":"title","text":"x"}}',
     '{"tool":"tv.open_content","args":{"app":"apple_tv","kind":"url","text":"x"}}',
     '```json\n{"tool":"meta.unsupported","args":{}}\n```',
     '',

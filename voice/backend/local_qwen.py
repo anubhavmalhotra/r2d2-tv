@@ -42,7 +42,7 @@ _AGENT_TOOLS = (
     ('tv.open_app',
      '{"app": "netflix"|"apple_tv"|"youtube_app"|"prime_video"|"disney_plus"|"hbo_max"|"hulu"|"sling"|"tubi"|"apple_music"}',
      'P3', False, 'open that TV app'),
-    ('tv.open_content', '{"app": "apple_tv", "kind": "search"|"title", "text": TEXT}', 'P5', True,
+    ('tv.open_content', '{"app": "apple_tv"|"netflix"|"tubi"|"apple_music", "kind": "search"|"title", "text": TEXT}', 'P5', True,
      'open a title or search inside that app'),
     ('tv.volume', '{"direction": "up"|"down", "steps": 1..5}', 'P4', False,
      'change the TV volume'),
