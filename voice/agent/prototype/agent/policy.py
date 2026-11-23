@@ -68,12 +68,16 @@ class Recent:
         return sum(1 for _, k in self.items if key is None or k == key)
 
 
-def needs_confirmation(tool, plan, *, repeats, current_volume, ceiling):
+def needs_confirmation(tool, plan, *, repeats, current_volume, ceiling, content_policy=None):
     """-> None or the rule name. `repeats` = admitted calls of this tool in 60 s."""
     if tool.confirm == 'always':
         return 'always'
     if repeats >= REPEAT_LIMIT and tool.name not in ('meta.whats_playing', 'meta.cancel'):
         return 'repeat'
+    if tool.confirm == 'policy' and plan.action == 'open_content':
+        # Only unambiguous exact/alias matches from a qualified builder launch directly;
+        # ambiguous, fuzzy, unqualified, or unknown builders fail safe to confirmation.
+        return None if content_policy == 'direct' else 'always'
     if tool.confirm == 'policy' and plan.action == 'volume' and plan.param('direction') == 'up':
         # Unknown current volume fails safe: ask.
         if type(current_volume) is not int or current_volume + plan.param('steps') > ceiling:

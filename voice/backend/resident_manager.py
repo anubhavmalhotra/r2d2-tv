@@ -94,7 +94,9 @@ class ResidentManager:
     def __init__(self, *, manager, spark_ip, tv_ip, manager_key, ssap_key_path,
                  ssap_pin_path, hook, enrollment, identity_loader, voice_key,
                  pcm_port=4182, sessions=None, transport_factory=TvTransport,
-                 clock=time.monotonic, audit=None, voice_status=None):
+                 clock=time.monotonic, audit=None, voice_status=None,
+                 deeplinks=None, netflix_catalog_db=None, netflix_qualified=False,
+                 catalog_dir=None, qualified_catalog_apps=()):
         spawn = getattr(manager, 'control_spawn', None)
         source = getattr(hook, 'source', None)
         if (spawn is None or getattr(spawn, 'manager', None) is not manager
@@ -121,10 +123,30 @@ class ResidentManager:
         tv_module = importlib.import_module(_load_agent_package()[5].__module__)
         self._certificate_changed = tv_module.CertificateChanged
         self._gateway_transport = transport_factory(tv_ip)
+        resolved_deeplinks = dict(deeplinks or {})
+        if catalog_dir is not None:
+            cat_mod = importlib.import_module(
+                tv_module.__name__.rsplit('.', 1)[0] + '.catalog'
+            )
+            built = cat_mod.build_catalog_deeplinks(
+                catalog_dir, qualified_apps=qualified_catalog_apps, preload=True
+            )
+            for prov, builder in built.items():
+                if prov not in resolved_deeplinks:
+                    resolved_deeplinks[prov] = builder
+        if netflix_catalog_db is not None and 'netflix' not in resolved_deeplinks:
+            nf_mod = importlib.import_module(
+                tv_module.__name__.rsplit('.', 1)[0] + '.netflix_catalog'
+            )
+            nf_idx = nf_mod.NetflixCatalogIndex(netflix_catalog_db, require_private=True)
+            resolved_deeplinks['netflix'] = nf_mod.NetflixDeeplinkBuilder(
+                nf_idx, qualified=bool(netflix_qualified), preload=True
+            )
         try:
             self.gateway = tv_module.TVGateway(
                 self._gateway_transport, key_path=ssap_key_path, pin_path=ssap_pin_path,
-                killswitch=self.killswitch, phase='P5', clock=clock, spark_ip=spark_ip)
+                killswitch=self.killswitch, phase='P5', clock=clock, spark_ip=spark_ip,
+                deeplinks=resolved_deeplinks)
             self.resident = ResidentUtteranceServer(
                 spark_ip=spark_ip, tv_ip=tv_ip, pcm_port=pcm_port, voice_key=voice_key,
                 enrollment=enrollment, identity_loader=identity_loader, hook=hook,

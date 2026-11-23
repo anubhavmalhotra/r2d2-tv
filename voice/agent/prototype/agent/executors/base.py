@@ -60,7 +60,7 @@ RESULTS = {
                      'unknown': {'TV_UNCONFIRMED'}},
     ('tv', 'open_content'): {'verified': {'TV_FOREGROUND_VERIFIED'},
                              'rejected': {'TV_LAUNCH_REJECTED'},
-                             'refused': {'DEEPLINK_UNQUALIFIED', 'TV_APP_NOT_INSTALLED', *_TV_PRE},
+                             'refused': {'DEEPLINK_UNQUALIFIED', 'TITLE_NOT_FOUND', 'TV_APP_NOT_INSTALLED', *_TV_PRE},
                              'unknown': {'TV_UNCONFIRMED'}},
     ('tv', 'volume'): {'verified': {'TV_VOLUME_VERIFIED'},
                        'accepted': {'TV_VOLUME_ACCEPTED'},

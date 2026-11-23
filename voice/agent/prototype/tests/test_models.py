@@ -19,7 +19,7 @@ from tests.test_agent import mutations
 CONTROLLER_DIR = Path(os.environ.get('R2D2_CONTROLLER_DIR') or
                       Path(__file__).resolve().parents[3] / 'backend')
 # Pinned: a changed local_qwen.py must be re-checked against the adapter contract.
-LOCAL_QWEN_SHA256 = '26fb934d5c753e3c38212d06e875f99a8001d33e832e5c7db8cc927a0524dac5'
+LOCAL_QWEN_SHA256 = '68148d24594d65d4ac217cc6285401fb200d3635f49dc8a40fa91e71455ebb63'
 
 
 class FakeSock:

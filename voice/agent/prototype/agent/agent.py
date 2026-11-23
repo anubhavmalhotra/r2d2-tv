@@ -23,7 +23,7 @@ Invariants:
     dispatch (the gate passed to executors).
   * The audit row holds tool, enumerated args, free-text lengths and codes only.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import re
 import secrets
 import threading
@@ -351,8 +351,14 @@ class Agent:
         except Refused:
             self._rate_hit()
             raise
+        content_policy, content_display, pinned_target = self._content_policy(plan)
+        if pinned_target is not None and plan.action == 'open_content':
+            pdict = dict(plan.params)
+            pdict['pinned_target'] = pinned_target
+            plan = replace(plan, params=tuple(sorted(pdict.items())))
         rule = needs_confirmation(tool, plan, repeats=self.repeats.count(call.tool),
-                                  current_volume=self._volume_now(plan), ceiling=self.volume_ceiling)
+                                  current_volume=self._volume_now(plan), ceiling=self.volume_ceiling,
+                                  content_policy=content_policy)
         self.repeats.add(call.tool)
         if rule is not None:
             rec.rule = rule
@@ -360,7 +366,7 @@ class Agent:
                     not self.feedback.can_confirm(rec.surface, free_text=tool.free_text)):
                 return _refuse('CONFIRMATION_SURFACE_UNAVAILABLE')
             rec.expires = self.confirm.hold(plan, rec.surface, rule, rec.args).expires
-            rec.echo = self._card(call)
+            rec.echo = self._card(call, content_display)
             return _refuse('CONFIRMATION_PENDING')
         if call.tool in ('browser.web_search', 'browser.youtube_search'):
             rec.echo = call.args['query']  # overlay only (TV), never audited
@@ -426,13 +432,26 @@ class Agent:
         return Outcome('verified', 'PENDING_CANCELLED')
 
     @staticmethod
-    def _card(call):
+    def _card(call, display_title=None):
         """Exact app + title for the on-TV card (overlay only; never audited)."""
         if call.tool == 'tv.open_content':
-            return '%s %s: %s' % (call.args['app'], call.args['kind'], call.args['text'])
+            text = display_title if display_title else call.args['text']
+            return '%s %s: %s' % (call.args['app'], call.args['kind'], text)
         return call.tool
 
     # ------------------------------------------------------------- helpers
+    def _content_policy(self, plan):
+        if plan.action != 'open_content' or self.tv is None:
+            return None, None, None
+        probe = getattr(self.tv, 'content_match_policy', None)
+        if not callable(probe):
+            return 'confirm', None, None
+        res = probe(plan)
+        if type(res) is tuple and len(res) == 3:
+            return res
+        if type(res) is tuple and len(res) == 2:
+            return res[0], res[1], None
+        return 'confirm', None, None
     def _volume_now(self, plan):
         if plan.action == 'volume' and plan.param('direction') == 'up' and self.tv is not None:
             try:

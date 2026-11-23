@@ -29,6 +29,7 @@ TEMPLATES = {
     'TV_APP_NOT_INSTALLED': 'That app is not installed',
     'TV_CHANNEL_UNAVAILABLE': 'TV controls are unavailable',
     'TV_TOOL_UNAVAILABLE': 'That is not available yet',
+    'TITLE_NOT_FOUND': 'Could not find that title',
     'CONFIRMATION_PENDING': 'Say yes to confirm, or no',
     'CONFIRMATION_DECLINED': 'Cancelled',
     'CONFIRMATION_EXPIRED': 'Confirmation timed out',
