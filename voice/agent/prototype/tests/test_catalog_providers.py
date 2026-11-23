@@ -157,35 +157,43 @@ class MultiProviderCatalogTests(Case):
         self.assertFalse(builders['apple_tv'].validate({'contentTarget': 'https://tv.apple.com/us/show/x/umc.cmc.1srk2goyh2q2zdxcx605w8vtx?evil=1'}))
         self.assertFalse(builders['apple_tv'].validate({'contentTarget': 'https://evil.example/us/show/severance/umc.cmc.1srk2goyh2q2zdxcx605w8vtx'}))
 
-        # Tubi movie & show
+        # Tubi movie & show (LG webOS takes raw numeric ID in contentTarget)
         self.assertEqual(
             builders['tubi'].build('title', 'watch The Hunger Games on Tubi'),
-            {'contentTarget': 'https://tubitv.com/movies/550824'},
+            {'contentTarget': '550824'},
         )
         self.assertEqual(
             builders['tubi'].build('title', 'Taboo'),
-            {'contentTarget': 'https://tubitv.com/series/300000737'},
+            {'contentTarget': '300000737'},
         )
-        self.assertFalse(builders['tubi'].validate({'contentTarget': 'https://tubitv.com/movies/550824?link-action=play'}))
+        self.assertFalse(builders['tubi'].validate({'contentTarget': 'https://tubitv.com/movies/550824'}))
+        self.assertFalse(builders['tubi'].validate({'contentTarget': '550824?evil=1'}))
+
+        # Single-token guard on high-collision Tubi catalog requires confirmation
+        t_mode, t_disp, t_pin = builders['tubi'].classify_match_pinned('title', 'Taboo')
+        self.assertEqual((t_mode, t_disp, t_pin), ('confirm', 'Taboo', '300000737'))
+        t_mode2, _, _ = builders['tubi'].classify_match_pinned('title', 'The Hunger Games')
+        self.assertEqual(t_mode2, 'direct')
 
         # Apple Music artist, song by artist alias, and media-type hint (album vs song)
         self.assertEqual(
             builders['apple_music'].build('title', 'play Taylor Swift on Apple Music'),
-            {'contentTarget': 'https://music.apple.com/us/artist/159260351'},
+            {'contentTarget': 'https://music.apple.com/us/artist/taylor-swift/159260351'},
         )
         self.assertEqual(
             builders['apple_music'].build('title', 'play Blinding Lights by The Weeknd on Apple Music'),
-            {'contentTarget': 'https://music.apple.com/us/album/1499378108?i=1499378607'},
+            {'contentTarget': 'https://music.apple.com/us/song/blinding-lights/1499378607'},
         )
         self.assertEqual(
             builders['apple_music'].build('title', 'play album Thriller on Apple Music'),
-            {'contentTarget': 'https://music.apple.com/us/album/269572838'},
+            {'contentTarget': 'https://music.apple.com/us/album/thriller/269572838'},
         )
         self.assertEqual(
             builders['apple_music'].build('title', 'play song Thriller on Apple Music'),
-            {'contentTarget': 'https://music.apple.com/us/album/269572838?i=269573364'},
+            {'contentTarget': 'https://music.apple.com/us/song/thriller/269573364'},
         )
-        self.assertFalse(builders['apple_music'].validate({'contentTarget': 'https://music.apple.com/us/album/269572838?i=1&evil=2'}))
+        self.assertFalse(builders['apple_music'].validate({'contentTarget': 'https://music.apple.com/us/album/thriller/269572838?i=1'}))
+        self.assertFalse(builders['apple_music'].validate({'contentTarget': 'https://music.apple.com/us/album/269572838'}))
 
     def test_apple_music_ambiguous_card_includes_artist_subtitle(self):
         builders = build_catalog_deeplinks(self.cat_dir, qualified_apps=('apple_music',))
@@ -193,13 +201,13 @@ class MultiProviderCatalogTests(Case):
         mode, display, pinned = builders['apple_music'].classify_match_pinned('title', 'Thriller')
         self.assertEqual(mode, 'confirm')
         self.assertEqual(display, 'Thriller - Michael Jackson')
-        self.assertEqual(pinned, 'https://music.apple.com/us/album/269572838?i=269573364')
+        self.assertEqual(pinned, 'https://music.apple.com/us/song/thriller/269573364')
 
         # Disambiguated with media hint 'album Thriller' -> direct launch
         mode_a, display_a, pinned_a = builders['apple_music'].classify_match_pinned('title', 'album Thriller')
         self.assertEqual(mode_a, 'direct')
         self.assertEqual(display_a, 'Thriller - Michael Jackson')
-        self.assertEqual(pinned_a, 'https://music.apple.com/us/album/269572838')
+        self.assertEqual(pinned_a, 'https://music.apple.com/us/album/thriller/269572838')
 
     def test_pinned_target_prevents_swap_across_db_reload_between_confirm_and_yes(self):
         builders = build_catalog_deeplinks(self.cat_dir, qualified_apps=('netflix',))

@@ -52,15 +52,13 @@ APPLE_TV_TARGET_STRICT = re.compile(
 )
 
 TUBI_ID_STRICT = re.compile(r'^[0-9]{4,12}$')
-TUBI_TARGET_STRICT = re.compile(
-    r'^https://tubitv\.com/(?:movies|series)/[0-9]{4,12}$'
-)
+TUBI_TARGET_STRICT = re.compile(r'^[0-9]{4,12}$')
 
 APPLE_MUSIC_ID_STRICT = re.compile(
     r'^(?:artist:[0-9]{4,14}|album:[0-9]{4,14}|song:[0-9]{4,14}:[0-9]{4,14})$'
 )
 APPLE_MUSIC_TARGET_STRICT = re.compile(
-    r'^https://music\.apple\.com/us/(?:artist/[0-9]{4,14}|album/[0-9]{4,14}(?:\?i=[0-9]{4,14})?)$'
+    r'^https://music\.apple\.com/us/(?:artist|album|song)/[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?/[0-9]{4,14}$'
 )
 
 MAX_QUERY_CHARS = 160
@@ -303,28 +301,29 @@ def format_apple_tv_content_target(provider_id: str, media_type: str, slug: str 
     return target
 
 
-def format_tubi_content_target(provider_id: str, media_type: str) -> str:
+def format_tubi_content_target(provider_id: str, media_type: str = 'movie') -> str:
+    """LG webOS com.tubitv.ott.tubi takes the raw numeric content ID in contentTarget."""
     if type(provider_id) is not str or TUBI_ID_STRICT.fullmatch(provider_id) is None:
         raise Refused('DEEPLINK_UNQUALIFIED')
-    kind_seg = 'movies' if media_type == 'movie' else ('series' if media_type == 'show' else '')
-    if not kind_seg:
+    if media_type not in ('movie', 'show'):
         raise Refused('DEEPLINK_UNQUALIFIED')
-    target = f'https://tubitv.com/{kind_seg}/{provider_id}'
-    if TUBI_TARGET_STRICT.fullmatch(target) is None:
+    if TUBI_TARGET_STRICT.fullmatch(provider_id) is None:
         raise Refused('DEEPLINK_UNQUALIFIED')
-    return target
+    return provider_id
 
 
-def format_apple_music_content_target(provider_id: str) -> str:
+def format_apple_music_content_target(provider_id: str, title: str = '', slug: str = '') -> str:
+    """LG webOS com.apple.applemusic requires canonical /us/{artist|album|song}/{slug}/{id} (no ?i=)."""
     if type(provider_id) is not str or APPLE_MUSIC_ID_STRICT.fullmatch(provider_id) is None:
         raise Refused('DEEPLINK_UNQUALIFIED')
+    clean_slug = slug if (type(slug) is str and APPLE_TV_SLUG_STRICT.fullmatch(slug)) else make_ascii_slug(title)
     parts = provider_id.split(':')
     if parts[0] == 'artist' and len(parts) == 2:
-        target = f'https://music.apple.com/us/artist/{parts[1]}'
+        target = f'https://music.apple.com/us/artist/{clean_slug}/{parts[1]}'
     elif parts[0] == 'album' and len(parts) == 2:
-        target = f'https://music.apple.com/us/album/{parts[1]}'
+        target = f'https://music.apple.com/us/album/{clean_slug}/{parts[1]}'
     elif parts[0] == 'song' and len(parts) == 3:
-        target = f'https://music.apple.com/us/album/{parts[1]}?i={parts[2]}'
+        target = f'https://music.apple.com/us/song/{clean_slug}/{parts[2]}'
     else:
         raise Refused('DEEPLINK_UNQUALIFIED')
     if APPLE_MUSIC_TARGET_STRICT.fullmatch(target) is None:
@@ -366,7 +365,7 @@ def _format_entry_target(provider: str, entry: TitleEntry) -> str:
     if provider == 'tubi':
         return format_tubi_content_target(entry.provider_id, entry.media_type)
     if provider == 'apple_music':
-        return format_apple_music_content_target(entry.provider_id)
+        return format_apple_music_content_target(entry.provider_id, entry.title, entry.slug)
     raise Refused('DEEPLINK_UNQUALIFIED')
 
 
@@ -769,6 +768,7 @@ class CatalogDeeplinkBuilder:
     PROVIDER: str = ''
     TARGET_REGEX: re.Pattern[str] = re.compile(r'^(?!)$')
     _DIRECT_TIERS = frozenset(('exact', 'exact_bare', 'alias'))
+    _CONFIRM_SINGLE_TOKEN_PROVIDERS = frozenset(('tubi', 'apple_music'))
 
     def __init__(
         self,
@@ -813,7 +813,18 @@ class CatalogDeeplinkBuilder:
         if not self.validate(params):
             raise Refused('DEEPLINK_UNQUALIFIED')
         display = self._format_display(match)
-        mode = 'direct' if (not match.ambiguous and match.match_tier in self._DIRECT_TIERS) else 'confirm'
+        cleaned, preferred = parse_spoken_query(text, provider=self.PROVIDER)
+        q_tokens = [t for t in normalize_title(cleaned).split() if t]
+        single_tok_guard = (
+            self.PROVIDER in self._CONFIRM_SINGLE_TOKEN_PROVIDERS
+            and len(q_tokens) <= 1
+            and preferred is None
+        )
+        mode = (
+            'direct'
+            if (not match.ambiguous and not single_tok_guard and match.match_tier in self._DIRECT_TIERS)
+            else 'confirm'
+        )
         return mode, display, match.content_target
 
     def classify_match(self, kind: str, text: str) -> tuple[str, str]:
